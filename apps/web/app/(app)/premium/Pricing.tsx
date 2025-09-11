@@ -5,18 +5,13 @@ import { toast } from "sonner";
 import { useRouter } from "next/navigation";
 import { Label, Radio, RadioGroup } from "@headlessui/react";
 import { CheckIcon, SparklesIcon } from "lucide-react";
-import { capitalCase } from "capital-case";
 import Link from "next/link";
 import { env } from "@/env";
 import { LoadingContent } from "@/components/LoadingContent";
 import { usePremium } from "@/components/PremiumAlert";
 import { Button } from "@/components/ui/button";
 import { getUserTier } from "@/utils/premium";
-import {
-  pricingAdditonalEmail,
-  type Tier,
-  tiers,
-} from "@/app/(app)/premium/config";
+import { type Tier, tiers } from "@/app/(app)/premium/config";
 import { AlertWithButton } from "@/components/Alert";
 import { TooltipExplanation } from "@/components/TooltipExplanation";
 import { toastError } from "@/components/Toast";
@@ -24,7 +19,7 @@ import {
   generateCheckoutSessionAction,
   getBillingPortalUrlAction,
 } from "@/utils/actions/premium";
-import type { PremiumTier } from "@prisma/client";
+import { PremiumTier } from "@prisma/client";
 import { LoadingMiniSpinner } from "@/components/Loading";
 import { cn } from "@/utils";
 import { ManageSubscription } from "@/app/(app)/premium/ManageSubscription";
@@ -45,10 +40,6 @@ export default function Pricing(props: PricingProps) {
 
   const isLoggedIn = !!data?.id;
 
-  // const defaultFrequency = usePricingFrequencyDefault();
-  // const [frequency, setFrequency] = useState(
-  //   defaultFrequency === "monthly" ? frequencies[0] : frequencies[1],
-  // );
   const [frequency, setFrequency] = useState(frequencies[1]);
 
   const userPremiumTier = getUserTier(premium);
@@ -66,26 +57,6 @@ export default function Pricing(props: PricingProps) {
       </p>
     </div>
   );
-
-  // const pricingVariant = usePricingVariant();
-  // const { Layout, Item, tiers } = getLayoutComponents(
-  //   pricingVariant,
-  //   premiumTier,
-  // );
-
-  // const pricingVariant = usePricingVariant();
-  // const { Layout, Item, tiers } = getLayoutComponents(
-  //   pricingVariant,
-  //   premiumTier,
-  // );
-
-  // const { Layout, Item, tiers } = {
-  //   Layout: ThreeColLayout,
-  //   Item: ThreeColItem,
-  //   tiers: [basicTier, businessTier, enterpriseTier],
-  // };
-
-  const Layout = ThreeColLayout;
 
   const router = useRouter();
 
@@ -115,25 +86,23 @@ export default function Pricing(props: PricingProps) {
                   </Link>
                 </Button>
                 <div className="mx-auto mt-4 max-w-md">
-                  <AlertWithButton
-                    className="bg-background"
-                    variant="blue"
-                    title="Add extra users to your account!"
-                    description={`You can upgrade extra accounts to ${capitalCase(
-                      userPremiumTier,
-                    )} for $${
-                      pricingAdditonalEmail[userPremiumTier]
-                    } per email address!`}
-                    icon={null}
-                    button={
-                      <div className="ml-4 whitespace-nowrap">
-                        <Button asChild>
-                          {/* <Link href="/settings#manage-users">Add users</Link> */}
-                          <Link href="/accounts">Add users</Link>
-                        </Button>
-                      </div>
-                    }
-                  />
+                  {userPremiumTier === PremiumTier.BUSINESS_MONTHLY ||
+                  userPremiumTier === PremiumTier.BUSINESS_ANNUALLY ? (
+                    <AlertWithButton
+                      className="bg-background"
+                      variant="blue"
+                      title="Need multiple accounts?"
+                      description="Individual plans are designed for single users. Contact our support team for custom pricing on multiple accounts."
+                      icon={null}
+                      button={
+                        <div className="ml-4 whitespace-nowrap">
+                          <Button asChild>
+                            <Link href="/support">Contact Support</Link>
+                          </Button>
+                        </div>
+                      }
+                    />
+                  ) : null}
                 </div>
               </>
             )}
@@ -168,13 +137,12 @@ export default function Pricing(props: PricingProps) {
           </div>
         </div>
 
-        <Layout className="isolate mx-auto mt-10 grid max-w-7xl grid-cols-1 gap-y-8">
-          {tiers.map((tier, index) => {
+        <div className="isolate mx-auto mt-10 grid max-w-7xl grid-cols-1 gap-y-8 lg:mx-0 lg:max-w-none lg:grid-cols-3 gap-4">
+          {tiers.map((tier) => {
             return (
               <PriceTier
                 key={tier.name}
                 tier={tier}
-                index={index}
                 userPremiumTier={userPremiumTier}
                 frequency={frequency}
                 stripeSubscriptionId={premium?.stripeSubscriptionId}
@@ -184,7 +152,7 @@ export default function Pricing(props: PricingProps) {
               />
             );
           })}
-        </Layout>
+        </div>
       </div>
     </LoadingContent>
   );
@@ -192,7 +160,6 @@ export default function Pricing(props: PricingProps) {
 
 function PriceTier({
   tier,
-  index,
   userPremiumTier,
   frequency,
   stripeSubscriptionId,
@@ -201,7 +168,6 @@ function PriceTier({
   router,
 }: {
   tier: Tier;
-  index: number;
   userPremiumTier: PremiumTier | null;
   frequency: (typeof frequencies)[number];
   stripeSubscriptionId: string | null | undefined;
@@ -222,7 +188,6 @@ function PriceTier({
   return (
     <ThreeColItem
       key={tier.name}
-      index={index}
       className="flex flex-col rounded-3xl bg-white p-8 ring-1 ring-gray-200 xl:p-10"
     >
       <div className="flex-1">
@@ -265,14 +230,6 @@ function PriceTier({
             </Badge>
           )}
         </p>
-        {tier.priceAdditional && tier.priceAdditional[frequency.value] > 0 ? (
-          <p className="mt-3 text-sm leading-6 text-gray-500">
-            +${formatPrice(tier.priceAdditional[frequency.value])} for each
-            additional email account
-          </p>
-        ) : (
-          <div />
-        )}
         <ul className="mt-8 space-y-3 text-sm leading-6 text-gray-600">
           {tier.features.map((feature) => (
             <li key={feature.text} className="flex gap-x-3">
@@ -367,97 +324,14 @@ function PriceTier({
   );
 }
 
-// function attachUserInfo(
-//   url: string,
-//   user: { id: string; email: string; name?: string | null },
-//   quantity?: number,
-// ) {
-//   if (!user) return url;
-
-//   let res = `${url}?checkout[custom][user_id]=${user.id}&checkout[email]=${user.email}&checkout[name]=${user.name}`;
-//   if (quantity) res += `&quantity=${quantity}`;
-//   return res;
-// }
-
-// function useAffiliateCode() {
-//   const searchParams = useSearchParams();
-//   const affiliateCode = searchParams.get("aff");
-//   return affiliateCode;
-// }
-
-// function buildLemonUrl(url: string, affiliateCode: string | null) {
-//   if (!affiliateCode) return url;
-//   const newUrl = `${url}?aff_ref=${affiliateCode}`;
-//   return newUrl;
-// }
-
-// function getLayoutComponents(
-//   pricingVariant: string,
-//   premiumTier: PremiumTier | null,
-// ) {
-//   const isBasicTier =
-//     premiumTier === PremiumTier.BASIC_MONTHLY ||
-//     premiumTier === PremiumTier.BASIC_ANNUALLY;
-
-//   if (pricingVariant === "basic-business" || isBasicTier) {
-//     return {
-//       Layout: TwoColLayout,
-//       Item: TwoColItem,
-//       tiers: [basicTier, businessTier],
-//     };
-//   }
-
-//   if (pricingVariant === "business-basic" || isBasicTier) {
-//     return {
-//       Layout: TwoColLayout,
-//       Item: TwoColItem,
-//       tiers: [businessTier, basicTier],
-//     };
-//   }
-
-//   // control
-//   return {
-//     Layout: ThreeColLayout,
-//     Item: ThreeColItem,
-//     tiers: [basicTier, businessTier, enterpriseTier],
-//   };
-// }
-
-function ThreeColLayout({
-  children,
-  className,
-}: {
-  children: React.ReactNode;
-  className?: string;
-}) {
-  return (
-    <div className={cn("lg:mx-0 lg:max-w-none lg:grid-cols-3", className)}>
-      {children}
-    </div>
-  );
-}
-
 function ThreeColItem({
   children,
   className,
-  index,
 }: {
   children: React.ReactNode;
   className?: string;
-  index: number;
 }) {
-  return (
-    <div
-      className={cn(
-        index === 1 ? "lg:z-10 lg:rounded-b-none" : "lg:mt-8", // middle tier
-        index === 0 ? "lg:rounded-r-none" : "",
-        index === 2 ? "lg:rounded-l-none" : "",
-        className,
-      )}
-    >
-      {children}
-    </div>
-  );
+  return <div className={cn(className)}>{children}</div>;
 }
 
 function Badge({ children }: { children: React.ReactNode }) {
@@ -466,11 +340,4 @@ function Badge({ children }: { children: React.ReactNode }) {
       {children}
     </span>
   );
-}
-
-// $3 => $3
-// $3.5 => $3.50
-function formatPrice(price: number) {
-  if (price - Math.floor(price) > 0) return price.toFixed(2);
-  return price;
 }

@@ -52,6 +52,7 @@ import { prefixPath } from "@/utils/path";
 import { ExpandableText } from "@/components/ExpandableText";
 import { useEmailAccountFull } from "@/hooks/useEmailAccountFull";
 import type { RulesResponse } from "@/app/api/user/rules/route";
+import { sortActionsByPriority } from "@/utils/action-sort";
 import { inboxZeroLabels } from "@/utils/label";
 import { isDefined } from "@/utils/types";
 import { useAssistantNavigation } from "@/hooks/useAssistantNavigation";
@@ -82,7 +83,7 @@ export function Rules({
   const ruleDialog = useDialogState<{ ruleId: string; editMode?: boolean }>();
   const coldEmailDialog = useDialogState();
 
-  const onCreateRule = () => ruleDialog.open();
+  const onCreateRule = () => ruleDialog.onOpen();
 
   const { emailAccountId, provider } = useAccount();
   const { createAssistantUrl } = useAssistantNavigation(emailAccountId);
@@ -259,9 +260,9 @@ export function Rules({
                           type="button"
                           onClick={() => {
                             if (isColdEmailBlocker) {
-                              coldEmailDialog.open();
+                              coldEmailDialog.onOpen();
                             } else {
-                              ruleDialog.open({
+                              ruleDialog.onOpen({
                                 ruleId: rule.id,
                                 editMode: false,
                               });
@@ -343,9 +344,9 @@ export function Rules({
                             <DropdownMenuItem
                               onClick={() => {
                                 if (isColdEmailBlocker) {
-                                  coldEmailDialog.open();
+                                  coldEmailDialog.onOpen();
                                 } else {
-                                  ruleDialog.open({
+                                  ruleDialog.onOpen({
                                     ruleId: rule.id,
                                     editMode: false,
                                   });
@@ -358,9 +359,9 @@ export function Rules({
                             <DropdownMenuItem
                               onClick={() => {
                                 if (isColdEmailBlocker) {
-                                  coldEmailDialog.open();
+                                  coldEmailDialog.onOpen();
                                 } else {
-                                  ruleDialog.open({
+                                  ruleDialog.onOpen({
                                     ruleId: rule.id,
                                     editMode: true,
                                   });
@@ -500,17 +501,17 @@ export function Rules({
       <RuleDialog
         ruleId={ruleDialog.data?.ruleId}
         isOpen={ruleDialog.isOpen}
-        onClose={ruleDialog.close}
+        onClose={ruleDialog.onClose}
         onSuccess={() => {
           mutate();
-          ruleDialog.close();
+          ruleDialog.onClose();
         }}
         editMode={ruleDialog.data?.editMode}
       />
 
       <ColdEmailDialog
         isOpen={coldEmailDialog.isOpen}
-        onClose={coldEmailDialog.close}
+        onClose={coldEmailDialog.onClose}
       />
     </div>
   );
@@ -525,12 +526,13 @@ export function ActionBadges({
     type: ActionType;
     label?: string | null;
     folderName?: string | null;
+    content?: string | null;
   }[];
   provider: string;
 }) {
   return (
     <div className="flex gap-2">
-      {actions.map((action) => {
+      {sortActionsByPriority(actions).map((action) => {
         // Hidden for simplicity
         if (action.type === ActionType.TRACK_THREAD) return null;
 

@@ -38,25 +38,11 @@ export function usePricingFrequencyDefault() {
   );
 }
 
-export function useDelayedActionsEnabled() {
-  return true;
-  // return useFeatureFlagEnabled("delayed-actions");
-}
-
 export type TestimonialsVariant = "control" | "senja-widget";
 
 export function useTestimonialsVariant() {
   return (
     (useFeatureFlagVariantKey("testimonials") as TestimonialsVariant) ||
-    "control"
-  );
-}
-
-export type OnboardingVariant = "control" | "new-onboarding";
-
-export function useOnboardingVariant() {
-  return (
-    (useFeatureFlagVariantKey("onboarding-flow") as OnboardingVariant) ||
     "control"
   );
 }
