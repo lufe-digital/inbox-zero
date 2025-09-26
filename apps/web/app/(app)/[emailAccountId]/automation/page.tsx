@@ -1,4 +1,5 @@
 import { Suspense } from "react";
+import { SparklesIcon } from "lucide-react";
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import prisma from "@/utils/prisma";
@@ -10,7 +11,6 @@ import { PermissionsCheck } from "@/app/(app)/[emailAccountId]/PermissionsCheck"
 import { EmailProvider } from "@/providers/EmailProvider";
 import { ASSISTANT_ONBOARDING_COOKIE } from "@/utils/cookies";
 import { prefixPath } from "@/utils/path";
-import { PremiumAlertWithData } from "@/components/PremiumAlert";
 import { checkUserOwnsEmailAccount } from "@/utils/email-account";
 import { SettingsTab } from "@/app/(app)/[emailAccountId]/assistant/settings/SettingsTab";
 import { TabSelect } from "@/components/TabSelect";
@@ -18,6 +18,7 @@ import { RulesTab } from "@/app/(app)/[emailAccountId]/assistant/RulesTabNew";
 import { AIChatButton } from "@/app/(app)/[emailAccountId]/assistant/AIChatButton";
 import { PageWrapper } from "@/components/PageWrapper";
 import { PageHeader } from "@/components/PageHeader";
+import { DismissibleVideoCard } from "@/components/VideoCard";
 
 export const maxDuration = 300; // Applies to the actions
 
@@ -84,8 +85,6 @@ export default async function AutomationPage({
         <PermissionsCheck />
 
         <PageWrapper>
-          <PremiumAlertWithData className="mb-2" />
-
           <div className="flex items-center justify-between">
             <div>
               <PageHeader
@@ -95,7 +94,7 @@ export default async function AutomationPage({
                   title: "Getting started with AI Personal Assistant",
                   description:
                     "Learn how to use the AI Personal Assistant to automatically label, archive, and more.",
-                  videoId: "SoeNDVr7ve4",
+                  muxPlaybackId: "VwIP7UAw4MXDjkvmLjJzGsY00ee9jxIZVI952DoBBfp8",
                 }}
               />
             </div>
@@ -121,6 +120,17 @@ export default async function AutomationPage({
               />
             </Suspense>
           </div>
+
+          <DismissibleVideoCard
+            className="my-4"
+            icon={<SparklesIcon className="h-5 w-5" />}
+            title="Getting started with AI Assistant"
+            description={
+              "Learn how to use the AI Assistant to automatically label, archive, and more."
+            }
+            muxPlaybackId="VwIP7UAw4MXDjkvmLjJzGsY00ee9jxIZVI952DoBBfp8"
+            storageKey="ai-assistant-onboarding-video"
+          />
 
           <Tabs defaultValue="rules">
             <TabsContent value="rules" className="mb-10">

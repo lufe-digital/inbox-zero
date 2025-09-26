@@ -57,6 +57,7 @@ import type {
   EmailFilter,
 } from "@/utils/email/types";
 import { unwatchOutlook, watchOutlook } from "@/utils/outlook/watch";
+import { escapeODataString } from "@/utils/outlook/odata-escape";
 
 const logger = createScopedLogger("outlook-provider");
 
@@ -174,7 +175,7 @@ export class OutlookProvider implements EmailProvider {
 
     // Add exclusion filters for TO emails
     for (const email of excludeToEmails) {
-      const escapedEmail = email.replace(/'/g, "''");
+      const escapedEmail = escapeODataString(email);
       filters.push(
         `not (toRecipients/any(r: r/emailAddress/address eq '${escapedEmail}'))`,
       );
@@ -182,7 +183,7 @@ export class OutlookProvider implements EmailProvider {
 
     // Add exclusion filters for FROM emails
     for (const email of excludeFromEmails) {
-      const escapedEmail = email.replace(/'/g, "''");
+      const escapedEmail = escapeODataString(email);
       filters.push(`not (from/emailAddress/address eq '${escapedEmail}')`);
     }
 
@@ -283,12 +284,13 @@ export class OutlookProvider implements EmailProvider {
   async draftEmail(
     email: ParsedMessage,
     args: { to?: string; subject?: string; content: string },
+    userEmail: string,
     executedRule?: { id: string; threadId: string; emailAccountId: string },
   ): Promise<{ draftId: string }> {
     if (executedRule) {
       // Run draft creation and previous draft deletion in parallel
       const [result] = await Promise.all([
-        draftEmail(this.client, email, args),
+        draftEmail(this.client, email, args, userEmail),
         handlePreviousDraftDeletion({
           client: this,
           executedRule,
@@ -297,7 +299,7 @@ export class OutlookProvider implements EmailProvider {
       ]);
       return { draftId: result.id || "" };
     } else {
-      const result = await draftEmail(this.client, email, args);
+      const result = await draftEmail(this.client, email, args, userEmail);
       return { draftId: result.id || "" };
     }
   }
@@ -533,6 +535,26 @@ export class OutlookProvider implements EmailProvider {
     };
   }
 
+  async getMessagesFromSender(options: {
+    senderEmail: string;
+    maxResults?: number;
+    pageToken?: string;
+    before?: Date;
+    after?: Date;
+  }): Promise<{
+    messages: ParsedMessage[];
+    nextPageToken?: string;
+  }> {
+    const senderFilter = `from/emailAddress/address eq '${escapeODataString(options.senderEmail)}'`;
+    return this.getMessagesWithPagination({
+      query: senderFilter,
+      maxResults: options.maxResults,
+      pageToken: options.pageToken,
+      before: options.before,
+      after: options.after,
+    });
+  }
+
   async getMessagesBatch(messageIds: string[]): Promise<ParsedMessage[]> {
     // For Outlook, we need to fetch messages individually since there's no batch endpoint
     const messagePromises = messageIds.map((messageId) =>
@@ -659,16 +681,23 @@ export class OutlookProvider implements EmailProvider {
     // Add other filters
     if (query?.fromEmail) {
       // Escape single quotes in email address
-      const escapedEmail = query.fromEmail.replace(/'/g, "''");
+      const escapedEmail = escapeODataString(query.fromEmail);
       filters.push(`from/emailAddress/address eq '${escapedEmail}'`);
     }
 
-    if (query?.q) {
-      // Escape single quotes in search query
-      const escapedQuery = query.q.replace(/'/g, "''");
-      filters.push(
-        `(contains(subject,'${escapedQuery}') or contains(bodyPreview,'${escapedQuery}'))`,
-      );
+    // Handle structured date options
+    if (query?.after) {
+      const afterISO = query.after.toISOString();
+      filters.push(`receivedDateTime gt ${afterISO}`);
+    }
+
+    if (query?.before) {
+      const beforeISO = query.before.toISOString();
+      filters.push(`receivedDateTime lt ${beforeISO}`);
+    }
+
+    if (query?.isUnread) {
+      filters.push("isRead eq false");
     }
 
     const filter = filters.length > 0 ? filters.join(" and ") : undefined;
@@ -810,7 +839,7 @@ export class OutlookProvider implements EmailProvider {
         .getClient()
         .api("/me/messages")
         .filter(
-          `from/emailAddress/address eq '${options.from}' and receivedDateTime lt ${options.date.toISOString()}`,
+          `from/emailAddress/address eq '${escapeODataString(options.from)}' and receivedDateTime lt ${options.date.toISOString()}`,
         )
         .top(2)
         .select("id")

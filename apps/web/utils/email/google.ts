@@ -278,12 +278,13 @@ export class GmailProvider implements EmailProvider {
   async draftEmail(
     email: ParsedMessage,
     args: { to?: string; subject?: string; content: string },
+    userEmail: string,
     executedRule?: { id: string; threadId: string; emailAccountId: string },
   ): Promise<{ draftId: string }> {
     if (executedRule) {
       // Run draft creation and previous draft deletion in parallel
       const [result] = await Promise.all([
-        draftEmail(this.client, email, args),
+        draftEmail(this.client, email, args, userEmail),
         handlePreviousDraftDeletion({
           client: this,
           executedRule,
@@ -292,7 +293,7 @@ export class GmailProvider implements EmailProvider {
       ]);
       return { draftId: result.data.id || "" };
     } else {
-      const result = await draftEmail(this.client, email, args);
+      const result = await draftEmail(this.client, email, args, userEmail);
       return { draftId: result.data.id || "" };
     }
   }
@@ -497,6 +498,25 @@ export class GmailProvider implements EmailProvider {
     };
   }
 
+  async getMessagesFromSender(options: {
+    senderEmail: string;
+    maxResults?: number;
+    pageToken?: string;
+    before?: Date;
+    after?: Date;
+  }): Promise<{
+    messages: ParsedMessage[];
+    nextPageToken?: string;
+  }> {
+    return this.getMessagesWithPagination({
+      query: `from:${options.senderEmail}`,
+      maxResults: options.maxResults,
+      pageToken: options.pageToken,
+      before: options.before,
+      after: options.after,
+    });
+  }
+
   async getMessagesBatch(messageIds: string[]): Promise<ParsedMessage[]> {
     return getMessagesBatch({
       messageIds,
@@ -593,16 +613,31 @@ export class GmailProvider implements EmailProvider {
     const query = options.query;
 
     function getQuery() {
-      if (query?.q) {
-        return query.q;
-      }
+      const queryParts: string[] = [];
+
       if (query?.fromEmail) {
-        return `from:${query.fromEmail}`;
+        queryParts.push(`from:${query.fromEmail}`);
       }
+
+      if (query?.after) {
+        const afterSeconds = Math.floor(query.after.getTime() / 1000);
+        queryParts.push(`after:${afterSeconds}`);
+      }
+
+      if (query?.before) {
+        const beforeSeconds = Math.floor(query.before.getTime() / 1000);
+        queryParts.push(`before:${beforeSeconds}`);
+      }
+
+      if (query?.isUnread) {
+        queryParts.push("is:unread");
+      }
+
       if (query?.type === "archive") {
-        return `-label:${GmailLabel.INBOX}`;
+        queryParts.push(`-label:${GmailLabel.INBOX}`);
       }
-      return undefined;
+
+      return queryParts.length > 0 ? queryParts.join(" ") : undefined;
     }
 
     function getLabelIds(type?: string | null) {

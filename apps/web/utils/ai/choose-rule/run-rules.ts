@@ -4,7 +4,12 @@ import type {
   RuleWithActionsAndCategories,
 } from "@/utils/types";
 import type { EmailAccountWithAI } from "@/utils/llms/types";
-import { ExecutedRuleStatus, type Prisma, type Rule } from "@prisma/client";
+import {
+  ExecutedRuleStatus,
+  SystemType,
+  type Prisma,
+  type Rule,
+} from "@prisma/client";
 import type { ActionItem } from "@/utils/ai/types";
 import { findMatchingRule } from "@/utils/ai/choose-rule/match-rules";
 import { getActionItemsWithAiArgs } from "@/utils/ai/choose-rule/choose-args";
@@ -15,6 +20,7 @@ import { createScopedLogger } from "@/utils/logger";
 import type { MatchReason } from "@/utils/ai/choose-rule/types";
 import { sanitizeActionFields } from "@/utils/action-item";
 import { extractEmailAddress } from "@/utils/email";
+import { filterNullProperties } from "@/utils";
 import { analyzeSenderPattern } from "@/app/api/ai/analyze-sender-pattern/call-analyze-pattern-api";
 import {
   scheduleDelayedActions,
@@ -64,7 +70,9 @@ export async function runRules({
     emailAccountId: emailAccount.id,
   });
 
-  logger.trace("Matching rule", { result });
+  logger.trace("Matching rule", () => ({
+    result: filterNullProperties(result),
+  }));
 
   if (result.rule) {
     return await executeMatchedRule(
@@ -308,18 +316,7 @@ async function analyzeSenderPatternIfAiMatch({
   message: ParsedMessage;
   emailAccountId: string;
 }) {
-  if (
-    !isTest &&
-    result.rule &&
-    // skip if we already matched for static reasons
-    // learnings only needed for rules that would run through an ai
-    !result.matchReasons?.some(
-      (reason) =>
-        reason.type === "STATIC" ||
-        reason.type === "GROUP" ||
-        reason.type === "CATEGORY",
-    )
-  ) {
+  if (shouldAnalyzeSenderPattern({ isTest, result })) {
     const fromAddress = extractEmailAddress(message.headers.from);
     if (fromAddress) {
       after(() =>
@@ -330,4 +327,29 @@ async function analyzeSenderPatternIfAiMatch({
       );
     }
   }
+}
+
+function shouldAnalyzeSenderPattern({
+  isTest,
+  result,
+}: {
+  isTest: boolean;
+  result: { rule?: Rule | null; matchReasons?: MatchReason[] };
+}) {
+  if (isTest) return false;
+  if (!result.rule) return false;
+  if (result.rule.systemType === SystemType.TO_REPLY) return false;
+
+  // skip if we already matched for static reasons
+  // learnings only needed for rules that would run through an ai
+  if (
+    result.matchReasons?.some(
+      (reason) =>
+        reason.type === "STATIC" ||
+        reason.type === "GROUP" ||
+        reason.type === "CATEGORY",
+    )
+  )
+    return false;
+  return true;
 }

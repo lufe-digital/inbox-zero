@@ -7,7 +7,8 @@ import { PlayIcon } from "lucide-react";
 type Video = {
   title: string;
   description: React.ReactNode;
-  videoId: string;
+  youtubeVideoId?: string;
+  muxPlaybackId?: string;
 };
 
 export function PageHeader({
@@ -24,7 +25,9 @@ export function PageHeader({
       <PageHeading>{title}</PageHeading>
       <div className="flex items-center mt-1">
         <PageSubHeading>{description}</PageSubHeading>
-        {video && <WatchVideo video={video} />}
+        {video && (video.youtubeVideoId || video.muxPlaybackId) && (
+          <WatchVideo video={video} />
+        )}
       </div>
     </div>
   );
@@ -36,13 +39,14 @@ function WatchVideo({ video }: { video: Video }) {
       <DialogTrigger asChild>
         <Button variant="outline" size="xs" className="ml-3">
           <PlayIcon className="mr-2 size-3" />
-          Watch Video
+          Watch demo
         </Button>
       </DialogTrigger>
       <OnboardingDialogContent
         title={video.title}
         description={video.description}
-        videoId={video.videoId}
+        youtubeVideoId={video.youtubeVideoId}
+        muxPlaybackId={video.muxPlaybackId}
       />
     </Dialog>
   );

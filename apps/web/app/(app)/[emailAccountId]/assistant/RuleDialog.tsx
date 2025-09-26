@@ -1,5 +1,6 @@
 "use client";
 
+import { useCallback } from "react";
 import {
   Dialog,
   DialogContent,
@@ -10,6 +11,9 @@ import { RuleForm } from "./RuleForm";
 import { LoadingContent } from "@/components/LoadingContent";
 import { useRule } from "@/hooks/useRule";
 import type { CreateRuleBody } from "@/utils/actions/rule.validation";
+import { useDialogState } from "@/hooks/useDialogState";
+import { ActionType, LogicalOperator } from "@prisma/client";
+import { ConditionType } from "@/utils/config";
 
 interface RuleDialogProps {
   ruleId?: string;
@@ -18,6 +22,23 @@ interface RuleDialogProps {
   onSuccess?: () => void;
   initialRule?: Partial<CreateRuleBody>;
   editMode?: boolean;
+}
+
+export function useRuleDialog() {
+  const ruleDialog = useDialogState<{ ruleId: string }>();
+
+  const RuleDialogComponent = useCallback(() => {
+    return (
+      <RuleDialog
+        ruleId={ruleDialog.data?.ruleId}
+        isOpen={ruleDialog.isOpen}
+        onClose={ruleDialog.onClose}
+        editMode={false}
+      />
+    );
+  }, [ruleDialog.data?.ruleId, ruleDialog.isOpen, ruleDialog.onClose]);
+
+  return { ruleDialog, RuleDialogComponent };
 }
 
 export function RuleDialog({
@@ -59,11 +80,19 @@ export function RuleDialog({
             <RuleForm
               rule={{
                 name: "",
-                actions: [],
-                conditions: [],
+                conditions: [
+                  {
+                    type: ConditionType.AI,
+                  },
+                ],
+                actions: [
+                  {
+                    type: ActionType.LABEL,
+                  },
+                ],
                 automate: true,
                 runOnThreads: true,
-                conditionalOperator: "AND" as const,
+                conditionalOperator: LogicalOperator.AND,
                 ...initialRule,
               }}
               alwaysEditMode={true}

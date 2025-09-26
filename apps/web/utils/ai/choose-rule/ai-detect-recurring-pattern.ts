@@ -20,6 +20,7 @@ export async function aiDetectRecurringPattern({
   emails,
   emailAccount,
   rules,
+  consistentRuleName,
 }: {
   emails: EmailForLLM[];
   emailAccount: EmailAccountWithAI;
@@ -27,6 +28,7 @@ export async function aiDetectRecurringPattern({
     name: string;
     instructions: string;
   }[];
+  consistentRuleName?: string;
 }): Promise<DetectPatternResult | null> {
   // Extract the sender email from the first email
   // All emails should be from the same sender
@@ -39,20 +41,30 @@ export async function aiDetectRecurringPattern({
 <instructions>
 Your task is to determine if emails from a specific sender should ALWAYS be matched to the same rule.
 
-Analyze the email content to determine if this sender ALWAYS matches a specific rule.
-Only return a matchedRule if you're 100% confident all future emails from this sender will serve the same purpose; otherwise return null.
+${consistentRuleName ? `IMPORTANT: Historical data shows that ALL previous emails from this sender have been matched to the "${consistentRuleName}" rule. Your task is to verify if this pattern should be learned for future emails.` : ""}
 
-A sender should only be matched to a rule if you are HIGHLY CONFIDENT (>80%) that:
+Analyze the email content to determine if this sender ALWAYS matches a specific rule.
+Only return a matchedRule if you're 90%+ confident all future emails from this sender will serve the same purpose; otherwise return null.
+
+A sender should only be matched to a rule if you are HIGHLY CONFIDENT that:
 - All future emails from this sender will serve the same purpose
 - The purpose clearly aligns with one specific rule
 - There's a consistent pattern across all sample emails provided
+${consistentRuleName ? `- The content justifies always matching to the "${consistentRuleName}" rule` : ""}
 
 Examples of senders that typically match a single rule:
 - invoice@stripe.com → receipt rule (always sends payment confirmations)
 - newsletter@substack.com → newsletter rule (always sends newsletters)
-- noreply@linkedin.com → social rule (always job or connection notifications)
+- noreply@linkedin.com → notification rule (always sends platform notifications)
+- calendar@calendly.com → calendar rule (always sends calendar invites)
 
-Pay close attention to the ACTUAL CONTENT of the sample emails provided. The decision should be based primarily on content analysis, not just the sender's email pattern.
+Examples of senders that should NOT have learned patterns:
+- personal emails (john@gmail.com) → content varies too much
+
+Pay close attention to:
+1. The sender's email domain - generic domains (gmail.com, outlook.com) rarely warrant pattern learning
+2. The ACTUAL CONTENT of emails - must be consistently about the same topic/purpose
+3. The sender's role - service-specific emails are good candidates, personal emails are not
 
 Be conservative in your matching. If there's any doubt, return null for "matchedRule".
 </instructions>
@@ -79,7 +91,7 @@ Respond with a JSON object with the following fields:
 - "matchedRule": string or null - the name of the existing rule that should handle all emails from this sender
 - "explanation": string - one sentence explanation of why this rule does or doesn't match
 
-If you're not confident (at least 80% certain) that a single rule should handle all emails from this sender, return null for matchedRule.
+If you're not confident (at least 90% certain) that a single rule should handle all emails from this sender, return null for "matchedRule".
 </outputFormat>`;
 
   const prompt = `Analyze these emails and determine if they consistently match a rule:
