@@ -5,8 +5,6 @@ import { after } from "next/server";
 import {
   createRuleBody,
   updateRuleBody,
-  updateRuleInstructionsBody,
-  rulesExamplesBody,
   updateRuleSettingsBody,
   enableDraftRepliesBody,
   deleteRuleBody,
@@ -16,7 +14,6 @@ import {
 } from "@/utils/actions/rule.validation";
 import prisma from "@/utils/prisma";
 import { isDuplicateError, isNotFoundError } from "@/utils/prisma-helpers";
-import { aiFindExampleMatches } from "@/utils/ai/example-matches/find-example-matches";
 import { flattenConditions } from "@/utils/condition";
 import {
   ActionType,
@@ -39,15 +36,11 @@ import { INTERNAL_API_KEY_HEADER } from "@/utils/internal-api";
 import type { ProcessPreviousBody } from "@/app/api/reply-tracker/process-previous/route";
 import { RuleName, SystemRule } from "@/utils/rule/consts";
 import { actionClient } from "@/utils/actions/safe-action";
-import {
-  getGmailClientForEmail,
-  getOutlookClientForEmail,
-} from "@/utils/account";
-import { getEmailAccountWithAi } from "@/utils/user/get";
 import { prefixPath } from "@/utils/path";
 import { createRuleHistory } from "@/utils/rule/rule-history";
 import { ONE_WEEK_MINUTES } from "@/utils/date";
-import { getOrCreateOutlookFolderIdByName } from "@/utils/outlook/folders";
+import { createEmailProvider } from "@/utils/email/provider";
+import { resolveLabelNameAndId } from "@/utils/label/resolve-label";
 
 function getCategoryActionDescription(categoryAction: CategoryAction): string {
   switch (categoryAction) {
@@ -70,9 +63,21 @@ async function getActionsFromCategoryAction(
   categoryAction: CategoryAction,
   label: string,
   hasDigest: boolean,
+  provider: string,
 ): Promise<Prisma.ActionCreateManyRuleInput[]> {
+  const emailProvider = await createEmailProvider({
+    emailAccountId,
+    provider,
+  });
+
+  const { label: labelName, labelId } = await resolveLabelNameAndId({
+    emailProvider,
+    label,
+    labelId: null,
+  });
+
   let actions: Prisma.ActionCreateManyRuleInput[] = [
-    { type: ActionType.LABEL, label },
+    { type: ActionType.LABEL, label: labelName, labelId },
   ];
 
   switch (categoryAction) {
@@ -89,9 +94,11 @@ async function getActionsFromCategoryAction(
     }
     case "move_folder":
     case "move_folder_delayed": {
-      const outlook = await getOutlookClientForEmail({ emailAccountId });
-      const folderId = await getOrCreateOutlookFolderIdByName(
-        outlook,
+      const emailProvider = await createEmailProvider({
+        emailAccountId,
+        provider,
+      });
+      const folderId = await emailProvider.getOrCreateOutlookFolderIdByName(
         rule.name,
       );
       actions = [
@@ -121,10 +128,9 @@ export const createRuleAction = actionClient
   .schema(createRuleBody)
   .action(
     async ({
-      ctx: { emailAccountId, provider, logger },
+      ctx: { emailAccountId, logger, provider },
       parsedInput: {
         name,
-        automate,
         runOnThreads,
         actions,
         conditions: conditionsInput,
@@ -134,19 +140,24 @@ export const createRuleAction = actionClient
     }) => {
       const conditions = flattenConditions(conditionsInput);
 
+      const resolvedActions = await resolveActionLabels(
+        actions || [],
+        emailAccountId,
+        provider,
+      );
+
       try {
         const rule = await prisma.rule.create({
           data: {
             name,
-            automate: automate ?? undefined,
             runOnThreads: runOnThreads ?? undefined,
-            actions: actions
+            actions: resolvedActions.length
               ? {
                   createMany: {
-                    data: actions.map(
+                    data: resolvedActions.map(
                       ({
                         type,
-                        label,
+                        labelId,
                         subject,
                         content,
                         to,
@@ -158,7 +169,8 @@ export const createRuleAction = actionClient
                       }) => {
                         return sanitizeActionFields({
                           type,
-                          label: label?.value,
+                          label: labelId?.name,
+                          labelId: labelId?.value,
                           subject: subject?.value,
                           content: content?.value,
                           to: to?.value,
@@ -220,11 +232,10 @@ export const updateRuleAction = actionClient
   .schema(updateRuleBody)
   .action(
     async ({
-      ctx: { emailAccountId, logger },
+      ctx: { emailAccountId, logger, provider },
       parsedInput: {
         id,
         name,
-        automate,
         runOnThreads,
         actions,
         conditions: conditionsInput,
@@ -233,6 +244,12 @@ export const updateRuleAction = actionClient
       },
     }) => {
       const conditions = flattenConditions(conditionsInput);
+
+      const resolvedActions = await resolveActionLabels(
+        actions,
+        emailAccountId,
+        provider,
+      );
 
       try {
         const currentRule = await prisma.rule.findUnique({
@@ -244,17 +261,17 @@ export const updateRuleAction = actionClient
         const currentActions = currentRule.actions;
 
         const actionsToDelete = currentActions.filter(
-          (currentAction) => !actions.find((a) => a.id === currentAction.id),
+          (currentAction) =>
+            !resolvedActions.find((a) => a.id === currentAction.id),
         );
-        const actionsToUpdate = actions.filter((a) => a.id);
-        const actionsToCreate = actions.filter((a) => !a.id);
+        const actionsToUpdate = resolvedActions.filter((a) => a.id);
+        const actionsToCreate = resolvedActions.filter((a) => !a.id);
 
         const [updatedRule] = await prisma.$transaction([
           // update rule
           prisma.rule.update({
             where: { id, emailAccountId },
             data: {
-              automate: automate ?? undefined,
               runOnThreads: runOnThreads ?? undefined,
               name: name || undefined,
               conditionalOperator: conditionalOperator || LogicalOperator.AND,
@@ -289,7 +306,8 @@ export const updateRuleAction = actionClient
               where: { id: a.id },
               data: sanitizeActionFields({
                 type: a.type,
-                label: a.label?.value,
+                label: a.labelId?.name,
+                labelId: a.labelId?.value,
                 subject: a.subject?.value,
                 content: a.content?.value,
                 to: a.to?.value,
@@ -309,7 +327,8 @@ export const updateRuleAction = actionClient
                     return {
                       ...sanitizeActionFields({
                         type: a.type,
-                        label: a.label?.value,
+                        label: a.labelId?.name,
+                        labelId: a.labelId?.value,
                         subject: a.subject?.value,
                         content: a.content?.value,
                         to: a.to?.value,
@@ -353,23 +372,6 @@ export const updateRuleAction = actionClient
         logger.error("Error updating rule", { error });
         throw new SafeError("Error updating rule");
       }
-    },
-  );
-
-export const updateRuleInstructionsAction = actionClient
-  .metadata({ name: "updateRuleInstructions" })
-  .schema(updateRuleInstructionsBody)
-  .action(
-    async ({ ctx: { emailAccountId }, parsedInput: { id, instructions } }) => {
-      const currentRule = await prisma.rule.findUnique({
-        where: { id, emailAccountId },
-        include: { actions: true, categoryFilters: true, group: true },
-      });
-      if (!currentRule) throw new SafeError("Rule not found");
-
-      revalidatePath(prefixPath(emailAccountId, `/assistant/rule/${id}`));
-      revalidatePath(prefixPath(emailAccountId, "/assistant"));
-      revalidatePath(prefixPath(emailAccountId, "/automation"));
     },
   );
 
@@ -444,47 +446,27 @@ export const enableDraftRepliesAction = actionClient
 export const deleteRuleAction = actionClient
   .metadata({ name: "deleteRule" })
   .schema(deleteRuleBody)
-  .action(
-    async ({ ctx: { emailAccountId, provider }, parsedInput: { id } }) => {
-      const rule = await prisma.rule.findUnique({
-        where: { id, emailAccountId },
-        include: { actions: true, categoryFilters: true, group: true },
+  .action(async ({ ctx: { emailAccountId }, parsedInput: { id } }) => {
+    const rule = await prisma.rule.findUnique({
+      where: { id, emailAccountId },
+      include: { actions: true, categoryFilters: true, group: true },
+    });
+    if (!rule) return; // already deleted
+    if (rule.emailAccountId !== emailAccountId)
+      throw new SafeError("You don't have permission to delete this rule");
+
+    try {
+      await deleteRule({
+        ruleId: id,
+        emailAccountId,
+        groupId: rule.groupId,
       });
-      if (!rule) return; // already deleted
-      if (rule.emailAccountId !== emailAccountId)
-        throw new SafeError("You don't have permission to delete this rule");
 
-      try {
-        await deleteRule({
-          ruleId: id,
-          emailAccountId,
-          groupId: rule.groupId,
-        });
-
-        revalidatePath(prefixPath(emailAccountId, `/assistant/rule/${id}`));
-      } catch (error) {
-        if (isNotFoundError(error)) return;
-        throw error;
-      }
-    },
-  );
-
-export const getRuleExamplesAction = actionClient
-  .metadata({ name: "getRuleExamples" })
-  .schema(rulesExamplesBody)
-  .action(async ({ ctx: { emailAccountId }, parsedInput: { rulesPrompt } }) => {
-    const emailAccount = await getEmailAccountWithAi({ emailAccountId });
-    if (!emailAccount) throw new SafeError("Email account not found");
-
-    const gmail = await getGmailClientForEmail({ emailAccountId });
-
-    const { matches } = await aiFindExampleMatches(
-      emailAccount,
-      gmail,
-      rulesPrompt,
-    );
-
-    return { matches };
+      revalidatePath(prefixPath(emailAccountId, `/assistant/rule/${id}`));
+    } catch (error) {
+      if (isNotFoundError(error)) return;
+      throw error;
+    }
   });
 
 export const createRulesOnboardingAction = actionClient
@@ -517,7 +499,7 @@ export const createRulesOnboardingAction = actionClient
       });
       if (!emailAccount) throw new SafeError("User not found");
 
-      const promises: Promise<any>[] = [];
+      const promises: Promise<unknown>[] = [];
 
       const isSet = (
         value: string | undefined | null,
@@ -606,6 +588,7 @@ export const createRulesOnboardingAction = actionClient
               categoryAction,
               label,
               hasDigest,
+              provider,
             );
 
             return (
@@ -629,8 +612,6 @@ export const createRulesOnboardingAction = actionClient
             );
           })();
           promises.push(promise);
-
-          // TODO: prompt file update
         } else {
           const promise = (async () => {
             const actions = await getActionsFromCategoryAction(
@@ -639,6 +620,7 @@ export const createRulesOnboardingAction = actionClient
               categoryAction,
               label,
               hasDigest,
+              provider,
             );
 
             return prisma.rule
@@ -648,7 +630,6 @@ export const createRulesOnboardingAction = actionClient
                   name,
                   instructions,
                   systemType: systemType ?? undefined,
-                  automate: true,
                   runOnThreads,
                   actions: {
                     createMany: { data: actions },
@@ -825,4 +806,42 @@ export async function getRuleNameByExecutedAction(
   }
 
   return executedAction.executedRule?.rule?.name;
+}
+
+async function resolveActionLabels<
+  T extends {
+    type: ActionType;
+    labelId?: {
+      name?: string | null;
+      value?: string | null;
+      ai?: boolean | null;
+    } | null;
+  },
+>(actions: T[], emailAccountId: string, provider: string) {
+  const emailProvider = await createEmailProvider({
+    emailAccountId,
+    provider,
+  });
+
+  return Promise.all(
+    actions.map(async (action) => {
+      if (action.type === ActionType.LABEL) {
+        const { label: resolvedLabel, labelId: resolvedLabelId } =
+          await resolveLabelNameAndId({
+            emailProvider,
+            label: action.labelId?.name || null,
+            labelId: action.labelId?.value || null,
+          });
+        return {
+          ...action,
+          labelId: {
+            value: resolvedLabelId,
+            name: resolvedLabel,
+            ai: action.labelId?.ai,
+          },
+        };
+      }
+      return action;
+    }),
+  );
 }

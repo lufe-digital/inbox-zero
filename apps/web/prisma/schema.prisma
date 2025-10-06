@@ -96,7 +96,6 @@ model User {
   // Referral relationships
   referralsMade    Referral[] @relation("ReferrerUser")
   referralReceived Referral?  @relation("ReferredUser")
-
 }
 
 // Migrating over to the new settings model. Currently most settings are in the User model, but will be moved to this model in the future.
@@ -111,7 +110,7 @@ model EmailAccount {
 
   about                     String?
   writingStyle              String?
-  signature                 String?
+  signature                 String? // User's email signature from provider or manually set
   includeReferralSignature  Boolean   @default(true)
   watchEmailsExpirationDate DateTime?
   watchEmailsSubscriptionId String? // For Outlook subscription ID
@@ -129,6 +128,11 @@ model EmailAccount {
   rulesPrompt           String?
   outboundReplyTracking Boolean           @default(false) // When true: manages "To Reply" and "Awaiting Reply" labels automatically
   autoCategorizeSenders Boolean           @default(false)
+
+  // Configurable system labels (store stable IDs)
+  needsReplyLabelId     String? // Gmail: Label ID, Outlook: Category ID
+  awaitingReplyLabelId  String? // Gmail: Label ID, Outlook: Category ID
+  coldEmailLabelId      String? // Gmail: Label ID, Outlook: Category ID
 
   digestSchedule Schedule?
 
@@ -154,10 +158,11 @@ model EmailAccount {
   digests          Digest[]
   scheduledActions ScheduledAction[]
 
-  members      Member[]
-  invitations  Invitation[]
-  ssoproviders SsoProvider[]
+  members             Member[]
+  invitations         Invitation[]
+  ssoproviders        SsoProvider[]
   calendarConnections CalendarConnection[]
+  mcpConnections      McpConnection[]
 
   @@index([lastSummaryEmailAt])
 }
@@ -222,7 +227,7 @@ model SsoProvider {
   samlConfig     String?
   emailAccountId String?
   emailAccount   EmailAccount? @relation(fields: [emailAccountId], references: [id], onDelete: Cascade)
-  providerId     String  @unique
+  providerId     String        @unique
   organizationId String?
   organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   domain         String
@@ -375,7 +380,7 @@ model Rule {
   name         String
   actions      Action[]
   enabled      Boolean  @default(true)
-  automate     Boolean  @default(false) // if disabled, user must approve to execute
+  automate     Boolean  @default(true) // @deprecated - No longer used. All rules are now automated. Kept for historical data only.
   runOnThreads Boolean  @default(false) // if disabled, only runs on individual emails
 
   emailAccountId String
@@ -423,7 +428,8 @@ model Action {
   ruleId    String
   rule      Rule       @relation(fields: [ruleId], references: [id], onDelete: Cascade)
 
-  label          String?
+  label          String? // labelName - labelId is the source of truth, and we use it when set
+  labelId        String? // Stable ID: Label ID (Gmail) or Category ID (Outlook)
   subject        String?
   content        String?
   to             String?
@@ -501,6 +507,7 @@ model ExecutedAction {
 
   // optional extra fields to be used with the action
   label      String?
+  labelId    String? // Stable ID: Label ID (Gmail) or Category ID (Outlook)
   subject    String?
   content    String?
   to         String?
@@ -532,6 +539,7 @@ model ScheduledAction {
   schedulingStatus SchedulingStatus      @default(PENDING)
 
   label       String?
+  labelId     String? // Stable ID: Label ID (Gmail) or Category ID (Outlook)
   subject     String?
   content     String?
   to          String?
@@ -900,6 +908,65 @@ model Referral {
   @@index([status])
 }
 
+model McpIntegration {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  name String @unique // Lookup key to MCP_INTEGRATIONS config
+
+  // OAuth registration metadata (captured during dynamic registration)
+  // These represent what the credentials below were registered for
+  registeredServerUrl        String? // Server URL credentials are registered with
+  registeredAuthorizationUrl String? // OAuth authorization endpoint used
+  registeredTokenUrl         String? // OAuth token endpoint used
+
+  // OAuth client credentials (from dynamic registration - shared across all users)
+  oauthClientId     String?
+  oauthClientSecret String?
+
+  connections McpConnection[]
+}
+
+model McpConnection {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  name     String
+  isActive Boolean @default(true)
+
+  // Encrypted credentials
+  accessToken  String?
+  refreshToken String?
+  apiKey       String?
+  expiresAt    DateTime?
+
+  integrationId  String
+  integration    McpIntegration @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+  emailAccountId String?
+  emailAccount   EmailAccount?  @relation(fields: [emailAccountId], references: [id], onDelete: Cascade)
+  tools          McpTool[]
+
+  @@unique([emailAccountId, integrationId])
+}
+
+model McpTool {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  name        String
+  description String?
+  schema      Json?
+  isEnabled   Boolean @default(true)
+
+  connectionId String
+  connection   McpConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@unique([connectionId, name])
+}
+
 enum ActionType {
   ARCHIVE
   LABEL
@@ -962,8 +1029,8 @@ enum PremiumTier {
 enum ExecutedRuleStatus {
   APPLIED
   APPLYING
-  REJECTED
-  PENDING
+  REJECTED // @deprecated - No longer created. Kept for historical data only.
+  PENDING // @deprecated - No longer created. Kept for historical data only.
   SKIPPED
   ERROR
 }

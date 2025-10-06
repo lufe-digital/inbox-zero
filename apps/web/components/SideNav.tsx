@@ -11,6 +11,7 @@ import {
   BarChartBigIcon,
   BookIcon,
   BrushIcon,
+  CalendarIcon,
   ChevronDownIcon,
   ChevronRightIcon,
   CrownIcon,
@@ -94,13 +95,18 @@ export const useNavigation = () => {
               href: prefixPath(currentEmailAccountId, "/clean"),
               icon: BrushIcon,
             },
-            {
-              name: "Analytics",
-              href: prefixPath(currentEmailAccountId, "/stats"),
-              icon: BarChartBigIcon,
-            },
           ]
         : []),
+      {
+        name: "Analytics",
+        href: prefixPath(currentEmailAccountId, "/stats"),
+        icon: BarChartBigIcon,
+      },
+      {
+        name: "Calendars",
+        href: prefixPath(currentEmailAccountId, "/calendars"),
+        icon: CalendarIcon,
+      },
     ],
     [currentEmailAccountId, provider],
   );

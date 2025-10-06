@@ -10,9 +10,7 @@ import {
   Trash2Icon,
   ToggleRightIcon,
   ToggleLeftIcon,
-  InfoIcon,
   SparklesIcon,
-  EyeIcon,
 } from "lucide-react";
 import { useMemo } from "react";
 import { LoadingContent } from "@/components/LoadingContent";
@@ -38,7 +36,6 @@ import { conditionsToString } from "@/utils/condition";
 import { Badge } from "@/components/Badge";
 import { getActionColor } from "@/components/PlanBadge";
 import { toastError, toastSuccess } from "@/components/Toast";
-import { Tooltip } from "@/components/Tooltip";
 import { useRules } from "@/hooks/useRules";
 import { ActionType, ColdEmailSetting, LogicalOperator } from "@prisma/client";
 import { useAction } from "next-safe-action/hooks";
@@ -60,6 +57,7 @@ import {
   isGoogleProvider,
   isMicrosoftProvider,
 } from "@/utils/email/provider-types";
+import { useLabels } from "@/hooks/useLabels";
 
 const COLD_EMAIL_BLOCKER_RULE_ID = "cold-email-blocker-rule";
 
@@ -74,6 +72,7 @@ export function Rules({
   const { setOpen } = useSidebar();
   const { setInput } = useChat();
   const { data: emailAccountData } = useEmailAccountFull();
+  const { userLabels } = useLabels();
   const ruleDialog = useDialogState<{ ruleId: string; editMode?: boolean }>();
   const coldEmailDialog = useDialogState();
 
@@ -126,15 +125,16 @@ export function Rules({
       id: COLD_EMAIL_BLOCKER_RULE_ID,
       name: "Cold Email",
       instructions: emailAccountData?.coldEmailPrompt || null,
-      automate: true,
       enabled: true,
       runOnThreads: false,
+      automate: true,
       actions: [
         isGoogleProvider(provider)
           ? {
               id: "cold-email-blocker-label",
               type: ActionType.LABEL,
               label: inboxZeroLabels.cold_email.name,
+              labelId: null,
               createdAt: new Date(),
               updatedAt: new Date(),
               ruleId: COLD_EMAIL_BLOCKER_RULE_ID,
@@ -156,6 +156,7 @@ export function Rules({
                 ? ActionType.MOVE_FOLDER
                 : ActionType.ARCHIVE,
               label: null,
+              labelId: null,
               createdAt: new Date(),
               updatedAt: new Date(),
               ruleId: COLD_EMAIL_BLOCKER_RULE_ID,
@@ -175,6 +176,7 @@ export function Rules({
               id: "cold-email-blocker-digest",
               type: ActionType.DIGEST,
               label: null,
+              labelId: null,
               createdAt: new Date(),
               updatedAt: new Date(),
               ruleId: COLD_EMAIL_BLOCKER_RULE_ID,
@@ -277,17 +279,6 @@ export function Rules({
                             </Badge>
                           )}
                           {rule.name}
-                          {!rule.automate && (
-                            <Tooltip content="Actions for matched emails will require manual approval in the 'Pending' tab. You can change this in the rule settings by clicking this badge.">
-                              <Badge
-                                color="yellow"
-                                className="ml-auto text-nowrap"
-                              >
-                                Requires Approval
-                                <InfoIcon className="ml-1.5 size-3" />
-                              </Badge>
-                            </Tooltip>
-                          )}
                         </button>
                       </TableCell>
                       {size === "md" && (
@@ -302,6 +293,7 @@ export function Rules({
                         <ActionBadges
                           actions={rule.actions}
                           provider={provider}
+                          labels={userLabels}
                         />
                       </TableCell>
                       <TableCell className="text-center">
@@ -484,16 +476,19 @@ export function Rules({
 export function ActionBadges({
   actions,
   provider,
+  labels,
 }: {
   actions: {
     id: string;
     type: ActionType;
     label?: string | null;
+    labelId?: string | null;
     folderName?: string | null;
     content?: string | null;
     to?: string | null;
   }[];
   provider: string;
+  labels: Array<{ id: string; name: string }>;
 }) {
   return (
     <div className="flex gap-2 flex-wrap">
@@ -510,7 +505,7 @@ export function ActionBadges({
             className="w-fit text-nowrap"
           >
             <Icon className="size-3 mr-1.5" />
-            {getActionDisplay(action, provider)}
+            {getActionDisplay(action, provider, labels)}
           </Badge>
         );
       })}
@@ -519,9 +514,20 @@ export function ActionBadges({
 }
 
 function NoRules() {
+  const { emailAccountId } = useAccount();
+
   return (
     <CardHeader>
-      <CardDescription>You don't have any rules yet.</CardDescription>
+      <CardDescription className="flex flex-col items-center gap-4 py-20">
+        You don't have any rules yet.
+        <div>
+          <Button asChild size="sm">
+            <Link href={prefixPath(emailAccountId, "/assistant/onboarding")}>
+              Set up default rules
+            </Link>
+          </Button>
+        </div>
+      </CardDescription>
     </CardHeader>
   );
 }

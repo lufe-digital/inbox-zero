@@ -16,6 +16,7 @@ import { getOrCreateReferralCode } from "@/utils/referral/referral-code";
 import { generateReferralLink } from "@/utils/referral/referral-link";
 import { aiGetCalendarAvailability } from "@/utils/ai/calendar/availability";
 import { env } from "@/env";
+import { mcpAgent } from "@/utils/ai/mcp/mcp-agent";
 
 const logger = createScopedLogger("generate-reply");
 
@@ -41,24 +42,33 @@ export async function fetchMessagesAndGenerateDraft(
     throw new Error("Draft result is not a string");
   }
 
-  const emailAccountWithIncludeReferralSignature =
-    env.NEXT_PUBLIC_DISABLE_REFERRAL_SIGNATURE
-      ? null
-      : await prisma.emailAccount.findUnique({
-          where: { id: emailAccount.id },
-          select: { includeReferralSignature: true },
-        });
+  const emailAccountWithSignatures = await prisma.emailAccount.findUnique({
+    where: { id: emailAccount.id },
+    select: {
+      includeReferralSignature: true,
+      signature: true,
+    },
+  });
 
-  if (emailAccountWithIncludeReferralSignature?.includeReferralSignature) {
+  let finalResult = result;
+
+  if (
+    !env.NEXT_PUBLIC_DISABLE_REFERRAL_SIGNATURE &&
+    emailAccountWithSignatures?.includeReferralSignature
+  ) {
     const referralSignature = await getOrCreateReferralCode(
       emailAccount.userId,
     );
     const referralLink = generateReferralLink(referralSignature.code);
     const htmlSignature = `Drafted by <a href="${referralLink}">Inbox Zero</a>.`;
-    return `${result}\n\n${htmlSignature}`;
+    finalResult = `${finalResult}\n\n${htmlSignature}`;
   }
 
-  return result;
+  if (emailAccountWithSignatures?.signature) {
+    finalResult = `${finalResult}\n\n${emailAccountWithSignatures.signature}`;
+  }
+
+  return finalResult;
 }
 
 /**
@@ -128,6 +138,7 @@ async function generateDraftContent(
     emailHistoryContext,
     calendarAvailability,
     writingStyle,
+    mcpResult,
   ] = await Promise.all([
     aiExtractRelevantKnowledge({
       knowledgeBase,
@@ -139,13 +150,9 @@ async function generateDraftContent(
       emailAccount,
       emailProvider,
     }),
-    aiGetCalendarAvailability({
-      emailAccount,
-      messages,
-    }),
-    getWritingStyle({
-      emailAccountId: emailAccount.id,
-    }),
+    aiGetCalendarAvailability({ emailAccount, messages }),
+    getWritingStyle({ emailAccountId: emailAccount.id }),
+    mcpAgent({ emailAccount, messages }),
   ]);
 
   // 2b. Extract email history context
@@ -181,6 +188,7 @@ async function generateDraftContent(
     emailHistoryContext,
     calendarAvailability,
     writingStyle,
+    mcpContext: mcpResult?.response || null,
   });
 
   if (typeof text === "string") {

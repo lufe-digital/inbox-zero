@@ -44,6 +44,8 @@ export const createMockEmailProvider = (
   }),
   getLabels: vi.fn().mockResolvedValue([]),
   getLabelById: vi.fn().mockResolvedValue(null),
+  getLabelByName: vi.fn().mockResolvedValue(null),
+  getSignatures: vi.fn().mockResolvedValue([]),
   getMessage: vi.fn().mockResolvedValue({
     id: "msg1",
     threadId: "thread1",
@@ -63,7 +65,6 @@ export const createMockEmailProvider = (
     inline: [],
     labelIds: [],
   }),
-  getMessages: vi.fn().mockResolvedValue([]),
   getSentMessages: vi.fn().mockResolvedValue([]),
   getSentThreadsExcluding: vi.fn().mockResolvedValue([]),
   getThreadMessages: vi.fn().mockResolvedValue([]),
@@ -75,11 +76,6 @@ export const createMockEmailProvider = (
   trashThread: vi.fn().mockResolvedValue(undefined),
   labelMessage: vi.fn().mockResolvedValue(undefined),
   removeThreadLabel: vi.fn().mockResolvedValue(undefined),
-  getNeedsReplyLabel: vi.fn().mockResolvedValue(null),
-  getAwaitingReplyLabel: vi.fn().mockResolvedValue(null),
-  labelAwaitingReply: vi.fn().mockResolvedValue(undefined),
-  removeAwaitingReplyLabel: vi.fn().mockResolvedValue(undefined),
-  removeNeedsReplyLabel: vi.fn().mockResolvedValue(undefined),
   draftEmail: vi.fn().mockResolvedValue({ draftId: "draft1" }),
   replyToEmail: vi.fn().mockResolvedValue(undefined),
   sendEmail: vi.fn().mockResolvedValue(undefined),
@@ -123,6 +119,12 @@ export const createMockEmailProvider = (
   getThreadsFromSenderWithSubject: vi.fn().mockResolvedValue([]),
   processHistory: vi.fn().mockResolvedValue(undefined),
   moveThreadToFolder: vi.fn().mockResolvedValue(undefined),
+  getMessagesByFields: vi
+    .fn()
+    .mockResolvedValue({ messages: [], nextPageToken: undefined }),
+  getOrCreateOutlookFolderIdByName: vi.fn().mockResolvedValue("folder1"),
+  sendEmailWithHtml: vi.fn().mockResolvedValue(undefined),
+  getDrafts: vi.fn().mockResolvedValue([]),
   ...overrides,
 });
 
