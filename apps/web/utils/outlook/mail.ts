@@ -186,29 +186,36 @@ export async function draftEmail(
     emailAddress: { address: addr },
   }));
 
-  const draft = {
-    subject: args.subject || originalEmail.headers.subject,
-    body: {
-      contentType: "html",
-      content: html,
-    },
-    toRecipients: [
-      {
-        emailAddress: {
-          address: recipients.to,
-        },
-      },
-    ],
-    ...(ccRecipients.length > 0 ? { ccRecipients } : {}),
-    conversationId: originalEmail.threadId,
-    isDraft: true,
-  };
-
-  const result: Message = await client
+  // Use createReply endpoint to create a proper reply draft
+  // This ensures the draft is linked to the original message as a reply
+  const replyDraft: Message = await client
     .getClient()
-    .api("/me/messages")
-    .post(draft);
-  return result;
+    .api(`/me/messages/${originalEmail.id}/createReply`)
+    .post({});
+
+  // Update the draft with our content
+  const updatedDraft: Message = await client
+    .getClient()
+    .api(`/me/messages/${replyDraft.id}`)
+    .patch({
+      subject: args.subject || originalEmail.headers.subject,
+      body: {
+        contentType: "html",
+        content: html,
+      },
+      toRecipients: [
+        {
+          emailAddress: {
+            address: recipients.to,
+          },
+        },
+      ],
+      ...(ccRecipients.length > 0 ? { ccRecipients } : {}),
+    });
+
+  // Use the original replyDraft.id since that's the stable ID
+  // The PATCH response might not always include the full object?
+  return { ...updatedDraft, id: replyDraft.id };
 }
 
 function convertTextToHtmlParagraphs(text?: string | null): string {

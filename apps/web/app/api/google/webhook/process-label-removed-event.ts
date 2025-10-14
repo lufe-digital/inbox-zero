@@ -1,13 +1,13 @@
 import type { gmail_v1 } from "@googleapis/gmail";
 import prisma from "@/utils/prisma";
 
-import { ColdEmailStatus } from "@prisma/client";
+import { ColdEmailStatus, SystemType } from "@prisma/client";
 import { logger } from "@/app/api/google/webhook/logger";
 import { extractEmailAddress } from "@/utils/email";
 import type { EmailAccountWithAI } from "@/utils/llms/types";
 import type { EmailProvider } from "@/utils/email/types";
-import { inboxZeroLabels } from "@/utils/label";
 import { GmailLabel } from "@/utils/gmail/label";
+import { getRuleLabel } from "@/utils/rule/consts";
 
 const SYSTEM_LABELS = [
   GmailLabel.INBOX,
@@ -63,7 +63,15 @@ export async function handleLabelRemovedEvent(
     });
   }
 
-  const removedLabelIds = message.labelIds || [];
+  // Filter out system labels early as we don't learn from them
+  const removedLabelIds = (message.labelIds || []).filter(
+    (labelId) => !SYSTEM_LABELS.includes(labelId),
+  );
+
+  if (removedLabelIds.length === 0) {
+    logger.trace("No non-system labels to process", loggerOptions);
+    return;
+  }
 
   const labels = await provider.getLabels();
 
@@ -74,14 +82,6 @@ export async function handleLabelRemovedEvent(
     if (!labelName) {
       logger.info("Skipping label removal - missing label name", {
         labelId,
-        ...loggerOptions,
-      });
-      continue;
-    }
-
-    if (SYSTEM_LABELS.includes(labelName)) {
-      logger.info("Skipping system label removal", {
-        labelName,
         ...loggerOptions,
       });
       continue;
@@ -133,7 +133,7 @@ async function learnFromRemovedLabel({
     return;
   }
 
-  if (labelName === inboxZeroLabels.cold_email.name) {
+  if (labelName === getRuleLabel(SystemType.COLD_EMAIL)) {
     logger.info("Processing Cold Email label removal", loggerOptions);
 
     await prisma.coldEmail.upsert({
