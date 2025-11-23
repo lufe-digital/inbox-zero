@@ -3,7 +3,6 @@
 import { sso } from "@better-auth/sso";
 import { createContact as createLoopsContact } from "@inboxzero/loops";
 import { createContact as createResendContact } from "@inboxzero/resend";
-import type { Prisma } from "@prisma/client";
 import type { Account, AuthContext, User } from "better-auth";
 import { betterAuth } from "better-auth";
 import { prismaAdapter } from "better-auth/adapters/prisma";
@@ -20,7 +19,7 @@ import { captureException } from "@/utils/error";
 import { getContactsClient as getGoogleContactsClient } from "@/utils/gmail/client";
 import { SCOPES as GMAIL_SCOPES } from "@/utils/gmail/scopes";
 import { createScopedLogger } from "@/utils/logger";
-import { getContactsClient as getOutlookContactsClient } from "@/utils/outlook/client";
+import { createOutlookClient } from "@/utils/outlook/client";
 import { SCOPES as OUTLOOK_SCOPES } from "@/utils/outlook/scopes";
 import { updateAccountSeats } from "@/utils/premium/server";
 import prisma from "@/utils/prisma";
@@ -302,7 +301,7 @@ async function getProfileData(providerId: string, accessToken: string) {
   }
 
   if (isMicrosoftProvider(providerId)) {
-    const client = getOutlookContactsClient({ accessToken });
+    const client = createOutlookClient(accessToken);
     try {
       const profileResponse = await client.getUserProfile();
 
@@ -375,24 +374,21 @@ async function handleLinkAccount(account: Account) {
       return;
     }
 
-    // --- Create/Update the corresponding EmailAccount record ---
-    const emailAccountData: Prisma.EmailAccountUpsertArgs = {
-      where: { email: profileData?.email },
-      update: {
-        userId: account.userId,
-        accountId: account.id,
-        name: primaryName,
-        image: primaryPhotoUrl,
-      },
-      create: {
-        email: primaryEmail,
-        userId: account.userId,
-        accountId: account.id,
-        name: primaryName,
-        image: primaryPhotoUrl,
-      },
+    const data = {
+      userId: account.userId,
+      accountId: account.id,
+      name: primaryName,
+      image: primaryPhotoUrl,
     };
-    await prisma.emailAccount.upsert(emailAccountData);
+
+    await prisma.emailAccount.upsert({
+      where: { email: profileData?.email },
+      update: data,
+      create: {
+        ...data,
+        email: primaryEmail,
+      },
+    });
 
     // Handle premium account seats
     await updateAccountSeats({ userId: account.userId }).catch((error) => {

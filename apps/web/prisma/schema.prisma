@@ -113,16 +113,19 @@ model EmailAccount {
   name  String? // Name associated with the Google account
   image String? // Profile image URL from the Google account
 
-  about                     String?
-  writingStyle              String?
-  signature                 String? // User's email signature from provider or manually set
-  includeReferralSignature  Boolean   @default(true)
-  watchEmailsExpirationDate DateTime?
-  watchEmailsSubscriptionId String? // For Outlook subscription ID
-  lastSyncedHistoryId       String?
-  behaviorProfile           Json?
-  personaAnalysis           Json? // ai analysis of the user's persona
-  role                      String? // the role confirmed by the user - previously `User.surveyRole`
+  about                          String?
+  writingStyle                   String?
+  signature                      String? // User's email signature from provider or manually set
+  includeReferralSignature       Boolean   @default(true)
+  watchEmailsExpirationDate      DateTime?
+  watchEmailsSubscriptionId      String? // For Outlook subscription ID
+  watchEmailsSubscriptionHistory Json? // Historical Outlook subscription IDs: [{ subscriptionId, createdAt, replacedAt }]
+  lastSyncedHistoryId            String?
+  behaviorProfile                Json?
+  personaAnalysis                Json? // ai analysis of the user's persona
+  role                           String? // the role confirmed by the user - previously `User.surveyRole`
+  timezone                       String? // User's timezone (IANA tz database format, e.g., "America/Los_Angeles", "Asia/Jerusalem") - handles DST automatically
+  calendarBookingLink            String? // User's calendar booking link
 
   statsEmailFrequency       Frequency         @default(WEEKLY)
   summaryEmailFrequency     Frequency         @default(WEEKLY)
@@ -802,8 +805,6 @@ model Payment {
   premiumId String?
   premium   Premium? @relation(fields: [premiumId], references: [id], onDelete: SetNull)
 
-  @@index([premiumId])
-
   // Payment processor information
   processorType           ProcessorType @default(LEMON_SQUEEZY)
   processorId             String?       @unique // External payment ID from Stripe/Lemon Squeezy
@@ -824,6 +825,8 @@ model Payment {
 
   // Metadata
   billingReason String? // initial, renewal, update, etc.
+
+  @@index([premiumId])
 }
 
 model DraftSendLog {

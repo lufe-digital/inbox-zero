@@ -11,7 +11,6 @@ import {
   LogicalOperator,
 } from "@prisma/client";
 import { Button } from "@/components/ui/button";
-import { conditionsToString } from "@/utils/condition";
 import { MessageText } from "@/components/Typography";
 import { EyeIcon } from "lucide-react";
 import { useRuleDialog } from "@/app/(app)/[emailAccountId]/assistant/RuleDialog";
@@ -21,7 +20,13 @@ import { getActionDisplay, getActionIcon } from "@/utils/action-display";
 import { getActionColor } from "@/components/PlanBadge";
 import { useAccount } from "@/providers/EmailAccountProvider";
 
-export function ResultsDisplay({ results }: { results: RunRulesResult[] }) {
+export function ResultsDisplay({
+  results,
+  showFullContent = false,
+}: {
+  results: RunRulesResult[];
+  showFullContent?: boolean;
+}) {
   const groupedResults = groupBy(results, (result) => {
     return result.createdAt.toString();
   });
@@ -34,22 +39,46 @@ export function ResultsDisplay({ results }: { results: RunRulesResult[] }) {
     },
   );
 
-  return sortedBatches.map(([date, batchResults], batchIndex) => (
-    <div key={date}>
-      {batchIndex === 1 && sortedBatches.length > 1 && (
-        <div className="mb-1 text-xs text-muted-foreground">Previous:</div>
-      )}
-      <div className="flex gap-1">
-        {batchResults.map((result, resultIndex) => (
-          <ResultDisplay key={`${date}-${resultIndex}`} result={result} />
-        ))}
-      </div>
+  return (
+    <div className="flex flex-col gap-2">
+      {sortedBatches.map(([date, batchResults], batchIndex) => (
+        <div key={date}>
+          {batchIndex === 1 && sortedBatches.length > 1 && (
+            <div className="my-1 text-xs text-muted-foreground">Previous:</div>
+          )}
+          <div
+            className={showFullContent ? "flex flex-col gap-4" : "flex gap-1"}
+          >
+            {batchResults.map((result, resultIndex) => (
+              <ResultDisplay
+                key={`${date}-${resultIndex}`}
+                result={result}
+                showFullContent={showFullContent}
+              />
+            ))}
+          </div>
+        </div>
+      ))}
     </div>
-  ));
+  );
 }
 
-function ResultDisplay({ result }: { result: RunRulesResult }) {
+function ResultDisplay({
+  result,
+  showFullContent = false,
+}: {
+  result: RunRulesResult;
+  showFullContent?: boolean;
+}) {
   const { rule, status } = result;
+
+  if (showFullContent) {
+    return (
+      <div className="w-full">
+        <ResultDisplayContent result={result} />
+      </div>
+    );
+  }
 
   return (
     <HoverCard content={<ResultDisplayContent result={result} />}>
@@ -187,7 +216,7 @@ function Actions({
             {fields.length > 0 && (
               <div className="ml-1 text-sm text-muted-foreground space-y-0.5">
                 {fields.map((field) => (
-                  <div key={field.key}>
+                  <div key={field.key} className="whitespace-pre-wrap">
                     <span className="font-medium capitalize">{field.key}:</span>{" "}
                     {field.value}
                   </div>
