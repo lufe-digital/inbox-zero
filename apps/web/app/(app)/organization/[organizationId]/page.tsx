@@ -1,5 +1,5 @@
 import { Members } from "@/app/(app)/organization/[organizationId]/Members";
-import { PageHeader } from "@/components/PageHeader";
+import { OrganizationTabs } from "@/app/(app)/organization/[organizationId]/OrganizationTabs";
 import { PageWrapper } from "@/components/PageWrapper";
 
 export default async function MembersPage({
@@ -11,9 +11,9 @@ export default async function MembersPage({
 
   return (
     <PageWrapper>
-      <PageHeader title="Organization Members" />
+      <OrganizationTabs organizationId={organizationId} />
 
-      <div className="mt-8">
+      <div className="mt-6">
         <Members organizationId={organizationId} />
       </div>
     </PageWrapper>
