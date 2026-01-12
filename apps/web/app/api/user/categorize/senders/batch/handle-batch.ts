@@ -1,29 +1,26 @@
 import { NextResponse } from "next/server";
 import { aiCategorizeSendersSchema } from "@/app/api/user/categorize/senders/batch/handle-batch-validation";
-import { getThreadsFromSenderWithSubject } from "@/utils/gmail/thread";
 import {
   categorizeWithAi,
   getCategories,
   updateSenderCategory,
 } from "@/utils/categorize/senders/categorize";
 import { validateUserAndAiAccess } from "@/utils/user/validate";
-import { getGmailClientWithRefresh } from "@/utils/gmail/client";
 import { UNKNOWN_CATEGORY } from "@/utils/ai/categorize-sender/ai-categorize-senders";
-import { createScopedLogger } from "@/utils/logger";
 import prisma from "@/utils/prisma";
 import { saveCategorizationProgress } from "@/utils/redis/categorization-progress";
 import { SafeError } from "@/utils/error";
-
-const logger = createScopedLogger("api/user/categorize/senders/batch");
+import type { RequestWithLogger } from "@/utils/middleware";
+import { createEmailProvider } from "@/utils/email/provider";
 
 export async function handleBatchRequest(
-  request: Request,
+  request: RequestWithLogger,
 ): Promise<NextResponse> {
   try {
     await handleBatchInternal(request);
     return NextResponse.json({ ok: true });
   } catch (error) {
-    logger.error("Handle batch request error", { error });
+    request.logger.error("Handle batch request error", { error });
     return NextResponse.json(
       { error: "Internal server error" },
       { status: 500 },
@@ -31,15 +28,12 @@ export async function handleBatchRequest(
   }
 }
 
-async function handleBatchInternal(request: Request) {
+async function handleBatchInternal(request: RequestWithLogger) {
   const json = await request.json();
   const body = aiCategorizeSendersSchema.parse(json);
   const { emailAccountId, senders } = body;
 
-  logger.trace("Handle batch request", {
-    emailAccountId,
-    senders: senders.length,
-  });
+  request.logger.info("Handle batch request", { senders: senders.length });
 
   const userResult = await validateUserAndAiAccess({ emailAccountId });
   const { emailAccount } = userResult;
@@ -52,9 +46,6 @@ async function handleBatchInternal(request: Request) {
     select: {
       account: {
         select: {
-          access_token: true,
-          refresh_token: true,
-          expires_at: true,
           provider: true,
         },
       },
@@ -64,14 +55,11 @@ async function handleBatchInternal(request: Request) {
   const account = emailAccountWithAccount?.account;
 
   if (!account) throw new SafeError("No account found");
-  if (!account.access_token || !account.refresh_token)
-    throw new SafeError("No access or refresh token");
 
-  const gmail = await getGmailClientWithRefresh({
-    accessToken: account.access_token,
-    refreshToken: account.refresh_token,
-    expiresAt: account.expires_at?.getTime() || null,
+  const emailProvider = await createEmailProvider({
     emailAccountId,
+    provider: account.provider,
+    logger: request.logger,
   });
 
   const sendersWithEmails: Map<string, { subject: string; snippet: string }[]> =
@@ -79,12 +67,8 @@ async function handleBatchInternal(request: Request) {
 
   // 1. fetch 3 messages for each sender
   for (const sender of senders) {
-    const threadsFromSender = await getThreadsFromSenderWithSubject(
-      gmail,
-      account.access_token,
-      sender,
-      3,
-    );
+    const threadsFromSender =
+      await emailProvider.getThreadsFromSenderWithSubject(sender, 3);
     sendersWithEmails.set(sender, threadsFromSender);
   }
 

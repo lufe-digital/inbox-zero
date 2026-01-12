@@ -179,6 +179,8 @@ function getActionLabel(type: ActionType, provider: string) {
       return "Mark as spam";
     case ActionType.MARK_READ:
       return "Mark as read";
+    case ActionType.NOTIFY_SENDER:
+      return "Notify Sender";
     default:
       return capitalCase(type);
   }
@@ -216,12 +218,15 @@ export function getActionColor(actionType: ActionType): Color {
     case ActionType.MARK_READ:
       return "yellow";
     case ActionType.LABEL:
-    case ActionType.MOVE_FOLDER:
       return "blue";
+    case ActionType.MOVE_FOLDER:
+      return "pink";
     case ActionType.MARK_SPAM:
       return "red";
     case ActionType.CALL_WEBHOOK:
     case ActionType.DIGEST:
+      return "purple";
+    case ActionType.NOTIFY_SENDER:
       return "purple";
     default: {
       const exhaustiveCheck: never = actionType;

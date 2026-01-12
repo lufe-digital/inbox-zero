@@ -43,6 +43,7 @@
         "AI_GATEWAY_API_KEY",
         "OLLAMA_BASE_URL",
         "OLLAMA_MODEL",
+        "PERPLEXITY_API_KEY",
 
         "UPSTASH_REDIS_URL",
         "UPSTASH_REDIS_TOKEN",
@@ -55,7 +56,7 @@
         "SENTRY_ORGANIZATION",
         "SENTRY_PROJECT",
 
-        "LOG_ZOD_ERRORS",
+        "DISABLE_LOG_ZOD_ERRORS",
         "ENABLE_DEBUG_LOGS",
 
         "LEMON_SQUEEZY_SIGNING_SECRET",
@@ -71,6 +72,7 @@
 
         "RESEND_API_KEY",
         "RESEND_AUDIENCE_ID",
+        "NEXT_PUBLIC_IS_RESEND_CONFIGURED",
 
         "LOOPS_API_SECRET",
 
@@ -128,7 +130,13 @@
         "NEXT_PUBLIC_AXIOM_DATASET",
         "NEXT_PUBLIC_AXIOM_TOKEN",
         "NEXT_PUBLIC_DUB_REFER_DOMAIN",
-        "NEXT_PUBLIC_USE_AEONIK_FONT"
+        "NEXT_PUBLIC_USE_AEONIK_FONT",
+        "NEXT_PUBLIC_BYPASS_PREMIUM_CHECKS",
+        "NEXT_PUBLIC_DIGEST_ENABLED",
+        "NEXT_PUBLIC_MEETING_BRIEFS_ENABLED",
+        "NEXT_PUBLIC_FOLLOW_UP_REMINDERS_ENABLED",
+        "NEXT_PUBLIC_INTEGRATIONS_ENABLED",
+        "NEXT_PUBLIC_CLEANER_ENABLED"
       ],
       "outputs": [".next/**", "!.next/cache/**"]
     },
@@ -141,8 +149,8 @@
       "cache": false,
       "persistent": true
     },
-    "//#format-and-lint": {},
-    "//#format-and-lint:fix": {
+    "//#check": {},
+    "//#fix": {
       "cache": false
     }
   }

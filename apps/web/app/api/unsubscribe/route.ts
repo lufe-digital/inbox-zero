@@ -7,8 +7,8 @@ export const GET = withError("unsubscribe", async (request) => {
   return unsubscribe(request);
 });
 
-export const POST = withError(async (request) => {
-  return unsubscribe(request as RequestWithLogger);
+export const POST = withError("unsubscribe", async (request) => {
+  return unsubscribe(request);
 });
 
 async function unsubscribe(request: RequestWithLogger) {
@@ -48,7 +48,7 @@ async function unsubscribe(request: RequestWithLogger) {
 
   const [userUpdate, tokenDelete] = await Promise.allSettled([
     prisma.emailAccount.update({
-      where: { email: emailToken.emailAccountId },
+      where: { id: emailToken.emailAccountId },
       data: {
         summaryEmailFrequency: Frequency.NEVER,
         statsEmailFrequency: Frequency.NEVER,

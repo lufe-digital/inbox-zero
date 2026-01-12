@@ -10,20 +10,43 @@ import {
 } from "@/utils/cron";
 import { Frequency } from "@/generated/prisma/enums";
 import { captureException } from "@/utils/error";
-import { createScopedLogger } from "@/utils/logger";
+import type { Logger } from "@/utils/logger";
 import { publishToQstashQueue } from "@/utils/upstash";
 import { getPremiumUserFilter } from "@/utils/premium";
-
-const logger = createScopedLogger("cron/resend/summary/all");
+import type { SendSummaryEmailBody } from "../validation";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
-async function sendSummaryAllUpdate() {
+export const GET = withError("cron/resend/summary/all", async (request) => {
+  if (!hasCronSecret(request)) {
+    captureException(new Error("Unauthorized request: api/resend/summary/all"));
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  const result = await sendSummaryAllUpdate(request.logger);
+
+  return NextResponse.json(result);
+});
+
+export const POST = withError("cron/resend/summary/all", async (request) => {
+  if (!(await hasPostCronSecret(request))) {
+    captureException(
+      new Error("Unauthorized cron request: api/resend/summary/all"),
+    );
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  const result = await sendSummaryAllUpdate(request.logger);
+
+  return NextResponse.json(result);
+});
+
+async function sendSummaryAllUpdate(logger: Logger) {
   logger.info("Sending summary all update");
 
   const emailAccounts = await prisma.emailAccount.findMany({
-    select: { email: true },
+    select: { id: true },
     where: {
       summaryEmailFrequency: {
         not: Frequency.NEVER,
@@ -42,16 +65,16 @@ async function sendSummaryAllUpdate() {
 
   for (const emailAccount of emailAccounts) {
     try {
-      await publishToQstashQueue({
+      await publishToQstashQueue<SendSummaryEmailBody>({
         queueName: "email-summary-all",
         parallelism: 3, // Allow up to 3 concurrent jobs from this queue
         url,
-        body: { email: emailAccount.email },
+        body: { emailAccountId: emailAccount.id },
         headers: getCronSecretHeader(),
       });
     } catch (error) {
       logger.error("Failed to publish to Qstash", {
-        email: emailAccount.email,
+        emailAccountId: emailAccount.id,
         error,
       });
     }
@@ -60,27 +83,3 @@ async function sendSummaryAllUpdate() {
   logger.info("All requests initiated", { count: emailAccounts.length });
   return { count: emailAccounts.length };
 }
-
-export const GET = withError(async (request) => {
-  if (!hasCronSecret(request)) {
-    captureException(new Error("Unauthorized request: api/resend/summary/all"));
-    return new Response("Unauthorized", { status: 401 });
-  }
-
-  const result = await sendSummaryAllUpdate();
-
-  return NextResponse.json(result);
-});
-
-export const POST = withError(async (request) => {
-  if (!(await hasPostCronSecret(request))) {
-    captureException(
-      new Error("Unauthorized cron request: api/resend/summary/all"),
-    );
-    return new Response("Unauthorized", { status: 401 });
-  }
-
-  const result = await sendSummaryAllUpdate();
-
-  return NextResponse.json(result);
-});

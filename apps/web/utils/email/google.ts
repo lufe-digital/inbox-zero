@@ -55,6 +55,7 @@ import {
 } from "@/utils/gmail/thread";
 import { decodeSnippet } from "@/utils/gmail/decode";
 import { getDraft, deleteDraft } from "@/utils/gmail/draft";
+import { extractErrorInfo } from "@/utils/gmail/retry";
 import {
   getFiltersList,
   createFilter,
@@ -71,7 +72,6 @@ import type {
   EmailSignature,
 } from "@/utils/email/types";
 import { createScopedLogger, type Logger } from "@/utils/logger";
-import { extractEmailAddress } from "@/utils/email";
 import { getGmailSignatures } from "@/utils/gmail/signature-settings";
 
 export class GmailProvider implements EmailProvider {
@@ -294,7 +294,7 @@ export class GmailProvider implements EmailProvider {
       log.info("Message archived successfully");
     } catch (error) {
       log.error("Failed to archive message", {
-        error: error instanceof Error ? error.message : error,
+        error,
       });
       throw error;
     }
@@ -315,9 +315,7 @@ export class GmailProvider implements EmailProvider {
         },
       });
     } catch (error) {
-      log.error("Failed to archive messages bulk", {
-        error: error instanceof Error ? error.message : error,
-      });
+      log.error("Failed to archive messages bulk", { error });
       throw error;
     }
   }
@@ -394,7 +392,7 @@ export class GmailProvider implements EmailProvider {
         } catch (error) {
           log.error("Failed to archive messages from sender", {
             sender,
-            error: error instanceof Error ? error.message : error,
+            error,
           });
           // continue processing remaining pages
           nextPageToken = undefined;
@@ -452,7 +450,7 @@ export class GmailProvider implements EmailProvider {
         } catch (error) {
           log.error("Failed to get messages from sender", {
             sender,
-            error: error instanceof Error ? error.message : error,
+            error,
           });
           // continue processing remaining senders
           nextPageToken = undefined;
@@ -471,7 +469,7 @@ export class GmailProvider implements EmailProvider {
             log.error("Failed to trash thread for sender", {
               sender,
               threadId,
-              error: error instanceof Error ? error.message : error,
+              error,
             });
             // Continue processing remaining threads
           }
@@ -508,7 +506,7 @@ export class GmailProvider implements EmailProvider {
           } catch (error) {
             log.error("Failed to track trash operation for sender", {
               sender,
-              error: error instanceof Error ? error.message : error,
+              error,
             });
           }
         }
@@ -576,15 +574,19 @@ export class GmailProvider implements EmailProvider {
 
       return {};
     } catch (error) {
-      const errorMessage =
-        error instanceof Error ? error.message : String(error);
+      const { errorMessage } = extractErrorInfo(error);
 
-      // Only use fallback for "label not found" errors
-      if (
-        (errorMessage.includes("Requested entity was not found") ||
-          errorMessage.includes("labelId not found")) &&
-        labelName
-      ) {
+      const isLabelNotFound =
+        errorMessage.includes("Requested entity was not found") ||
+        errorMessage.includes("labelId not found");
+
+      log.info("Label operation failed, checking fallback", {
+        errorMessage,
+        isLabelNotFound,
+        hasLabelName: Boolean(labelName),
+      });
+
+      if (isLabelNotFound && labelName) {
         log.warn("Label not found by ID, trying to get or create by name");
 
         const label = await getOrCreateLabel({
@@ -603,7 +605,15 @@ export class GmailProvider implements EmailProvider {
         };
       }
 
-      // Re-throw if not a "not found" error or fallback didn't work
+      // Handle case where label was deleted but we don't have the name to recreate it
+      if (isLabelNotFound && !labelName) {
+        log.warn(
+          "Label was deleted but labelName is not available for recreation. Skipping label action.",
+        );
+        return {};
+      }
+
+      // Re-throw if not a "not found" error
       throw error;
     }
   }
@@ -618,16 +628,19 @@ export class GmailProvider implements EmailProvider {
 
   async draftEmail(
     email: ParsedMessage,
-    args: { to?: string; subject?: string; content: string },
+    args: {
+      to?: string;
+      subject?: string;
+      content: string;
+      cc?: string;
+      bcc?: string;
+    },
     userEmail: string,
     executedRule?: { id: string; threadId: string; emailAccountId: string },
   ): Promise<{ draftId: string }> {
-    const log = this.logger.with({
-      action: "draftEmail",
-      email: userEmail,
-      executedRuleId: executedRule?.id,
-      threadId: executedRule?.threadId,
-      messageId: email.id,
+    this.logger.info("Creating Gmail draft", {
+      hasExecutedRule: Boolean(executedRule),
+      contentLength: args.content?.length,
     });
 
     if (executedRule) {
@@ -637,13 +650,27 @@ export class GmailProvider implements EmailProvider {
         handlePreviousDraftDeletion({
           client: this,
           executedRule,
-          logger: log,
+          logger: this.logger,
         }),
       ]);
-      return { draftId: result.data.id || "" };
+
+      const draftId = result.data.id || "";
+      this.logger.info("Gmail draft created successfully", {
+        draftId,
+        gmailMessageId: result.data.message?.id,
+      });
+
+      return { draftId };
     } else {
       const result = await draftEmail(this.client, email, args, userEmail);
-      return { draftId: result.data.id || "" };
+
+      const draftId = result.data.id || "";
+      this.logger.info("Gmail draft created successfully", {
+        draftId,
+        gmailMessageId: result.data.message?.id,
+      });
+
+      return { draftId };
     }
   }
 
@@ -831,7 +858,11 @@ export class GmailProvider implements EmailProvider {
     addLabelIds?: string[];
     removeLabelIds?: string[];
   }) {
-    return createFilter({ gmail: this.client, ...options });
+    return createFilter({
+      gmail: this.client,
+      ...options,
+      logger: this.logger,
+    });
   }
 
   async createAutoArchiveFilter(options: {
@@ -842,6 +873,7 @@ export class GmailProvider implements EmailProvider {
       gmail: this.client,
       from: options.from,
       gmailLabelId: options.gmailLabelId,
+      logger: this.logger,
     });
   }
 
@@ -908,60 +940,56 @@ export class GmailProvider implements EmailProvider {
     });
   }
 
-  async getMessagesByFields(options: {
-    froms?: string[];
-    tos?: string[];
-    subjects?: string[];
-    before?: Date;
-    after?: Date;
-    maxResults?: number;
-    pageToken?: string;
-  }): Promise<{
-    messages: ParsedMessage[];
-    nextPageToken?: string;
-  }> {
-    const parts: string[] = [];
+  async getThreadsWithParticipant(options: {
+    participantEmail: string;
+    maxThreads?: number;
+  }): Promise<EmailThread[]> {
+    const { participantEmail, maxThreads = 5 } = options;
 
-    const froms = (options.froms || [])
-      .map((f) => extractEmailAddress(f) || f)
-      .filter((f) => !!f);
-    if (froms.length > 0) {
-      const fromGroup = froms.map((f) => `"${f}"`).join(" OR ");
-      parts.push(`from:(${fromGroup})`);
-    }
-
-    const tos = (options.tos || [])
-      .map((t) => extractEmailAddress(t) || t)
-      .filter((t) => !!t);
-    if (tos.length > 0) {
-      const toGroup = tos.map((t) => `"${t}"`).join(" OR ");
-      parts.push(`to:(${toGroup})`);
-    }
-
-    const subjects = (options.subjects || []).filter((s) => !!s);
-    if (subjects.length > 0) {
-      const subjectGroup = subjects.map((s) => `"${s}"`).join(" OR ");
-      parts.push(`subject:(${subjectGroup})`);
-    }
-
-    const query = parts.join(" ") || undefined;
-
-    return this.getMessagesWithPagination({
-      query,
-      maxResults: options.maxResults,
-      pageToken: options.pageToken,
-      before: options.before,
-      after: options.after,
+    const query = `from:${participantEmail} OR to:${participantEmail}`;
+    const { threads: gmailThreads } = await getThreadsWithNextPageToken({
+      gmail: this.client,
+      q: query,
+      maxResults: maxThreads,
     });
+
+    const threadIds = gmailThreads
+      .map((t) => t.id)
+      .filter((id): id is string => !!id);
+
+    if (threadIds.length === 0) {
+      return [];
+    }
+
+    const threads = await getThreadsBatch(
+      threadIds,
+      getAccessTokenFromClient(this.client),
+    );
+
+    return threads
+      .filter((thread) => !!thread.id)
+      .map((thread) => ({
+        id: thread.id!,
+        messages:
+          thread.messages?.map((message) =>
+            parseMessage(message as MessageWithPayload),
+          ) || [],
+        snippet: decodeSnippet(thread.snippet),
+      }));
   }
 
   async getDrafts(options?: { maxResults?: number }): Promise<ParsedMessage[]> {
-    const response = await this.getMessagesWithPagination({
-      query: "in:draft",
+    const response = await this.client.users.drafts.list({
+      userId: "me",
       maxResults: options?.maxResults || 50,
     });
 
-    return response.messages;
+    const drafts = response.data.drafts || [];
+    const messagePromises = drafts
+      .filter((draft) => draft.message?.id)
+      .map((draft) => this.getMessage(draft.message!.id!));
+
+    return Promise.all(messagePromises);
   }
 
   async getMessagesBatch(messageIds: string[]): Promise<ParsedMessage[]> {
@@ -1181,7 +1209,7 @@ export class GmailProvider implements EmailProvider {
     date: Date;
     messageId: string;
   }): Promise<boolean> {
-    return hasPreviousCommunicationsWithSenderOrDomain(this, options);
+    return hasPreviousCommunicationsWithSenderOrDomain(this.client, options);
   }
 
   async getThreadsFromSenderWithSubject(
@@ -1258,8 +1286,8 @@ export class GmailProvider implements EmailProvider {
     this.logger.warn("Moving thread to folder is not supported for Gmail");
   }
 
-  async getOrCreateOutlookFolderIdByName(_folderName: string): Promise<string> {
-    this.logger.warn("Moving thread to folder is not supported for Gmail");
+  async getOrCreateFolderIdByName(_folderName: string): Promise<string> {
+    this.logger.warn("Moving to folder is not supported for Gmail");
     return "";
   }
 

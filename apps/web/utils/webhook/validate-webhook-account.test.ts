@@ -6,16 +6,15 @@ import { createScopedLogger } from "@/utils/logger";
 
 const logger = createScopedLogger("test");
 
-// Mock dependencies
 vi.mock("@/utils/premium");
 vi.mock("@/app/api/watch/controller");
 vi.mock("@/utils/email/provider");
+vi.mock("@/utils/email/watch-manager");
 vi.mock("@/utils/prisma");
 vi.mock("server-only", () => ({}));
 
-// Import mocked functions
 import { isPremium, hasAiAccess } from "@/utils/premium";
-import { unwatchEmails } from "@/app/api/watch/controller";
+import { unwatchEmails } from "@/utils/email/watch-manager";
 import { createEmailProvider } from "@/utils/email/provider";
 
 describe("validateWebhookAccount", () => {
@@ -24,6 +23,7 @@ describe("validateWebhookAccount", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(createEmailProvider).mockResolvedValue(mockEmailProvider as any);
+    vi.mocked(unwatchEmails).mockResolvedValue(undefined);
   });
 
   function createMockEmailAccount(
@@ -38,12 +38,15 @@ describe("validateWebhookAccount", () => {
       autoCategorizeSenders: false,
       watchEmailsSubscriptionId: "subscription-id",
       multiRuleSelectionEnabled: false,
+      timezone: null,
+      calendarBookingLink: null,
       watchEmailsSubscriptionHistory: [],
       account: {
         provider: "google",
         access_token: "access-token",
         refresh_token: "refresh-token",
         expires_at: new Date(),
+        disconnectedAt: null,
       },
       rules: [
         {
@@ -93,6 +96,27 @@ describe("validateWebhookAccount", () => {
     });
   });
 
+  describe("when account is disconnected", () => {
+    it("should return failure with 200 OK early", async () => {
+      const emailAccount = createMockEmailAccount({
+        account: {
+          provider: "google",
+          access_token: "access-token",
+          refresh_token: "refresh-token",
+          expires_at: new Date(),
+          disconnectedAt: new Date(),
+        },
+      });
+
+      const result = await validateWebhookAccount(emailAccount, logger);
+
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(await result.response.json()).toEqual({ ok: true });
+      }
+    });
+  });
+
   describe("when account is not premium", () => {
     it("should unwatch emails and return failure", async () => {
       const emailAccount = createMockEmailAccount({
@@ -112,12 +136,15 @@ describe("validateWebhookAccount", () => {
       expect(createEmailProvider).toHaveBeenCalledWith({
         emailAccountId: "account-id",
         provider: "google",
+        logger,
       });
-      expect(unwatchEmails).toHaveBeenCalledWith({
-        emailAccountId: "account-id",
-        provider: mockEmailProvider,
-        subscriptionId: "subscription-id",
-      });
+      expect(unwatchEmails).toHaveBeenCalledWith(
+        expect.objectContaining({
+          emailAccountId: "account-id",
+          provider: mockEmailProvider,
+          subscriptionId: "subscription-id",
+        }),
+      );
       if (!result.success) {
         expect(await result.response.json()).toEqual({ ok: true });
       }
@@ -134,11 +161,13 @@ describe("validateWebhookAccount", () => {
       const result = await validateWebhookAccount(emailAccount, logger);
 
       expect(result.success).toBe(false);
-      expect(unwatchEmails).toHaveBeenCalledWith({
-        emailAccountId: "account-id",
-        provider: mockEmailProvider,
-        subscriptionId: "subscription-id",
-      });
+      expect(unwatchEmails).toHaveBeenCalledWith(
+        expect.objectContaining({
+          emailAccountId: "account-id",
+          provider: mockEmailProvider,
+          subscriptionId: "subscription-id",
+        }),
+      );
       if (!result.success) {
         expect(await result.response.json()).toEqual({ ok: true });
       }
@@ -172,6 +201,7 @@ describe("validateWebhookAccount", () => {
           access_token: null,
           refresh_token: "refresh-token",
           expires_at: new Date(),
+          disconnectedAt: null,
         },
       });
 
@@ -195,6 +225,7 @@ describe("validateWebhookAccount", () => {
           access_token: "access-token",
           refresh_token: null,
           expires_at: new Date(),
+          disconnectedAt: null,
         },
       });
 

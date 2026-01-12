@@ -1,9 +1,9 @@
 "use client";
 
-import { useForm } from "react-hook-form";
+import { useState, useRef } from "react";
+import { useForm, Controller } from "react-hook-form";
 import { useAction } from "next-safe-action/hooks";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/Input";
 import { SettingCard } from "@/components/SettingCard";
 import {
   Dialog,
@@ -24,6 +24,8 @@ import {
   saveWritingStyleBody,
 } from "@/utils/actions/user.validation";
 import { saveWritingStyleAction } from "@/utils/actions/user";
+import { Tiptap, type TiptapHandle } from "@/components/editor/Tiptap";
+import { getActionErrorMessage } from "@/utils/error";
 
 export function WritingStyleSetting() {
   const { data, isLoading, error } = useEmailAccountFull();
@@ -33,7 +35,7 @@ export function WritingStyleSetting() {
   return (
     <SettingCard
       title="Writing style"
-      description="Used to draft replies in your voice."
+      description="Define your tone and style."
       right={
         <LoadingContent
           loading={isLoading}
@@ -58,11 +60,13 @@ function WritingStyleDialog({
   children: React.ReactNode;
   currentWritingStyle: string;
 }) {
+  const [open, setOpen] = useState(false);
   const { emailAccountId } = useAccount();
   const { mutate } = useEmailAccountFull();
+  const editorRef = useRef<TiptapHandle>(null);
 
   const {
-    register,
+    control,
     formState: { errors },
     handleSubmit,
   } = useForm<SaveWritingStyleBody>({
@@ -77,12 +81,11 @@ function WritingStyleDialog({
         toastSuccess({
           description: "Writing style saved!",
         });
+        setOpen(false);
       },
       onError: (error) => {
         toastError({
-          description:
-            error.error.serverError ??
-            "An unknown error occurred while saving your writing style",
+          description: getActionErrorMessage(error.error),
         });
       },
       onSettled: () => {
@@ -91,8 +94,12 @@ function WritingStyleDialog({
     },
   );
 
+  const onSubmit = (data: SaveWritingStyleBody) => {
+    execute(data);
+  };
+
   return (
-    <Dialog>
+    <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>{children}</DialogTrigger>
       <DialogContent className="max-w-2xl">
         <DialogHeader>
@@ -102,24 +109,40 @@ function WritingStyleDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <form onSubmit={handleSubmit(execute)}>
-          <Input
-            type="text"
-            autosizeTextarea
-            rows={8}
+        <form onSubmit={handleSubmit(onSubmit)}>
+          <Controller
             name="writingStyle"
-            label=""
-            registerProps={register("writingStyle")}
-            error={errors.writingStyle}
-            placeholder="Typical Length: 2-3 sentences
+            control={control}
+            render={({ field }) => (
+              <div className="max-h-[400px] overflow-y-auto">
+                <Tiptap
+                  ref={editorRef}
+                  initialContent={field.value ?? ""}
+                  onChange={field.onChange}
+                  output="markdown"
+                  className="prose prose-sm dark:prose-invert max-w-none [&_p.is-editor-empty:first-child::before]:pointer-events-none [&_p.is-editor-empty:first-child::before]:float-left [&_p.is-editor-empty:first-child::before]:h-0 [&_p.is-editor-empty:first-child::before]:text-muted-foreground [&_p.is-editor-empty:first-child::before]:content-[attr(data-placeholder)]"
+                  autofocus={false}
+                  preservePastedLineBreaks
+                  placeholder={`Typical Length: 2-3 sentences
+
 Formality: Informal but professional
+
 Common Greeting: Hey,
+
 Notable Traits:
 - Uses contractions frequently
 - Concise and direct responses
-- Minimal closings"
+- Minimal closings`}
+                />
+              </div>
+            )}
           />
-          <Button type="submit" className="mt-8" loading={isExecuting}>
+          {errors.writingStyle && (
+            <p className="mt-1 text-sm text-destructive">
+              {errors.writingStyle.message}
+            </p>
+          )}
+          <Button type="submit" className="mt-4" loading={isExecuting}>
             Save
           </Button>
         </form>

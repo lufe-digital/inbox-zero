@@ -1,6 +1,7 @@
 import { DEFAULT_COLD_EMAIL_PROMPT } from "@/utils/cold-email/prompt";
 import { isMicrosoftProvider } from "@/utils/email/provider-types";
 import { ActionType, SystemType } from "@/generated/prisma/enums";
+import { env } from "@/env";
 
 const ruleConfig: Record<
   SystemType,
@@ -13,6 +14,7 @@ const ruleConfig: Record<
     categoryAction: "label" | "label_archive" | "move_folder";
     categoryActionMicrosoft?: "move_folder";
     tooltipText: string;
+    shouldLearn: boolean;
   }
 > = {
   [SystemType.TO_REPLY]: {
@@ -24,6 +26,7 @@ const ruleConfig: Record<
     categoryAction: "label",
     tooltipText:
       "Emails you need to reply to and those where you're awaiting a reply. The label will update automatically as the conversation progresses",
+    shouldLearn: false,
   },
   [SystemType.FYI]: {
     name: "FYI",
@@ -32,6 +35,7 @@ const ruleConfig: Record<
     runOnThreads: true,
     categoryAction: "label",
     tooltipText: "",
+    shouldLearn: false,
   },
   [SystemType.AWAITING_REPLY]: {
     name: "Awaiting Reply",
@@ -40,6 +44,7 @@ const ruleConfig: Record<
     runOnThreads: true,
     categoryAction: "label",
     tooltipText: "",
+    shouldLearn: false,
   },
   [SystemType.ACTIONED]: {
     name: "Actioned",
@@ -48,6 +53,7 @@ const ruleConfig: Record<
     runOnThreads: true,
     categoryAction: "label",
     tooltipText: "",
+    shouldLearn: false,
   },
   [SystemType.NEWSLETTER]: {
     name: "Newsletter",
@@ -58,6 +64,7 @@ const ruleConfig: Record<
     categoryAction: "label",
     categoryActionMicrosoft: "move_folder",
     tooltipText: "Newsletters, blogs, and publications",
+    shouldLearn: true,
   },
   [SystemType.MARKETING]: {
     name: "Marketing",
@@ -68,6 +75,7 @@ const ruleConfig: Record<
     categoryAction: "label_archive",
     categoryActionMicrosoft: "move_folder",
     tooltipText: "Promotional emails about sales and offers",
+    shouldLearn: true,
   },
   [SystemType.CALENDAR]: {
     name: "Calendar",
@@ -77,6 +85,7 @@ const ruleConfig: Record<
     runOnThreads: false,
     categoryAction: "label",
     tooltipText: "Events, appointments, and reminders",
+    shouldLearn: true,
   },
   [SystemType.RECEIPT]: {
     name: "Receipt",
@@ -87,6 +96,7 @@ const ruleConfig: Record<
     categoryAction: "label",
     categoryActionMicrosoft: "move_folder",
     tooltipText: "Invoices, receipts, and payments",
+    shouldLearn: true,
   },
   [SystemType.NOTIFICATION]: {
     name: "Notification",
@@ -96,6 +106,7 @@ const ruleConfig: Record<
     categoryAction: "label",
     categoryActionMicrosoft: "move_folder",
     tooltipText: "Alerts, status updates, and system messages",
+    shouldLearn: true,
   },
   [SystemType.COLD_EMAIL]: {
     name: "Cold Email",
@@ -106,6 +117,7 @@ const ruleConfig: Record<
     categoryActionMicrosoft: "move_folder",
     tooltipText:
       "Unsolicited sales pitches and cold emails. We'll never block someone that's emailed you before",
+    shouldLearn: true,
   },
 };
 
@@ -121,6 +133,10 @@ export function getRuleName(systemType: SystemType) {
 
 export function getRuleLabel(systemType: SystemType) {
   return getRuleConfig(systemType).label;
+}
+
+export function shouldLearnFromLabelRemoval(systemType: SystemType): boolean {
+  return getRuleConfig(systemType).shouldLearn;
 }
 
 export function getCategoryAction(systemType: SystemType, provider: string) {
@@ -274,21 +290,24 @@ export function getDefaultActions(
   return actions;
 }
 
-export function getSystemRuleActionTypes(
-  systemType: SystemType,
-  provider: string,
-): Array<{
+type ActionTypeConfig = {
   type: ActionType;
   includeLabel?: boolean;
   includeFolder?: boolean;
-}> {
-  const config = getRuleConfig(systemType);
-  const categoryAction = getCategoryAction(systemType, provider);
-  const actionTypes: Array<{
-    type: ActionType;
-    includeLabel?: boolean;
-    includeFolder?: boolean;
-  }> = [];
+};
+
+export function getActionTypesForCategoryAction({
+  categoryAction,
+  systemType,
+  draftReply = false,
+  hasDigest = false,
+}: {
+  categoryAction: "label" | "label_archive" | "move_folder";
+  systemType?: SystemType;
+  draftReply?: boolean;
+  hasDigest?: boolean;
+}): ActionTypeConfig[] {
+  const actionTypes: ActionTypeConfig[] = [];
 
   if (categoryAction === "move_folder") {
     actionTypes.push({ type: ActionType.MOVE_FOLDER, includeFolder: true });
@@ -298,11 +317,36 @@ export function getSystemRuleActionTypes(
 
   if (categoryAction === "label_archive") {
     actionTypes.push({ type: ActionType.ARCHIVE });
+
+    if (
+      systemType === SystemType.COLD_EMAIL &&
+      env.NEXT_PUBLIC_IS_RESEND_CONFIGURED
+    ) {
+      actionTypes.push({ type: ActionType.NOTIFY_SENDER });
+    }
   }
 
-  if (config.draftReply) {
+  if (draftReply) {
     actionTypes.push({ type: ActionType.DRAFT_EMAIL });
   }
 
+  if (hasDigest) {
+    actionTypes.push({ type: ActionType.DIGEST });
+  }
+
   return actionTypes;
+}
+
+export function getSystemRuleActionTypes(
+  systemType: SystemType,
+  provider: string,
+): ActionTypeConfig[] {
+  const config = getRuleConfig(systemType);
+  const categoryAction = getCategoryAction(systemType, provider);
+
+  return getActionTypesForCategoryAction({
+    categoryAction,
+    systemType,
+    draftReply: config.draftReply,
+  });
 }

@@ -1,6 +1,7 @@
 import { ActionType } from "@/generated/prisma/enums";
 import type { ParsedMessage } from "@/utils/types";
 import prisma from "@/utils/prisma";
+import { withPrismaRetry } from "@/utils/prisma-retry";
 import { calculateSimilarity } from "@/utils/similarity-score";
 import type { EmailProvider } from "@/utils/email/types";
 import type { Logger } from "@/utils/logger";
@@ -19,7 +20,7 @@ export async function trackSentDraftStatus({
   provider: EmailProvider;
   logger: Logger;
 }) {
-  const { threadId, id: sentMessageId, textPlain: sentTextPlain } = message;
+  const { threadId, id: sentMessageId } = message;
 
   logger.info("Checking if sent message corresponds to an AI draft");
 
@@ -62,10 +63,14 @@ export async function trackSentDraftStatus({
       draftId: executedAction.draftId,
     });
     // Mark the action to indicate its draft was not sent
-    await prisma.executedAction.update({
-      where: { id: executedAction.id },
-      data: { wasDraftSent: false },
-    });
+    await withPrismaRetry(
+      () =>
+        prisma.executedAction.update({
+          where: { id: executedAction.id },
+          data: { wasDraftSent: false },
+        }),
+      { logger },
+    );
     return;
   }
 
@@ -79,30 +84,32 @@ export async function trackSentDraftStatus({
 
   const executedActionId = executedAction.id;
 
-  const similarityScore = calculateSimilarity(
-    executedAction.content,
-    sentTextPlain,
-  );
+  // Pass full message to properly handle Outlook HTML content
+  const similarityScore = calculateSimilarity(executedAction.content, message);
 
   logger.info("Calculated similarity score", {
     executedActionId,
     similarityScore,
   });
 
-  await prisma.$transaction([
-    prisma.draftSendLog.create({
-      data: {
-        executedActionId: executedActionId,
-        sentMessageId: sentMessageId,
-        similarityScore: similarityScore,
-      },
-    }),
-    // Mark that the draft was sent
-    prisma.executedAction.update({
-      where: { id: executedActionId },
-      data: { wasDraftSent: true },
-    }),
-  ]);
+  await withPrismaRetry(
+    () =>
+      prisma.$transaction([
+        prisma.draftSendLog.create({
+          data: {
+            executedActionId: executedActionId,
+            sentMessageId: sentMessageId,
+            similarityScore: similarityScore,
+          },
+        }),
+        // Mark that the draft was sent
+        prisma.executedAction.update({
+          where: { id: executedActionId },
+          data: { wasDraftSent: true },
+        }),
+      ]),
+    { logger },
+  );
 
   logger.info(
     "Successfully created draft send log and updated action status via transaction",
@@ -166,12 +173,12 @@ export async function cleanupThreadAIDrafts({
       try {
         const draftDetails = await provider.getDraft(action.draftId);
 
-        if (draftDetails?.textPlain) {
+        if (draftDetails?.textPlain || draftDetails?.textHtml) {
           // Draft exists, check if modified
-          // Using calculateSimilarity == 1.0 as the check for "unmodified"
+          // Pass full draftDetails to properly handle Outlook HTML content
           const similarityScore = calculateSimilarity(
             action.content,
-            draftDetails.textPlain,
+            draftDetails,
           );
           const isUnmodified = similarityScore === 1.0;
 
@@ -189,10 +196,14 @@ export async function cleanupThreadAIDrafts({
             await Promise.all([
               provider.deleteDraft(action.draftId),
               // Mark as not sent (cleaned up because ignored/superseded)
-              prisma.executedAction.update({
-                where: { id: action.id },
-                data: { wasDraftSent: false },
-              }),
+              withPrismaRetry(
+                () =>
+                  prisma.executedAction.update({
+                    where: { id: action.id },
+                    data: { wasDraftSent: false },
+                  }),
+                { logger },
+              ),
             ]);
             logger.info(
               "Deleted unmodified draft and updated action status.",
@@ -210,10 +221,14 @@ export async function cleanupThreadAIDrafts({
             actionLoggerOptions,
           );
           // Draft doesn't exist anymore, mark as not sent
-          await prisma.executedAction.update({
-            where: { id: action.id },
-            data: { wasDraftSent: false },
-          });
+          await withPrismaRetry(
+            () =>
+              prisma.executedAction.update({
+                where: { id: action.id },
+                data: { wasDraftSent: false },
+              }),
+            { logger },
+          );
         }
       } catch (error) {
         logger.error("Error checking draft for cleanup", {

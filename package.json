@@ -8,9 +8,13 @@
     "lint": "turbo lint",
     "prepare": "husky install",
     "ncu": "ncu -u -ws",
-    "format-and-lint": "biome check .",
-    "format-and-lint:fix": "biome check . --write",
-    "setup": "tsx packages/cli/src/main.ts setup"
+    "check": "ultracite check",
+    "fix": "ultracite fix",
+    "setup": "tsx packages/cli/src/main.ts setup",
+    "start:cli": "tsx packages/cli/src/main.ts start",
+    "docker:local:build": "./docker/scripts/publish-ghcr.sh --local",
+    "docker:local:push": "./docker/scripts/publish-ghcr.sh",
+    "docker:local:run": "./docker/scripts/run-local.sh"
   },
   "devDependencies": {
     "@biomejs/biome": "2.2.2",
@@ -22,13 +26,13 @@
     "prettier": "3.6.2",
     "tsconfig-paths": "^4.2.0",
     "tsx": "4.21.0",
-    "turbo": "2.6.2",
+    "turbo": "2.6.3",
     "ultracite": "5.3.3"
   },
-  "packageManager": "pnpm@10.24.0",
+  "packageManager": "pnpm@10.28.0",
   "lint-staged": {
     "*.{js,jsx,ts,tsx,json,jsonc,css,scss,md,mdx}": [
-      "npx ultracite fix"
+      "ultracite fix"
     ]
   },
   "engines": {

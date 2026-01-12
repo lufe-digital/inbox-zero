@@ -4,15 +4,20 @@ import prisma from "@/utils/prisma";
 import { deleteTinybirdAiCalls } from "@inboxzero/tinybird-ai-analytics";
 import { deletePosthogUser, trackUserDeleted } from "@/utils/posthog";
 import { captureException } from "@/utils/error";
-import { unwatchEmails } from "@/app/api/watch/controller";
+import { unwatchEmails } from "@/utils/email/watch-manager";
 import { createEmailProvider } from "@/utils/email/provider";
 import type { EmailProvider } from "@/utils/email/types";
-import { createScopedLogger } from "@/utils/logger";
+import type { Logger } from "@/utils/logger";
 import { sleep } from "@/utils/sleep";
+import { clearCachedResearchForUser } from "@/utils/redis/research-cache";
 
-const logger = createScopedLogger("user/delete");
-
-export async function deleteUser({ userId }: { userId: string }) {
+export async function deleteUser({
+  userId,
+  logger,
+}: {
+  userId: string;
+  logger: Logger;
+}) {
   const accounts = await prisma.account.findMany({
     where: { userId },
     select: {
@@ -38,6 +43,7 @@ export async function deleteUser({ userId }: { userId: string }) {
       ? await createEmailProvider({
           emailAccountId: account.emailAccount.id,
           provider: account.provider,
+          logger,
         })
       : null;
 
@@ -47,6 +53,7 @@ export async function deleteUser({ userId }: { userId: string }) {
       userId,
       emailProvider,
       subscriptionId: account.emailAccount.watchEmailsSubscriptionId,
+      logger,
     });
   });
 
@@ -58,7 +65,12 @@ export async function deleteUser({ userId }: { userId: string }) {
         error,
         userId,
       });
-      captureException(error, { extra: { userId } }, userId);
+      captureException(error);
+    });
+
+    clearCachedResearchForUser(userId).catch((error) => {
+      logger.error("Error clearing cached research", { error });
+      captureException(error);
     });
 
     // Then proceed with the regular deletion process
@@ -70,7 +82,6 @@ export async function deleteUser({ userId }: { userId: string }) {
     const failures = results.filter((r) => r.status === "rejected");
     if (failures.length > 0) {
       logger.error("Some deletion operations failed", {
-        userId,
         failures: failures.map((f) => (f as PromiseRejectedResult).reason),
       });
 
@@ -78,14 +89,13 @@ export async function deleteUser({ userId }: { userId: string }) {
       const customError = new Error("User deletion error");
       customError.cause = originalError;
 
-      captureException(customError, { extra: { failures, userId } });
+      captureException(customError, { extra: { failures } });
     }
   } catch (error) {
     logger.error("Error during user resources deletion process", {
       error,
-      userId,
     });
-    captureException(error, { extra: { userId } }, userId);
+    captureException(error);
   }
 }
 
@@ -95,12 +105,14 @@ async function deleteResources({
   userId,
   emailProvider,
   subscriptionId,
+  logger,
 }: {
   emailAccountId: string;
   email: string;
   userId: string;
   emailProvider: EmailProvider | null;
   subscriptionId: string | null;
+  logger: Logger;
 }) {
   const resourcesPromise = Promise.allSettled([
     deleteLoopsContact(emailAccountId),
@@ -111,6 +123,7 @@ async function deleteResources({
           emailAccountId,
           provider: emailProvider,
           subscriptionId,
+          logger,
         })
       : Promise.resolve(),
   ]);
@@ -119,7 +132,7 @@ async function deleteResources({
     // First delete ExecutedRules and their associated ExecutedActions in batches
     // If we try do this in one go for a user with a lot of executed rules, this will fail
     logger.info("Deleting ExecutedRules in batches");
-    await deleteExecutedRulesInBatches({ emailAccountId });
+    await deleteExecutedRulesInBatches({ emailAccountId, logger });
 
     logger.info("Deleting user");
     await prisma.user.delete({ where: { id: userId } });
@@ -129,9 +142,8 @@ async function deleteResources({
   } catch (error) {
     logger.error("Error during database user deletion process", {
       error,
-      emailAccountId,
     });
-    captureException(error, { extra: { emailAccountId } }, emailAccountId);
+    captureException(error, { emailAccountId, userEmail: email });
     throw error;
   }
 
@@ -144,9 +156,11 @@ async function deleteResources({
 async function deleteExecutedRulesInBatches({
   emailAccountId,
   batchSize = 100,
+  logger,
 }: {
   emailAccountId: string;
   batchSize?: number;
+  logger: Logger;
 }) {
   let deletedTotal = 0;
 
@@ -159,9 +173,9 @@ async function deleteExecutedRulesInBatches({
     });
 
     if (executedRules.length === 0) {
-      logger.info(
-        `Completed deletion of ExecutedRules, total: ${deletedTotal}`,
-      );
+      logger.info("Completed deletion of ExecutedRules", {
+        total: deletedTotal,
+      });
       break;
     }
 
@@ -178,9 +192,10 @@ async function deleteExecutedRulesInBatches({
     });
 
     deletedTotal += count;
-    logger.info(
-      `Deleted batch of ${count} ExecutedRules, total: ${deletedTotal}`,
-    );
+    logger.info("Deleted batch of ExecutedRules", {
+      deletedCount: count,
+      total: deletedTotal,
+    });
 
     // Small delay to prevent database overload (optional)
     await sleep(100);

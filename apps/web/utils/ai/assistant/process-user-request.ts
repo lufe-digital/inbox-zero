@@ -1,7 +1,7 @@
 import { stepCountIs, tool } from "ai";
 import { z } from "zod";
 import { createGenerateText } from "@/utils/llms";
-import { createScopedLogger } from "@/utils/logger";
+import type { Logger } from "@/utils/logger";
 import { GroupItemType, LogicalOperator } from "@/generated/prisma/enums";
 import type { Rule } from "@/generated/prisma/client";
 import type { EmailAccountWithAI } from "@/utils/llms/types";
@@ -23,17 +23,16 @@ export async function processUserRequest({
   originalEmail,
   messages,
   matchedRule,
+  logger,
 }: {
   emailAccount: EmailAccountWithAI;
   rules: RuleWithRelations[];
   originalEmail: ParsedMessage | null;
   messages: { role: "assistant" | "user"; content: string }[];
   matchedRule: RuleWithRelations | null;
+  logger: Logger;
 }) {
-  const logger = createScopedLogger("ai-fix-rules").with({
-    emailAccountId: emailAccount.id,
-    userId: emailAccount.userId,
-    email: emailAccount.email,
+  logger = logger.with({
     messageId: originalEmail?.id,
     threadId: originalEmail?.threadId,
   });
@@ -87,7 +86,7 @@ Best practices:
 
 Always end by using the reply tool to explain what changes were made.
 Use simple language and avoid jargon in your reply.
-When you've made updates, include a link to the rules page at the end of your reply: ${env.NEXT_PUBLIC_BASE_URL}/assistant?tab=rules
+When you've made updates, include a link to the rules page at the end of your reply: ${env.NEXT_PUBLIC_BASE_URL}/automation?tab=rules
 If you are unable to fix the rule, say so.`;
 
   const prompt = `${

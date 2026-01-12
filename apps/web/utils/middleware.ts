@@ -1,6 +1,7 @@
 import { ZodError } from "zod";
 import { type NextRequest, NextResponse, after } from "next/server";
 import { randomUUID } from "node:crypto";
+import * as Sentry from "@sentry/nextjs";
 import { captureException, checkCommonErrors, SafeError } from "@/utils/error";
 import { env } from "@/env";
 import { logErrorToPosthog } from "@/utils/error.server";
@@ -125,7 +126,7 @@ function withMiddleware<T extends NextRequest>(
       const reqLogger = getLogger(reqWithLogger);
 
       if (error instanceof ZodError) {
-        if (env.LOG_ZOD_ERRORS) {
+        if (!env.DISABLE_LOG_ZOD_ERRORS) {
           reqLogger.error("Zod validation error", { error });
         }
         return NextResponse.json(
@@ -134,9 +135,15 @@ function withMiddleware<T extends NextRequest>(
         );
       }
 
-      const apiError = checkCommonErrors(error, req.url);
+      const apiError = checkCommonErrors(error, req.url, reqLogger);
       if (apiError) {
-        await logErrorToPosthog("api", req.url, apiError.type, "unknown"); // TODO: add emailAccountId
+        await logErrorToPosthog(
+          "api",
+          req.url,
+          apiError.type,
+          "unknown",
+          reqLogger,
+        ); // TODO: add emailAccountId
 
         return NextResponse.json(
           { error: apiError.message, isKnownError: true },
@@ -267,6 +274,9 @@ async function emailAccountMiddleware(
     );
   }
 
+  Sentry.setTag("emailAccountId", emailAccountId);
+  Sentry.setUser({ id: userId, email });
+
   // Create a new request with email account info
   const emailAccountReq = req.clone() as RequestWithEmailAccount;
   emailAccountReq.auth = { userId, emailAccountId, email };
@@ -346,7 +356,7 @@ export function withError(
   options?: MiddlewareOptions,
 ): NextHandler;
 export function withError(
-  handler: NextHandler,
+  handler: NextHandler<RequestWithLogger>,
   options?: MiddlewareOptions,
 ): NextHandler;
 export function withError(

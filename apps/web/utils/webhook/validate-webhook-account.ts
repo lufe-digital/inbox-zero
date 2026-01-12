@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { env } from "@/env";
 import { hasAiAccess, isPremium } from "@/utils/premium";
-import { unwatchEmails } from "@/app/api/watch/controller";
+import { unwatchEmails } from "@/utils/email/watch-manager";
 import { createEmailProvider } from "@/utils/email/provider";
 import prisma from "@/utils/prisma";
 import type { Logger } from "@/utils/logger";
@@ -29,6 +29,7 @@ export async function getWebhookEmailAccount(
           access_token: true,
           refresh_token: true,
           expires_at: true,
+          disconnectedAt: true,
         },
       },
       rules: {
@@ -123,6 +124,11 @@ export async function validateWebhookAccount(
     return { success: false, response: NextResponse.json({ ok: true }) };
   }
 
+  if (emailAccount.account?.disconnectedAt) {
+    logger.info("Skipping disconnected account");
+    return { success: false, response: NextResponse.json({ ok: true }) };
+  }
+
   const premium = env.NEXT_PUBLIC_BYPASS_PREMIUM_CHECKS
     ? { tier: "BUSINESS_PLUS_ANNUALLY" as const }
     : isPremium(
@@ -135,6 +141,7 @@ export async function validateWebhookAccount(
   const provider = await createEmailProvider({
     emailAccountId: emailAccount.id,
     provider: emailAccount.account?.provider,
+    logger,
   });
 
   if (!premium) {
@@ -147,6 +154,7 @@ export async function validateWebhookAccount(
       emailAccountId: emailAccount.id,
       provider,
       subscriptionId: emailAccount.watchEmailsSubscriptionId,
+      logger,
     });
     return { success: false, response: NextResponse.json({ ok: true }) };
   }
@@ -162,6 +170,7 @@ export async function validateWebhookAccount(
       emailAccountId: emailAccount.id,
       provider,
       subscriptionId: emailAccount.watchEmailsSubscriptionId,
+      logger,
     });
     return { success: false, response: NextResponse.json({ ok: true }) };
   }

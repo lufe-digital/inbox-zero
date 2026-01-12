@@ -15,6 +15,19 @@ export function extractNameFromEmail(email: string) {
   return email;
 }
 
+// Extracts all email addresses from a comma-separated header string
+// e.g., "John <john@example.com>, Jane <jane@example.com>" -> ["john@example.com", "jane@example.com"]
+export function extractEmailAddresses(header: string): string[] {
+  if (!header) return [];
+
+  // split by comma, but be careful about commas inside quoted names
+  const parts = header.split(/,(?=(?:[^"]*"[^"]*")*[^"]*$)/);
+
+  return parts
+    .map((part) => extractEmailAddress(part.trim()))
+    .filter((email) => email.length > 0);
+}
+
 // Converts "John Doe <john.doe@gmail>" to "john.doe@gmail"
 export function extractEmailAddress(email: string): string {
   if (!email) return "";
@@ -70,7 +83,7 @@ export function normalizeEmailAddress(email: string) {
 }
 
 // Converts "Name <hey@domain.com>" to "domain.com"
-export function extractDomainFromEmail(email: string) {
+export function extractDomainFromEmail(email: string): string {
   if (!email) return "";
 
   // Extract clean email address from formatted strings like "Name <email@domain.com>"
@@ -111,4 +124,35 @@ export function formatEmailWithName(
   if (!address) return "";
   if (!name || name === address) return address;
   return `${name} <${address}>`;
+}
+
+// Public email providers where we should search by full email address
+// For company domains, we search by domain to catch emails from different people at same company
+export const PUBLIC_EMAIL_DOMAINS = new Set([
+  "gmail.com",
+  "yahoo.com",
+  "hotmail.com",
+  "outlook.com",
+  "aol.com",
+  "icloud.com",
+  "me.com",
+  "protonmail.com",
+  "zoho.com",
+  "yandex.com",
+  "fastmail.com",
+  "gmx.com",
+  "hey.com",
+  "mail.com",
+]);
+
+// Returns the search term to use when checking for previous communications
+// For public email providers (gmail, yahoo, etc), returns the full email address
+// For company domains, returns just the domain to catch emails from different people at same company
+export function getSearchTermForSender(email: string): string {
+  const domain = extractDomainFromEmail(email);
+  if (!domain) return email;
+
+  return PUBLIC_EMAIL_DOMAINS.has(domain.toLowerCase())
+    ? extractEmailAddress(email) || email
+    : domain;
 }

@@ -7,6 +7,7 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
 } from "@/components/ui/sidebar";
+import { Badge } from "@/components/ui/badge";
 
 type NavItem = {
   name: string;
@@ -16,6 +17,8 @@ type NavItem = {
   count?: number;
   hideInMail?: boolean;
   active?: boolean;
+  beta?: boolean;
+  new?: boolean;
 };
 
 export function SideNavMenu({
@@ -39,6 +42,16 @@ export function SideNavMenu({
             <Link href={item.href}>
               <item.icon />
               <span>{item.name}</span>
+              {item.new && (
+                <Badge variant="green" className="ml-auto text-[10px]">
+                  New!
+                </Badge>
+              )}
+              {item.beta && (
+                <Badge variant="secondary" className="ml-auto text-[10px]">
+                  Beta
+                </Badge>
+              )}
             </Link>
           </SidebarMenuButton>
         </SidebarMenuItem>

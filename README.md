@@ -66,6 +66,7 @@ Learn more in our [docs](https://docs.getinboxzero.com).
 - [Prisma](https://www.prisma.io/)
 - [Upstash](https://upstash.com/)
 - [Turborepo](https://turbo.build/)
+- [Popsy Illustrations](https://popsy.co/)
 
 ## Star History
 
@@ -88,6 +89,17 @@ See our **[Self-Hosting Guide](docs/hosting/self-hosting.md)** for complete inst
 ### Local Development Setup
 
 [Here's a video](https://youtu.be/hVQENQ4WT2Y) on how to set up the project. It covers the same steps mentioned in this document. But goes into greater detail on setting up the external services.
+
+#### Option A: Devcontainer (Recommended)
+
+The fastest way to get started is using [devcontainers](https://containers.dev/), supported by VS Code ([Dev Containers extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers)), JetBrains IDEs, and other modern editors:
+
+1. Open the project and select "Reopen in Container" when prompted
+2. Wait for container to build and `postCreateCommand` to complete
+3. Configure at least one OAuth provider in `apps/web/.env` (see [Google OAuth Setup](#google-oauth-setup) or [Microsoft OAuth Setup](#microsoft-oauth-setup) below for credentials and redirect URIs)
+4. Run `pnpm dev`
+
+#### Option B: Manual Setup
 
 #### Requirements
 
@@ -210,7 +222,7 @@ ngrok http 3000
 
 Then update the webhook endpoint in the [Google PubSub subscriptions dashboard](https://console.cloud.google.com/cloudpubsub/subscription/list).
 
-**Email watch renewal:** Gmail watch subscriptions expire periodically and must be renewed. If using Docker Compose, this is handled automatically by the cron container every 6 hours. Otherwise, set up a cron job to call `/api/watch/all` (see [Self-Hosting Guide](docs/hosting/self-hosting.md#scheduled-tasks)).
+**Scheduled tasks:** Gmail/Outlook watch subscriptions and meeting briefs require periodic execution. If using Docker Compose, this is handled automatically by the cron container. Otherwise, set up cron jobs for `/api/watch/all` (every 6 hours) and `/api/meeting-briefs` (every 15 minutes). See [Self-Hosting Guide](docs/hosting/self-hosting.md#scheduled-tasks).
 
 ### Microsoft OAuth Setup
 
@@ -313,3 +325,9 @@ You can view open tasks in our [GitHub Issues](https://github.com/elie222/inbox-
 Join our [Discord](https://www.getinboxzero.com/discord) to discuss tasks and check what's being worked on.
 
 [ARCHITECTURE.md](./ARCHITECTURE.md) explains the architecture of the project (LLM generated).
+
+### Releases
+
+Docker images are automatically built on every push to `main` and tagged with the commit SHA (e.g., `elie222/inbox-zero:abc1234`). The `latest` tag always points to the most recent main build.
+
+For formal releases, we create GitHub Releases with version tags (e.g., `v2.26.0`) which also trigger Docker builds with that version tag.

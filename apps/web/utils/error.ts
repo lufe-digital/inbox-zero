@@ -3,10 +3,8 @@ import {
   setUser,
 } from "@sentry/nextjs";
 import { APICallError, RetryError } from "ai";
-import type { z } from "zod";
-import { createScopedLogger } from "@/utils/logger";
-
-const logger = createScopedLogger("error");
+import type { FlattenedValidationErrors } from "next-safe-action";
+import { createScopedLogger, type Logger } from "@/utils/logger";
 
 export type ErrorMessage = { error: string; data?: any };
 export type ZodError = {
@@ -33,18 +31,49 @@ export function isGmailError(
   );
 }
 
+export type CaptureExceptionContext = {
+  // emailAccountId is set automatically via:
+  // - Frontend: SentryIdentify component
+  // - API routes: emailAccountMiddleware
+  // - Server actions: actionClient
+  // Only pass explicitly for code outside these contexts (e.g., cron jobs).
+  emailAccountId?: string | null;
+  userId?: string | null;
+  userEmail?: string;
+  extra?: Record<string, any>;
+  sampleRate?: number;
+};
+
 export function captureException(
   error: unknown,
-  additionalInfo?: { extra?: Record<string, any> },
-  userEmail?: string,
+  context: CaptureExceptionContext = {},
 ) {
   if (isKnownApiError(error)) {
-    logger.warn("Known API error", { error, additionalInfo });
+    const logger = createScopedLogger("captureException");
+    logger.warn("Known API error", { error, context });
+    return;
+  }
+
+  const { sampleRate, userEmail, emailAccountId, userId, extra } = context;
+  if (
+    Number.isFinite(sampleRate) &&
+    process.env.NODE_ENV === "production" &&
+    Math.random() >= (sampleRate as number)
+  ) {
     return;
   }
 
   if (userEmail) setUser({ email: userEmail });
-  sentryCaptureException(error, additionalInfo);
+
+  const sentryExtra = {
+    ...extra,
+    ...(emailAccountId && { emailAccountId }),
+    ...(userId && { userId }),
+  };
+
+  sentryCaptureException(error, {
+    extra: Object.keys(sentryExtra).length > 0 ? sentryExtra : undefined,
+  });
 }
 
 export type ActionError<E extends object = Record<string, unknown>> = {
@@ -90,6 +119,20 @@ export function isInvalidOpenAIModelError(error: APICallError): boolean {
   );
 }
 
+export function isInvalidAIModelError(error: APICallError): boolean {
+  // OpenAI: "The model `xyz` does not exist or you do not have access to it"
+  if (
+    error.message.includes("does not exist or you do not have access to it")
+  ) {
+    return true;
+  }
+  // Anthropic: 404 with "not_found_error"
+  if (error.statusCode === 404 && error.message.includes("not_found_error")) {
+    return true;
+  }
+  return false;
+}
+
 export function isOpenAIAPIKeyDeactivatedError(error: APICallError): boolean {
   return error.message.includes("this API key has been deactivated");
 }
@@ -102,10 +145,18 @@ export function isAnthropicInsufficientBalanceError(
   );
 }
 
-// Handling OpenAI retry errors on their own because this will be related to the user's own API quota,
-// rather than an error on our side (as we default to Anthropic atm).
-export function isOpenAIRetryError(error: RetryError): boolean {
-  return error.message.includes("You exceeded your current quota");
+// Handling AI quota/retry errors. This can be related to the user's own API quota or the system's quota.
+export function isAiQuotaExceededError(error: RetryError): boolean {
+  const message = error.message.toLowerCase();
+  const quotaErrorMessages = [
+    "exceeded your current quota",
+    "quota exceeded",
+    "rate limit reached",
+    "rate_limit_reached",
+    "too many requests",
+    "hit a rate limit",
+  ];
+  return quotaErrorMessages.some((substr) => message.includes(substr));
 }
 
 export function isAWSThrottlingError(error: unknown): error is Error {
@@ -114,6 +165,19 @@ export function isAWSThrottlingError(error: unknown): error is Error {
     error.name === "ThrottlingException" &&
     (error.message?.includes("Too many requests") ||
       error.message?.includes("please wait before trying again"))
+  );
+}
+
+export function isOutlookThrottlingError(error: unknown): boolean {
+  const err = error as Record<string, unknown>;
+  const code = err?.code as string | undefined;
+  const statusCode = err?.statusCode as number | undefined;
+  const message = err?.message as string | undefined;
+  return (
+    statusCode === 429 ||
+    code === "ApplicationThrottled" ||
+    code === "TooManyRequests" ||
+    (typeof message === "string" && /MailboxConcurrency/i.test(message))
   );
 }
 
@@ -131,18 +195,20 @@ export function isKnownApiError(error: unknown): boolean {
     isGmailInsufficientPermissionsError(error) ||
     isGmailRateLimitExceededError(error) ||
     isGmailQuotaExceededError(error) ||
+    isOutlookThrottlingError(error) ||
     (APICallError.isInstance(error) &&
       (isIncorrectOpenAIAPIKeyError(error) ||
-        isInvalidOpenAIModelError(error) ||
+        isInvalidAIModelError(error) ||
         isOpenAIAPIKeyDeactivatedError(error) ||
         isAnthropicInsufficientBalanceError(error))) ||
-    (RetryError.isInstance(error) && isOpenAIRetryError(error))
+    (RetryError.isInstance(error) && isAiQuotaExceededError(error))
   );
 }
 
 export function checkCommonErrors(
   error: unknown,
   url: string,
+  logger: Logger,
 ): ApiErrorType | null {
   if (isGmailInsufficientPermissionsError(error)) {
     logger.warn("Gmail insufficient permissions error for url", { url });
@@ -174,14 +240,136 @@ export function checkCommonErrors(
     };
   }
 
-  if (RetryError.isInstance(error) && isOpenAIRetryError(error)) {
-    logger.warn("OpenAI quota exceeded for url", { url });
+  if (isOutlookThrottlingError(error)) {
+    logger.warn("Outlook throttling error for url", { url });
     return {
-      type: "OpenAI Quota Exceeded",
-      message: `OpenAI error: ${error.message}`,
+      type: "Outlook Rate Limit",
+      message:
+        "Microsoft is temporarily limiting requests. Please try again shortly.",
+      code: 429,
+    };
+  }
+
+  if (RetryError.isInstance(error) && isAiQuotaExceededError(error)) {
+    logger.warn("AI quota exceeded for url", { url });
+    return {
+      type: "AI Quota Exceeded",
+      message: `AI error: ${error.message}`,
       code: 429,
     };
   }
 
   return null;
+}
+
+export function getErrorMessage(error: unknown): string | undefined {
+  if (typeof error === "string") return error;
+  if (error instanceof Error) return error.message;
+
+  const outer = asRecord(error);
+  if (!outer) return undefined;
+
+  const directMessage = getStringProp(outer, "message");
+  if (directMessage) return directMessage;
+
+  const nested = asRecord(outer.error);
+  if (!nested) return undefined;
+
+  return getStringProp(nested, "message");
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function getStringProp(
+  obj: Record<string, unknown>,
+  key: string,
+): string | undefined {
+  const value = obj[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+// --- Safe Action Error Handling ---
+
+type FlattenedErrors = FlattenedValidationErrors<Record<string, string[]>>;
+
+type SafeActionError = {
+  serverError?: string;
+  validationErrors?: FlattenedErrors;
+  bindArgsValidationErrors?: readonly (FlattenedErrors | undefined)[];
+};
+
+type ActionErrorMessageOptions = {
+  fallback?: string;
+  prefix?: string;
+};
+
+/**
+ * Extracts a user-friendly error message from a safe-action error result.
+ * Expects flattened validation errors (defaultValidationErrorsShape: "flattened").
+ *
+ * @param error - The error object from safe-action
+ * @param fallbackOrOptions - Either a fallback string, or options object with fallback/prefix
+ *
+ * @example
+ * // Simple usage
+ * getActionErrorMessage(error.error)
+ *
+ * @example
+ * // With prefix (shows "Failed to save. <error>" or just "Failed to save" if no error)
+ * getActionErrorMessage(error.error, { prefix: "Failed to save" })
+ */
+export function getActionErrorMessage(
+  error: SafeActionError,
+  fallbackOrOptions:
+    | string
+    | ActionErrorMessageOptions = "An unknown error occurred",
+): string {
+  const { fallback, prefix } =
+    typeof fallbackOrOptions === "string"
+      ? { fallback: fallbackOrOptions, prefix: undefined }
+      : {
+          fallback: fallbackOrOptions.fallback ?? "An unknown error occurred",
+          prefix: fallbackOrOptions.prefix,
+        };
+
+  const message = extractActionErrorMessage(error);
+
+  if (prefix) {
+    return message ? `${prefix}. ${message}` : prefix;
+  }
+
+  return message || fallback;
+}
+
+function extractActionErrorMessage(error: SafeActionError): string | null {
+  if (error.serverError) {
+    return error.serverError;
+  }
+
+  const messages = getValidationMessages(error.validationErrors);
+  if (messages) return messages;
+
+  if (error.bindArgsValidationErrors) {
+    for (const ve of error.bindArgsValidationErrors) {
+      const msg = getValidationMessages(ve);
+      if (msg) return msg;
+    }
+  }
+
+  return null;
+}
+
+function getValidationMessages(
+  errors: FlattenedErrors | undefined,
+): string | null {
+  if (!errors) return null;
+
+  const { formErrors, fieldErrors } = errors;
+  const all = [...formErrors, ...Object.values(fieldErrors).flat()];
+
+  return all.length > 0 ? all.join(". ") : null;
 }

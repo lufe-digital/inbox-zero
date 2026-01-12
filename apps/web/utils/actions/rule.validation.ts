@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   ActionType,
+  CategoryFilterType,
   LogicalOperator,
   SystemType,
 } from "@/generated/prisma/enums";
@@ -26,6 +27,7 @@ const zodActionType = z.enum([
   ActionType.MARK_READ,
   ActionType.DIGEST,
   ActionType.MOVE_FOLDER,
+  ActionType.NOTIFY_SENDER,
 ]);
 
 const zodConditionType = z.enum([ConditionType.AI, ConditionType.STATIC]);
@@ -139,7 +141,7 @@ const zodAction = z
 
 export const createRuleBody = z.object({
   id: z.string().optional(),
-  name: z.string().min(1, "Please enter a name"),
+  name: z.string().trim().min(1, "Please enter a name"),
   instructions: z.string().nullish(),
   groupId: z.string().nullish(),
   runOnThreads: z.boolean().nullish(),
@@ -150,16 +152,54 @@ export const createRuleBody = z.object({
     .min(1, "You must have at least one condition")
     .refine(
       (conditions) => {
-        const types = conditions.map((condition) => condition.type);
-        return new Set(types).size === types.length;
+        // Allow multiple STATIC conditions if they have different fields populated
+        // But only allow one AI condition
+        const aiConditions = conditions.filter(
+          (c) => c.type === ConditionType.AI,
+        );
+        if (aiConditions.length > 1) {
+          return false;
+        }
+
+        // For STATIC conditions, check if they have different fields
+        const staticConditions = conditions.filter(
+          (c) => c.type === ConditionType.STATIC,
+        );
+
+        // Filter out empty static conditions (where the active field has no value)
+        const nonEmptyStaticConditions = staticConditions.filter((c) => {
+          return (
+            c.from?.trim() ||
+            c.to?.trim() ||
+            c.subject?.trim() ||
+            c.body?.trim()
+          );
+        });
+
+        if (nonEmptyStaticConditions.length <= 1) {
+          return true; // No duplicates possible
+        }
+
+        // Create a signature for each non-empty static condition based on which fields are populated
+        const staticSignatures = nonEmptyStaticConditions.map((c) => {
+          const fields = [];
+          if (c.from) fields.push("from");
+          if (c.to) fields.push("to");
+          if (c.subject) fields.push("subject");
+          if (c.body) fields.push("body");
+          return fields.sort().join(",");
+        });
+
+        // Check for duplicates
+        const uniqueSignatures = new Set(staticSignatures);
+        return uniqueSignatures.size === staticSignatures.length;
       },
       {
-        message: "You can't have two conditions with the same type.",
+        message: "You can't have duplicate conditions.",
       },
     ),
   conditionalOperator: z
     .enum([LogicalOperator.AND, LogicalOperator.OR])
-    .default(LogicalOperator.AND)
     .optional(),
   systemType: zodSystemRule.nullish(),
 });
@@ -227,3 +267,119 @@ export const toggleRuleBody = z
   .refine((data) => data.ruleId || data.systemType, {
     message: "Either ruleId or systemType must be provided",
   });
+
+export const toggleAllRulesBody = z.object({
+  enabled: z.boolean(),
+});
+export type ToggleAllRulesBody = z.infer<typeof toggleAllRulesBody>;
+
+export const copyRulesFromAccountBody = z.object({
+  sourceEmailAccountId: z.string().min(1, "Source account is required"),
+  targetEmailAccountId: z.string().min(1, "Target account is required"),
+  ruleIds: z.array(z.string()).min(1, "Select at least one rule to copy"),
+});
+export type CopyRulesFromAccountBody = z.infer<typeof copyRulesFromAccountBody>;
+
+// Schema for importing rules from JSON export
+const importedAction = z
+  .object({
+    type: zodActionType,
+    label: z.string().nullish(),
+    to: z.string().nullish(),
+    cc: z.string().nullish(),
+    bcc: z.string().nullish(),
+    subject: z.string().nullish(),
+    content: z.string().nullish(),
+    folderName: z.string().nullish(),
+    url: z.string().nullish(),
+    delayInMinutes: delayInMinutesSchema,
+  })
+  .superRefine((data, ctx) => {
+    if (data.type === ActionType.LABEL) {
+      const labelValue = data.label?.trim();
+
+      if (!labelValue) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Label action requires a label name",
+          path: ["label"],
+        });
+        return;
+      }
+
+      const validation = validateLabelNameBasic(labelValue);
+      if (!validation.valid) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: validation.error!,
+          path: ["label"],
+        });
+      }
+    }
+
+    if (data.type === ActionType.FORWARD && !data.to?.trim()) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Forward action requires a recipient email address",
+        path: ["to"],
+      });
+    }
+
+    if (data.type === ActionType.CALL_WEBHOOK && !data.url?.trim()) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Webhook action requires a URL",
+        path: ["url"],
+      });
+    }
+
+    if (data.type === ActionType.MOVE_FOLDER && !data.folderName?.trim()) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Move folder action requires a folder name",
+        path: ["folderName"],
+      });
+    }
+  });
+
+const importedRule = z
+  .object({
+    name: z.string().min(1),
+    instructions: z.string().nullish(),
+    enabled: z.boolean().optional().default(true),
+    automate: z.boolean().optional().default(true),
+    runOnThreads: z.boolean().optional().default(false),
+    systemType: zodSystemRule.nullish(),
+    conditionalOperator: z
+      .enum([LogicalOperator.AND, LogicalOperator.OR])
+      .optional()
+      .default(LogicalOperator.AND),
+    from: z.string().nullish(),
+    to: z.string().nullish(),
+    subject: z.string().nullish(),
+    body: z.string().nullish(),
+    categoryFilterType: z
+      .enum([CategoryFilterType.INCLUDE, CategoryFilterType.EXCLUDE])
+      .nullish(),
+    actions: z.array(importedAction).min(1),
+    group: z.string().nullish(),
+  })
+  .refine(
+    (data) =>
+      data.systemType ||
+      data.from?.trim() ||
+      data.to?.trim() ||
+      data.subject?.trim() ||
+      data.body?.trim() ||
+      data.instructions?.trim(),
+    {
+      message:
+        "At least one condition (from, to, subject, body, or instructions) must be provided",
+    },
+  );
+
+export const importRulesBody = z.object({
+  rules: z.array(importedRule).min(1, "No rules to import"),
+});
+export type ImportRulesBody = z.infer<typeof importRulesBody>;
+export type ImportedRule = z.infer<typeof importedRule>;

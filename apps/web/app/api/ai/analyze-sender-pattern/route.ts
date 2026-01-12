@@ -3,13 +3,14 @@ import { headers } from "next/headers";
 import { z } from "zod";
 import { withError } from "@/utils/middleware";
 import prisma from "@/utils/prisma";
-import { createScopedLogger, type Logger } from "@/utils/logger";
+import type { Logger } from "@/utils/logger";
 import type { ParsedMessage } from "@/utils/types";
 import { aiDetectRecurringPattern } from "@/utils/ai/choose-rule/ai-detect-recurring-pattern";
 import { isValidInternalApiKey } from "@/utils/internal-api";
 import { extractEmailAddress } from "@/utils/email";
 import { getEmailForLLM } from "@/utils/get-email-from-message";
 import { saveLearnedPattern } from "@/utils/rule/learned-patterns";
+import { GroupItemSource } from "@/generated/prisma/enums";
 import { checkSenderRuleHistory } from "@/utils/rule/check-sender-rule-history";
 import { createEmailProvider } from "@/utils/email/provider";
 import type { EmailProvider } from "@/utils/email/types";
@@ -25,28 +26,31 @@ const schema = z.object({
 });
 export type AnalyzeSenderPatternBody = z.infer<typeof schema>;
 
-export const POST = withError(async (request) => {
-  const json = await request.json();
+export const POST = withError(
+  "api/ai/analyze-sender-pattern",
+  async (request) => {
+    const json = await request.json();
 
-  let logger = createScopedLogger("api/ai/pattern-match");
+    let logger = request.logger;
 
-  if (!isValidInternalApiKey(await headers(), logger)) {
-    logger.error("Invalid API key for sender pattern analysis", json);
-    return NextResponse.json({ error: "Invalid API key" });
-  }
+    if (!isValidInternalApiKey(await headers(), logger)) {
+      logger.error("Invalid API key for sender pattern analysis", json);
+      return NextResponse.json({ error: "Invalid API key" });
+    }
 
-  const data = schema.parse(json);
-  const { emailAccountId } = data;
-  const from = extractEmailAddress(data.from);
+    const data = schema.parse(json);
+    const { emailAccountId } = data;
+    const from = extractEmailAddress(data.from);
 
-  logger = logger.with({ emailAccountId, from });
+    logger = logger.with({ from });
 
-  logger.trace("Analyzing sender pattern");
+    logger.trace("Analyzing sender pattern");
 
-  // return immediately and process in background
-  after(() => process({ emailAccountId, from, logger }));
-  return NextResponse.json({ processing: true });
-});
+    // return immediately and process in background
+    after(() => process({ emailAccountId, from, logger }));
+    return NextResponse.json({ processing: true });
+  },
+);
 
 /**
  * Main background process function that:
@@ -97,6 +101,7 @@ async function process({
     const provider = await createEmailProvider({
       emailAccountId,
       provider: account.provider,
+      logger,
     });
 
     const { threads: threadsWithMessages, conversationDetected } =
@@ -136,6 +141,7 @@ async function process({
       emailAccountId,
       from,
       provider,
+      logger,
     });
 
     if (!senderHistory.hasConsistentRule) {
@@ -166,16 +172,30 @@ async function process({
         instructions: rule.instructions || "",
       })),
       consistentRuleName: senderHistory.consistentRuleName,
+      logger,
     });
 
     if (patternResult?.matchedRule) {
       // Verify the AI matched the same rule as the historical data
       if (patternResult.matchedRule === senderHistory.consistentRuleName) {
-        await saveLearnedPattern({
-          emailAccountId,
-          from,
-          ruleName: patternResult.matchedRule,
-        });
+        const matchedRule = emailAccount.rules.find(
+          (rule) => rule.name === patternResult.matchedRule,
+        );
+
+        if (matchedRule) {
+          await saveLearnedPattern({
+            emailAccountId,
+            from,
+            ruleId: matchedRule.id,
+            logger,
+            source: GroupItemSource.AI,
+          });
+        } else {
+          logger.error("Matched rule not found in email account rules", {
+            ruleName: patternResult.matchedRule,
+            availableRules: emailAccount.rules.map((r) => r.name),
+          });
+        }
       } else {
         logger.warn("AI suggested different rule than historical data", {
           aiRule: patternResult.matchedRule,

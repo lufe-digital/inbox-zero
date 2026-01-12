@@ -1,5 +1,6 @@
 /** biome-ignore-all lint/suspicious/noConsole: we use console.log for development logs */
 import { log } from "next-axiom";
+import { serializeError } from "serialize-error";
 import { env } from "@/env";
 
 export type Logger = ReturnType<typeof createScopedLogger>;
@@ -136,19 +137,6 @@ function formatError(args?: Record<string, unknown>) {
   };
 }
 
-function serializeError(error: unknown): unknown {
-  if (error instanceof Error) {
-    return {
-      ...error,
-      name: error.name,
-      message: error.message,
-      stack: error.stack,
-    };
-  }
-
-  return error;
-}
-
 function processErrorsInObject(obj: unknown): unknown {
   if (obj instanceof Error) {
     return obj.message;
@@ -205,7 +193,7 @@ function hasNestedErrorField(value: unknown): value is { error: unknown } {
 }
 
 // Field names that contain PII and should be hashed in production
-const SENSITIVE_FIELD_NAMES = new Set(["from", "sender", "to"]);
+const SENSITIVE_FIELD_NAMES = new Set(["from", "sender", "to", "replyTo"]);
 
 // Field names that should NEVER be logged - replaced with boolean
 const REDACTED_FIELD_NAMES = new Set([
@@ -217,11 +205,18 @@ const REDACTED_FIELD_NAMES = new Set([
   "id_token",
   "headers",
   "authorization",
+  "requestBodyValues",
+  "systemInstruction",
+  "contents",
 ]);
+
+// Fields containing email/message content - redacted in production unless debug logs enabled
+const CONTENT_FIELD_NAMES = new Set(["text", "body", "content"]);
 
 /**
  * Recursively processes an object to protect sensitive data:
  * - REDACTED_FIELD_NAMES: Replaced with boolean (never logged)
+ * - CONTENT_FIELD_NAMES: Replaced with boolean in production (unless debug logs enabled)
  * - SENSITIVE_FIELD_NAMES: Hashed in production (raw in dev/test)
  *
  * Only works server-side - client-side logs are visible in browser anyway.
@@ -245,6 +240,14 @@ function hashSensitiveFields<T>(obj: T, depth = 0): T {
     for (const [key, value] of Object.entries(obj)) {
       // Always redact tokens - never log them
       if (REDACTED_FIELD_NAMES.has(key)) {
+        processed[key] = !!value;
+      }
+      // Redact content fields in production (unless debug logs enabled)
+      else if (
+        CONTENT_FIELD_NAMES.has(key) &&
+        env.NODE_ENV === "production" &&
+        !env.ENABLE_DEBUG_LOGS
+      ) {
         processed[key] = !!value;
       }
       // Hash emails in production only (server-side only)

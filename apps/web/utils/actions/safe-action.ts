@@ -1,4 +1,5 @@
 import { createSafeActionClient } from "next-safe-action";
+import * as Sentry from "@sentry/nextjs";
 import { withServerActionInstrumentation } from "@sentry/nextjs";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
@@ -12,43 +13,44 @@ import { env } from "@/env";
 
 // TODO: take functionality from `withActionInstrumentation` and move it here (apps/web/utils/actions/middleware.ts)
 
-const logger = createScopedLogger("safe-action");
-
 const baseClient = createSafeActionClient({
   defineMetadataSchema() {
     return z.object({ name: z.string() });
   },
+  defaultValidationErrorsShape: "flattened",
   handleServerError(error, { metadata, ctx, bindArgsClientInputs }) {
-    const context = ctx as any;
+    const context = ctx as {
+      userId?: string;
+      userEmail?: string;
+      emailAccountId?: string;
+    };
+
+    const logger = createScopedLogger("safe-action");
     logger.error("Server action error:", {
       metadata,
       userId: context?.userId,
       userEmail: context?.userEmail,
       emailAccountId: context?.emailAccountId,
       bindArgsClientInputs,
-      error: error.message,
+      error,
     });
-    // Need a better way to handle this within logger itself
+
     if (env.NODE_ENV !== "production") {
       // biome-ignore lint/suspicious/noConsole: helpful for debugging
       console.error("Error in server action", error);
     }
     if (error instanceof SafeError) return error.message;
 
-    captureException(
-      error,
-      {
-        extra: {
-          metadata,
-          userId: context?.userId,
-          userEmail: context?.userEmail,
-          emailAccountId: context?.emailAccountId,
-          bindArgsClientInputs,
-          error: error.message,
-        },
+    captureException(error, {
+      userId: context?.userId,
+      userEmail: context?.userEmail,
+      emailAccountId: context?.emailAccountId,
+      extra: {
+        metadata,
+        bindArgsClientInputs,
+        error: error.message,
       },
-      context?.userEmail,
-    );
+    });
 
     return "An unknown error occurred.";
   },
@@ -67,12 +69,17 @@ const baseClient = createSafeActionClient({
     });
   });
 
-  return next({ ctx: { logger } });
+  const result = await next({ ctx: { logger } });
+
+  if (result.validationErrors) {
+    logger.warn("Action validation error", {
+      action: metadata.name,
+      validationErrors: result.validationErrors,
+    });
+  }
+
+  return result;
 });
-// .inputSchema(z.object({}), {
-//   handleValidationErrorsShape: async (ve) =>
-//     flattenValidationErrors(ve).fieldErrors,
-// });
 
 export const actionClient = baseClient
   .bindArgsSchemas<[emailAccountId: z.ZodString]>([z.string()])
@@ -103,6 +110,9 @@ export const actionClient = baseClient
       ctx.logger.error("Unauthorized", metadata);
       throw new SafeError("Unauthorized");
     }
+
+    Sentry.setTag("emailAccountId", emailAccountId);
+    Sentry.setUser({ id: userId, email: userEmail });
 
     const logger = ctx.logger.with({
       userId,
@@ -154,13 +164,17 @@ export const actionClientUser = baseClient.use(
   },
 );
 
-export const adminActionClient = baseClient.use(async ({ next, metadata }) => {
-  const session = await auth();
-  if (!session?.user) throw new SafeError("Unauthorized");
-  if (!isAdmin({ email: session.user.email }))
-    throw new SafeError("Unauthorized");
+export const adminActionClient = baseClient.use(
+  async ({ next, metadata, ctx }) => {
+    const session = await auth();
+    if (!session?.user) throw new SafeError("Unauthorized");
+    if (!isAdmin({ email: session.user.email }))
+      throw new SafeError("Unauthorized");
 
-  return withServerActionInstrumentation(metadata?.name, async () => {
-    return next({ ctx: {} });
-  });
-});
+    const logger = ctx.logger.with({ admin: true });
+
+    return withServerActionInstrumentation(metadata?.name, async () => {
+      return next({ ctx: { logger } });
+    });
+  },
+);

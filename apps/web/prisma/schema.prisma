@@ -25,6 +25,7 @@ model Account {
   refreshTokenExpiresAt DateTime?
   access_token          String?       @db.Text
   expires_at            DateTime?     @default(now())
+  disconnectedAt        DateTime? // When OAuth tokens were invalidated (password change, revoked access)
   token_type            String?
   scope                 String?
   id_token              String?       @db.Text
@@ -141,6 +142,13 @@ model EmailAccount {
   autoCategorizeSenders     Boolean           @default(false)
   multiRuleSelectionEnabled Boolean           @default(false)
 
+  meetingBriefingsEnabled       Boolean @default(false)
+  meetingBriefingsMinutesBefore Int     @default(240) // 4 hours in minutes
+
+  followUpAwaitingReplyDays Int?
+  followUpNeedsReplyDays    Int?
+  followUpAutoDraftEnabled  Boolean @default(true)
+
   digestSchedule Schedule?
 
   userId    String
@@ -152,7 +160,7 @@ model EmailAccount {
   rules            Rule[]
   executedRules    ExecutedRule[]
   newsletters      Newsletter[]
-  coldEmails       ColdEmail[]
+  coldEmails       ColdEmail[] // @deprecated - kept for backward compatibility during migration
   groups           Group[]
   categories       Category[]
   threadTrackers   ThreadTracker[]
@@ -171,6 +179,7 @@ model EmailAccount {
   ssoproviders        SsoProvider[]
   calendarConnections CalendarConnection[]
   mcpConnections      McpConnection[]
+  meetingBriefings    MeetingBriefing[]
 
   @@index([userId])
   @@index([lastSummaryEmailAt])
@@ -272,12 +281,12 @@ model DigestItem {
   digest      Digest          @relation(fields: [digestId], references: [id], onDelete: Cascade)
   actionId    String?
   action      ExecutedAction? @relation(fields: [actionId], references: [id], onDelete: Cascade)
-  coldEmailId String?
-  coldEmail   ColdEmail?      @relation(fields: [coldEmailId], references: [id])
+  coldEmailId String? // @deprecated
+  coldEmail   ColdEmail?      @relation(fields: [coldEmailId], references: [id]) // @deprecated
 
   @@unique([digestId, threadId, messageId])
   @@index([actionId])
-  @@index([coldEmailId])
+  @@index([coldEmailId]) // @deprecated
 }
 
 model Schedule {
@@ -615,6 +624,12 @@ model GroupItem {
   value     String // eg "@gmail.com", "matt@gmail.com", "Receipt from"
   exclude   Boolean       @default(false) // Whether this pattern should be excluded rather than included
 
+  // Optional context for why/how this pattern was learned. 
+  reason    String?
+  threadId  String?
+  messageId String?
+  source    GroupItemSource? // provides value for UI/audit.
+
   @@unique([groupId, type, value])
 }
 
@@ -642,6 +657,7 @@ model Newsletter {
   createdAt DateTime          @default(now())
   updatedAt DateTime          @updatedAt
   email     String
+  name      String?
   status    NewsletterStatus?
 
   // For learned patterns for rules
@@ -659,6 +675,9 @@ model Newsletter {
   @@index([categoryId])
 }
 
+// @deprecated - ColdEmail data is being migrated to GroupItem (learned patterns).
+// This model is kept for backward compatibility during the migration period.
+// Once all users have run the migration, this model can be deleted.
 model ColdEmail {
   id        String           @id @default(cuid())
   createdAt DateTime         @default(now())
@@ -733,6 +752,8 @@ model ThreadTracker {
   resolved  Boolean           @default(false)
   type      ThreadTrackerType
 
+  followUpAppliedAt DateTime? // When the follow-up label was added (prevents re-processing)
+
   emailAccountId String
   emailAccount   EmailAccount @relation(fields: [emailAccountId], references: [id], onDelete: Cascade)
 
@@ -740,6 +761,7 @@ model ThreadTracker {
   @@index([emailAccountId, resolved])
   @@index([emailAccountId, resolved, sentAt, type])
   @@index([emailAccountId, type, resolved, sentAt])
+  @@index([emailAccountId, type, resolved, followUpAppliedAt, sentAt])
 }
 
 model CleanupJob {
@@ -930,6 +952,23 @@ model Calendar {
   @@unique([connectionId, calendarId])
 }
 
+model MeetingBriefing {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+
+  calendarEventId String // External event ID from Google/Microsoft
+  eventTitle      String
+  eventStartTime  DateTime
+  guestCount      Int
+  status          MeetingBriefingStatus
+
+  emailAccountId String
+  emailAccount   EmailAccount @relation(fields: [emailAccountId], references: [id], onDelete: Cascade)
+
+  @@unique([emailAccountId, calendarEventId]) // Prevent duplicate briefings
+  @@index([emailAccountId])
+}
+
 model Referral {
   id        String   @id @default(cuid())
   createdAt DateTime @default(now())
@@ -1030,6 +1069,7 @@ enum ActionType {
   // TRACK_THREAD // @deprecated - No longer used. We rely on rule SystemType instead to run this.
   DIGEST
   MOVE_FOLDER
+  NOTIFY_SENDER // Sends notification from Inbox Zero (not user's email). Only for cold email rules.
   // SUMMARIZE
   // SNOOZE
   // ADD_TO_DO
@@ -1158,4 +1198,17 @@ enum SchedulingStatus {
   PENDING
   SCHEDULED
   FAILED
+}
+
+enum MeetingBriefingStatus {
+  PENDING
+  SENT
+  FAILED
+  SKIPPED
+}
+
+enum GroupItemSource {
+  AI
+  USER
+  LABEL_REMOVED
 }

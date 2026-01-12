@@ -2,7 +2,7 @@ import type { EmailAccountWithAI } from "@/utils/llms/types";
 import type { ParsedMessage } from "@/utils/types";
 import { aiDetermineThreadStatus } from "@/utils/ai/reply/determine-thread-status";
 import prisma from "@/utils/prisma";
-import { createScopedLogger, type Logger } from "@/utils/logger";
+import type { Logger } from "@/utils/logger";
 import { getEmailForLLM } from "@/utils/get-email-from-message";
 import { internalDateToDate, sortByInternalDate } from "@/utils/date";
 import type { EmailProvider } from "@/utils/email/types";
@@ -14,12 +14,14 @@ export async function handleOutboundReply({
   emailAccount,
   message,
   provider,
+  logger,
 }: {
   emailAccount: EmailAccountWithAI;
   message: ParsedMessage;
   provider: EmailProvider;
+  logger: Logger;
 }) {
-  const logger = createScopedLogger("reply-tracker/outbound").with({
+  logger = logger.with({
     email: emailAccount.email,
     messageId: message.id,
     threadId: message.threadId,
@@ -44,13 +46,15 @@ export async function handleOutboundReply({
   const { isLatest, sortedMessages } = isMessageLatestInThread(
     message,
     threadMessages,
-    logger,
   );
   if (!isLatest) {
     logger.info(
-      "Skipping outbound check: message is not the latest in the thread",
+      "Outbound message is not the latest in the thread, proceeding anyway.",
+      {
+        processingMessageId: message.id,
+        actualLatestMessageId: sortedMessages.at(-1)?.id,
+      },
     );
-    return; // Stop processing if not the latest
   }
 
   // Prepare thread messages for AI analysis (chronological order, oldest to newest)
@@ -112,22 +116,14 @@ async function isOutboundTrackingEnabled({
 function isMessageLatestInThread(
   message: ParsedMessage,
   threadMessages: ParsedMessage[],
-  logger: Logger,
 ): { isLatest: boolean; sortedMessages: ParsedMessage[] } {
   if (!threadMessages.length) return { isLatest: false, sortedMessages: [] }; // Should not happen if called correctly
 
   const sortedMessages = [...threadMessages].sort(sortByInternalDate());
-  const actualLatestMessage = sortedMessages[sortedMessages.length - 1];
+  const actualLatestMessage = sortedMessages.at(-1);
 
-  if (actualLatestMessage?.id !== message.id) {
-    logger.warn(
-      "Skipping outbound reply check: message is not the latest in the thread",
-      {
-        processingMessageId: message.id,
-        actualLatestMessageId: actualLatestMessage?.id,
-      },
-    );
-    return { isLatest: false, sortedMessages };
-  }
-  return { isLatest: true, sortedMessages };
+  return {
+    isLatest: actualLatestMessage?.id === message.id,
+    sortedMessages,
+  };
 }

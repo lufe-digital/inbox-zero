@@ -8,15 +8,14 @@ import {
   isDefined,
 } from "@/utils/types";
 import { getBatch } from "@/utils/gmail/batch";
-import { extractDomainFromEmail } from "@/utils/email";
+import { getSearchTermForSender } from "@/utils/email";
 import { createScopedLogger } from "@/utils/logger";
 import { sleep } from "@/utils/sleep";
 import { getAccessTokenFromClient } from "@/utils/gmail/client";
 import { GmailLabel } from "@/utils/gmail/label";
 import { isIgnoredSender } from "@/utils/filter-ignored-senders";
 import parse from "gmail-api-parse-message";
-import type { EmailProvider } from "@/utils/email/types";
-import { withGmailRetry } from "@/utils/gmail/retry";
+import { isRetryableError, withGmailRetry } from "@/utils/gmail/retry";
 
 const logger = createScopedLogger("gmail/message");
 
@@ -28,6 +27,9 @@ export function parseMessage(
     ...parsed,
     subject: parsed.headers?.subject || "",
     date: parsed.headers?.date || "",
+    // gmail-api-parse-message converts internalDate to a number, but our type expects string
+    internalDate:
+      parsed.internalDate != null ? String(parsed.internalDate) : null,
   };
 }
 
@@ -140,9 +142,29 @@ export async function getMessagesBatch({
   const messages = batch
     .map((message, i) => {
       if (isBatchError(message)) {
-        logger.error("Error fetching message", {
-          code: message.error.code,
-          error: message.error.message,
+        const { code, message: errorMessage, errors } = message.error;
+        const reason = (errors?.[0] as any)?.reason;
+
+        const { retryable } = isRetryableError({
+          status: code,
+          reason,
+          errorMessage,
+        });
+
+        if (!retryable) {
+          logger.warn("Skipping message due to non-retryable error", {
+            messageId: messageIds[i],
+            code,
+            reason,
+            errorMessage,
+          });
+          return;
+        }
+
+        logger.error("Error fetching message, adding to retry queue", {
+          code,
+          error: errorMessage,
+          reason,
         });
         missingMessageIds.add(messageIds[i]);
         return;
@@ -171,39 +193,28 @@ export async function getMessagesBatch({
 }
 
 async function findPreviousEmailsWithSender(
-  client: EmailProvider,
+  gmail: gmail_v1.Gmail,
   options: {
     sender: string;
     dateInSeconds: number;
   },
 ) {
-  const beforeDate = new Date(options.dateInSeconds * 1000);
-  const [incomingEmails, outgoingEmails] = await Promise.all([
-    client.getMessagesWithPagination({
-      query: `from:${options.sender}`,
-      maxResults: 2,
-      before: beforeDate,
-    }),
-    client.getMessagesWithPagination({
-      query: `to:${options.sender}`,
-      maxResults: 2,
-      before: beforeDate,
-    }),
-  ]);
+  const beforeTimestamp = Math.floor(options.dateInSeconds);
+  const query = `(from:${options.sender} OR to:${options.sender}) before:${beforeTimestamp}`;
 
-  const allMessages = [
-    ...(incomingEmails.messages || []),
-    ...(outgoingEmails.messages || []),
-  ];
+  const response = await getMessages(gmail, {
+    query,
+    maxResults: 4,
+  });
 
-  return allMessages;
+  return response.messages || [];
 }
 
-export async function hasPreviousCommunicationWithSender(
-  client: EmailProvider,
+async function hasPreviousCommunicationWithSender(
+  gmail: gmail_v1.Gmail,
   options: { from: string; date: Date; messageId: string },
 ) {
-  const previousEmails = await findPreviousEmailsWithSender(client, {
+  const previousEmails = await findPreviousEmailsWithSender(gmail, {
     sender: options.from,
     dateInSeconds: +new Date(options.date) / 1000,
   });
@@ -215,36 +226,13 @@ export async function hasPreviousCommunicationWithSender(
   return hasPreviousEmail;
 }
 
-const PUBLIC_DOMAINS = new Set([
-  "gmail.com",
-  "yahoo.com",
-  "hotmail.com",
-  "outlook.com",
-  "aol.com",
-  "icloud.com",
-  "@me.com",
-  "protonmail.com",
-  "zoho.com",
-  "yandex.com",
-  "fastmail.com",
-  "gmx.com",
-  "@hey.com",
-]);
-
 export async function hasPreviousCommunicationsWithSenderOrDomain(
-  client: EmailProvider,
+  gmail: gmail_v1.Gmail,
   options: { from: string; date: Date; messageId: string },
 ) {
-  const domain = extractDomainFromEmail(options.from);
-  if (!domain) return hasPreviousCommunicationWithSender(client, options);
+  const searchTerm = getSearchTermForSender(options.from);
 
-  // For public email providers (gmail, yahoo, etc), search by full email address
-  // For company domains, search by domain to catch emails from different people at same company
-  const searchTerm = PUBLIC_DOMAINS.has(domain.toLowerCase())
-    ? options.from
-    : domain;
-
-  return hasPreviousCommunicationWithSender(client, {
+  return hasPreviousCommunicationWithSender(gmail, {
     ...options,
     from: searchTerm,
   });

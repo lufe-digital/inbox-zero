@@ -14,7 +14,10 @@ const withMDX = nextMdx({
 const nextConfig: NextConfig = {
   reactStrictMode: true,
   output: process.env.DOCKER_BUILD === "true" ? "standalone" : undefined,
-  eslint: { ignoreDuringBuilds: true },
+  // Skip TypeScript checking during E2E CI builds to save memory
+  typescript: {
+    ignoreBuildErrors: process.env.SKIP_TYPE_CHECK === "true",
+  },
   serverExternalPackages: ["@sentry/nextjs", "@sentry/node"],
   turbopack: {
     rules: {
@@ -54,6 +57,10 @@ const nextConfig: NextConfig = {
       {
         protocol: "https",
         hostname: "t1.gstatic.com",
+      },
+      {
+        protocol: "https",
+        hostname: "cdn.outrank.so",
       },
     ],
   },
@@ -327,7 +334,7 @@ if (env.MICROSOFT_CLIENT_ID && !env.MICROSOFT_WEBHOOK_CLIENT_STATE) {
 const withSerwist = withSerwistInit({
   swSrc: "app/sw.ts",
   swDest: "public/sw.js",
-  disable: env.NODE_ENV !== "production",
+  disable: process.env.NODE_ENV !== "production",
   maximumFileSizeToCacheInBytes: 3 * 1024 * 1024, // 3MB
 });
 

@@ -4,6 +4,7 @@ import type { EmailAccountWithAI } from "@/utils/llms/types";
 import {
   ActionType,
   ExecutedRuleStatus,
+  GroupItemSource,
   SystemType,
 } from "@/generated/prisma/enums";
 import type { Rule } from "@/generated/prisma/client";
@@ -12,6 +13,7 @@ import { findMatchingRules } from "@/utils/ai/choose-rule/match-rules";
 import { getActionItemsWithAiArgs } from "@/utils/ai/choose-rule/choose-args";
 import { executeAct } from "@/utils/ai/choose-rule/execute";
 import prisma from "@/utils/prisma";
+import { withPrismaRetry } from "@/utils/prisma-retry";
 import type { MatchReason } from "@/utils/ai/choose-rule/types";
 import { serializeMatchReasons } from "@/utils/ai/choose-rule/types";
 import { sanitizeActionFields } from "@/utils/action-item";
@@ -34,7 +36,7 @@ import {
   updateThreadTrackers,
 } from "@/utils/reply-tracker/handle-conversation-status";
 import { removeConflictingThreadStatusLabels } from "@/utils/reply-tracker/label-helpers";
-import { saveColdEmail } from "@/utils/cold-email/is-cold-email";
+import { saveLearnedPattern } from "@/utils/rule/learned-patterns";
 import { internalDateToDate } from "@/utils/date";
 import { ConditionType } from "@/utils/config";
 import type { Logger } from "@/utils/logger";
@@ -105,7 +107,50 @@ export async function runRules({
     logger,
   });
 
-  const finalMatches = limitDraftEmailActions(conversationAwareMatches, logger);
+  // Separate regular matches from conversation meta-rule
+  const regularMatches = conversationAwareMatches.filter(
+    (m) => !isConversationRule(m.rule.id),
+  );
+  const conversationMatch = conversationAwareMatches.find((m) =>
+    isConversationRule(m.rule.id),
+  );
+
+  // Resolve conversation meta-rule to actual rule (e.g., TO_REPLY)
+  const matchesWithFlags: {
+    rule: RuleWithActions;
+    matchReasons?: MatchReason[];
+    resolvedReason?: string;
+    isConversationRule: boolean;
+  }[] = regularMatches.map((m) => ({
+    ...m,
+    isConversationRule: false,
+  }));
+
+  let skippedConversationReason: string | undefined;
+
+  if (conversationMatch) {
+    const { rule, reason } = await determineConversationStatus({
+      conversationRules,
+      message,
+      emailAccount,
+      provider,
+      modelType,
+      isTest,
+    });
+    if (rule) {
+      matchesWithFlags.push({
+        rule,
+        matchReasons: conversationMatch.matchReasons,
+        resolvedReason: reason,
+        isConversationRule: true,
+      });
+    } else {
+      // Track why conversation rule was skipped (e.g., determined FYI but rule disabled)
+      skippedConversationReason = reason;
+    }
+  }
+
+  const finalMatches = limitDraftEmailActions(matchesWithFlags, logger);
 
   logger.trace("Matching rule", () => ({
     module: MODULE,
@@ -113,19 +158,24 @@ export async function runRules({
   }));
 
   if (!finalMatches.length) {
-    const reason = results.reasoning || "No rules matched";
+    const reason =
+      skippedConversationReason || results.reasoning || "No rules matched";
     if (!isTest) {
-      await prisma.executedRule.create({
-        data: {
-          threadId: message.threadId,
-          messageId: message.id,
-          automated: true,
-          reason,
-          matchMetadata: undefined,
-          status: ExecutedRuleStatus.SKIPPED,
-          emailAccount: { connect: { id: emailAccount.id } },
-        },
-      });
+      await withPrismaRetry(
+        () =>
+          prisma.executedRule.create({
+            data: {
+              threadId: message.threadId,
+              messageId: message.id,
+              automated: true,
+              reason,
+              matchMetadata: undefined,
+              status: ExecutedRuleStatus.SKIPPED,
+              emailAccount: { connect: { id: emailAccount.id } },
+            },
+          }),
+        { logger },
+      );
     }
 
     return [
@@ -141,40 +191,16 @@ export async function runRules({
   const executedRules: RunRulesResult[] = [];
 
   for (const result of finalMatches) {
-    let ruleToExecute = result.rule;
-    let reasonToUse = results.reasoning;
+    const ruleToExecute = result.rule;
+    const reasonToUse = result.resolvedReason || results.reasoning;
 
-    if (result.rule && isConversationRule(result.rule.id)) {
-      const { rule: statusRule, reason: statusReason } =
-        await determineConversationStatus({
-          conversationRules,
-          message,
-          emailAccount,
-          provider,
-          modelType,
-          isTest,
-        });
-
-      if (!statusRule) {
-        const executedRule: RunRulesResult = {
-          rule: null,
-          reason: statusReason || "No enabled conversation status rule found",
-          createdAt: batchTimestamp,
-          status: ExecutedRuleStatus.SKIPPED,
-        };
-
-        executedRules.push(executedRule);
-        continue;
-      }
-
-      ruleToExecute = statusRule;
-      reasonToUse = statusReason;
-    } else {
+    if (!result.isConversationRule) {
       analyzeSenderPatternIfAiMatch({
         isTest,
         result,
         message,
         emailAccountId: emailAccount.id,
+        logger,
       });
     }
 
@@ -291,43 +317,50 @@ async function executeMatchedRule(
     };
   }
 
-  const executedRule = await prisma.executedRule.create({
-    data: {
-      actionItems: {
-        createMany: {
-          data:
-            // Only save immediate actions as ExecutedActions
-            immediateActions?.map((item) => {
-              const {
-                delayInMinutes: _delayInMinutes,
-                ...executedActionFields
-              } = sanitizeActionFields(item);
-              return executedActionFields;
-            }) || [],
+  const executedRule = await withPrismaRetry(
+    () =>
+      prisma.executedRule.create({
+        data: {
+          actionItems: {
+            createMany: {
+              data:
+                // Only save immediate actions as ExecutedActions
+                immediateActions?.map((item) => {
+                  const {
+                    delayInMinutes: _delayInMinutes,
+                    ...executedActionFields
+                  } = sanitizeActionFields(item);
+                  return executedActionFields;
+                }) || [],
+            },
+          },
+          messageId: message.id,
+          threadId: message.threadId,
+          automated: true,
+          status: ExecutedRuleStatus.APPLYING, // Changed from PENDING - rules are now always automated
+          reason,
+          matchMetadata: serializeMatchReasons(matchReasons),
+          rule: rule?.id ? { connect: { id: rule.id } } : undefined,
+          emailAccount: { connect: { id: emailAccount.id } },
+          createdAt: batchTimestamp, // Use batch timestamp for grouping
         },
-      },
-      messageId: message.id,
-      threadId: message.threadId,
-      automated: true,
-      status: ExecutedRuleStatus.APPLYING, // Changed from PENDING - rules are now always automated
-      reason,
-      matchMetadata: serializeMatchReasons(matchReasons),
-      rule: rule?.id ? { connect: { id: rule.id } } : undefined,
-      emailAccount: { connect: { id: emailAccount.id } },
-      createdAt: batchTimestamp, // Use batch timestamp for grouping
-    },
-    include: { actionItems: true },
-  });
+        include: { actionItems: true },
+      }),
+    { logger },
+  );
 
   if (rule.systemType === SystemType.COLD_EMAIL) {
-    await saveColdEmail({
-      email: {
-        id: message.id,
-        threadId: message.threadId,
-        from: message.headers.from,
-      },
-      emailAccount,
-      aiReason: reason ?? null,
+    const from =
+      extractEmailAddress(message.headers.from) || message.headers.from;
+    await saveLearnedPattern({
+      emailAccountId: emailAccount.id,
+      from,
+      ruleId: rule.id,
+      logger,
+      reason,
+      messageId: message.id,
+      threadId: message.threadId,
+      source: GroupItemSource.AI,
     });
   }
 
@@ -382,10 +415,14 @@ async function executeMatchedRule(
       });
     } else if (!delayedActions?.length) {
       // No actions at all (neither immediate nor delayed), mark as applied
-      await prisma.executedRule.update({
-        where: { id: executedRule.id },
-        data: { status: ExecutedRuleStatus.APPLIED },
-      });
+      await withPrismaRetry(
+        () =>
+          prisma.executedRule.update({
+            where: { id: executedRule.id },
+            data: { status: ExecutedRuleStatus.APPLIED },
+          }),
+        { logger },
+      );
     }
   }
 
@@ -406,20 +443,25 @@ async function analyzeSenderPatternIfAiMatch({
   result,
   message,
   emailAccountId,
+  logger,
 }: {
   isTest: boolean;
   result: { rule?: Rule | null; matchReasons?: MatchReason[] };
   message: ParsedMessage;
   emailAccountId: string;
+  logger: Logger;
 }) {
   if (shouldAnalyzeSenderPattern({ isTest, result })) {
     const fromAddress = extractEmailAddress(message.headers.from);
     if (fromAddress) {
       after(() =>
-        analyzeSenderPattern({
-          emailAccountId,
-          from: fromAddress,
-        }),
+        analyzeSenderPattern(
+          {
+            emailAccountId,
+            from: fromAddress,
+          },
+          logger,
+        ),
       );
     }
   }
@@ -565,16 +607,9 @@ function isConversationRule(ruleId: string): boolean {
  * If there are no draft email actions, we return the matches as is.
  * If there is only one draft email action, we return the matches as is.
  */
-export function limitDraftEmailActions(
-  matches: {
-    rule: RuleWithActions;
-    matchReasons?: MatchReason[];
-  }[],
-  logger: Logger,
-): {
-  rule: RuleWithActions;
-  matchReasons?: MatchReason[];
-}[] {
+export function limitDraftEmailActions<
+  T extends { rule: RuleWithActions; matchReasons?: MatchReason[] },
+>(matches: T[], logger: Logger): T[] {
   const draftCandidates = matches.flatMap((match) =>
     match.rule.actions
       .filter((action) => action.type === ActionType.DRAFT_EMAIL)

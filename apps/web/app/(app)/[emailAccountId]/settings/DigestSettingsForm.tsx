@@ -8,6 +8,7 @@ import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { TimePicker } from "@/components/TimePicker";
 import { toastError, toastSuccess } from "@/components/Toast";
+import { getActionErrorMessage } from "@/utils/error";
 import { LoadingContent } from "@/components/LoadingContent";
 import { useRules } from "@/hooks/useRules";
 import { MultiSelectFilter } from "@/components/MultiSelectFilter";
@@ -58,7 +59,7 @@ const daysOfWeek = [
   { value: "6", label: "Saturday" },
 ];
 
-export function DigestSettingsForm() {
+export function DigestSettingsForm({ onSuccess }: { onSuccess?: () => void }) {
   const { emailAccountId } = useAccount();
   const {
     data: rules,
@@ -116,7 +117,7 @@ export function DigestSettingsForm() {
       onError: (error) => {
         toastError({
           title: "Error updating digest items",
-          description: error.error.serverError || "An error occurred",
+          description: getActionErrorMessage(error.error),
         });
       },
     },
@@ -131,7 +132,7 @@ export function DigestSettingsForm() {
       onError: (error) => {
         toastError({
           title: "Error updating digest schedule",
-          description: error.error.serverError || "An error occurred",
+          description: getActionErrorMessage(error.error),
         });
       },
     },
@@ -224,6 +225,7 @@ export function DigestSettingsForm() {
         toastSuccess({
           description: "Your digest settings have been updated!",
         });
+        onSuccess?.();
       } catch {
         toastError({
           title: "Error updating digest settings",
@@ -231,7 +233,7 @@ export function DigestSettingsForm() {
         });
       }
     },
-    [rules, executeItems, executeSchedule],
+    [rules, executeItems, executeSchedule, onSuccess],
   );
 
   // Create options for MultiSelectFilter
