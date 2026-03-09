@@ -4,11 +4,10 @@ CLI tool for running [Inbox Zero](https://www.getinboxzero.com) - an open-source
 
 ## Installation
 
-### Homebrew
+### Homebrew (macOS/Linux)
 
 ```bash
-brew tap inbox-zero/inbox-zero https://github.com/elie222/inbox-zero.git
-brew install inbox-zero
+brew install inbox-zero/inbox-zero/inbox-zero
 ```
 
 ### Manual Installation
@@ -38,6 +37,21 @@ Interactive setup wizard that:
 - Generates all required secrets
 
 Configuration is stored in `~/.inbox-zero/`
+
+### `inbox-zero setup-terraform`
+
+Generates Terraform files for AWS deployment (ECS Fargate, RDS, optional Redis).
+
+```bash
+# Generate Terraform files in ./terraform (interactive)
+inbox-zero setup-terraform
+
+# Non-interactive mode (values read from flags/env vars)
+inbox-zero setup-terraform --yes --region us-east-1
+```
+
+The generated Terraform uses AWS SSM Parameter Store for secrets and outputs the
+service URL after `terraform apply`.
 
 ### `inbox-zero start`
 

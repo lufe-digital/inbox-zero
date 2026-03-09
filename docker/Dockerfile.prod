@@ -1,5 +1,5 @@
 
-FROM node:22-alpine AS builder
+FROM node:24-alpine AS builder
 
 WORKDIR /app
 
@@ -9,7 +9,6 @@ RUN npm install -g pnpm@10.22.0
 # Copy lockfiles/workspace manifests for better caching
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc* ./
 COPY apps/web/package.json apps/web/package.json
-COPY apps/unsubscriber/package.json apps/unsubscriber/package.json
 COPY packages/loops/package.json packages/loops/package.json
 COPY packages/resend/package.json packages/resend/package.json
 COPY packages/tinybird/package.json packages/tinybird/package.json
@@ -18,6 +17,8 @@ COPY packages/tsconfig/package.json packages/tsconfig/package.json
 
 # Copy Prisma schema file needed for postinstall script
 COPY apps/web/prisma/schema.prisma apps/web/prisma/schema.prisma
+# Copy postinstall script
+COPY clone-marketing.sh clone-marketing.sh
 
 # Install deps
 # Use shamefully-hoist to ensure all packages are available at root level for webpack resolution
@@ -56,6 +57,7 @@ ENV EMAIL_ENCRYPT_SECRET="dummy_encrypt_secret_for_build_only"
 ENV EMAIL_ENCRYPT_SALT="dummy_encrypt_salt_for_build_only"
 ENV GOOGLE_PUBSUB_TOPIC_NAME="dummy_topic_for_build_only"
 ENV GOOGLE_PUBSUB_VERIFICATION_TOKEN="dummy_pubsub_token_for_build"
+ENV DEFAULT_LLM_PROVIDER="anthropic"
 ENV INTERNAL_API_KEY="dummy_apikey_for_build_only"
 ENV API_KEY_SALT="dummy_salt_for_build_only"
 ENV UPSTASH_REDIS_URL="http://dummy-redis-for-build:6379"
@@ -72,15 +74,12 @@ RUN npx prisma generate --schema=apps/web/prisma/schema.prisma \
  && cd ../.. \
  && rm -rf apps/web/.next/cache
 
-FROM node:22-alpine AS runner
+FROM node:24-alpine AS runner
 
 WORKDIR /app
 
 # Install openssl for Prisma
 RUN apk add --no-cache openssl
-
-# Install Prisma CLI globally (npm handles all dependencies including @prisma/engines)
-RUN npm install -g prisma@6.16.3
 
 # Copy the standalone server output (contains node_modules subset + server.js)
 COPY --from=builder /app/apps/web/.next/standalone ./
@@ -92,6 +91,11 @@ COPY --from=builder /app/apps/web/prisma ./apps/web/prisma
 # Copy runtime scripts
 COPY docker/scripts /app/docker/scripts
 RUN chmod +x /app/docker/scripts/*.sh
+
+# Install Prisma CLI globally for migrations
+RUN npm install -g prisma@7.3.0
+# Set NODE_PATH so prisma/config imports resolve correctly
+ENV NODE_PATH=/usr/local/lib/node_modules
 
 EXPOSE 3000
 

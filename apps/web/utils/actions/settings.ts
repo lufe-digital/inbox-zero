@@ -8,7 +8,7 @@ import {
   updateDigestItemsBody,
   toggleDigestBody,
 } from "@/utils/actions/settings.validation";
-import { DEFAULT_PROVIDER } from "@/utils/llms/config";
+import { DEFAULT_PROVIDER, Provider } from "@/utils/llms/config";
 import prisma from "@/utils/prisma";
 import {
   calculateNextScheduleDate,
@@ -18,6 +18,7 @@ import { actionClientUser } from "@/utils/actions/safe-action";
 import { ActionType, SystemType } from "@/generated/prisma/enums";
 import type { Prisma } from "@/generated/prisma/client";
 import { clearSpecificErrorMessages, ErrorType } from "@/utils/error-messages";
+import { env } from "@/env";
 
 export const updateEmailSettingsAction = actionClient
   .metadata({ name: "updateEmailSettings" })
@@ -45,6 +46,12 @@ export const updateAiSettingsAction = actionClientUser
       ctx: { userId, logger },
       parsedInput: { aiProvider, aiModel, aiApiKey },
     }) => {
+      if (aiProvider === Provider.AZURE && !env.AZURE_RESOURCE_NAME) {
+        throw new Error(
+          "Azure provider requires AZURE_RESOURCE_NAME to be configured on the server",
+        );
+      }
+
       await prisma.user.update({
         where: { id: userId },
         data:
@@ -63,6 +70,7 @@ export const updateAiSettingsAction = actionClientUser
           ErrorType.OPENAI_API_KEY_DEACTIVATED,
           ErrorType.AI_QUOTA_ERROR,
           ErrorType.ANTHROPIC_INSUFFICIENT_BALANCE,
+          ErrorType.INSUFFICIENT_CREDITS,
         ],
         logger,
       });
@@ -155,47 +163,52 @@ export const updateDigestItemsAction = actionClient
 export const toggleDigestAction = actionClient
   .metadata({ name: "toggleDigest" })
   .inputSchema(toggleDigestBody)
-  .action(async ({ ctx: { emailAccountId }, parsedInput: { enabled } }) => {
-    if (enabled) {
-      const defaultSchedule = {
-        intervalDays: 1,
-        occurrences: 1,
-        daysOfWeek: 127,
-        timeOfDay: createCanonicalTimeOfDay(9, 0),
-      };
+  .action(
+    async ({
+      ctx: { emailAccountId },
+      parsedInput: { enabled, timeOfDay },
+    }) => {
+      if (enabled) {
+        const defaultSchedule = {
+          intervalDays: 1,
+          occurrences: 1,
+          daysOfWeek: 127,
+          timeOfDay: timeOfDay ?? createCanonicalTimeOfDay(9, 0),
+        };
 
-      await prisma.schedule.upsert({
-        where: { emailAccountId },
-        create: {
-          emailAccountId,
-          ...defaultSchedule,
-          lastOccurrenceAt: new Date(),
-          nextOccurrenceAt: calculateNextScheduleDate({
+        await prisma.schedule.upsert({
+          where: { emailAccountId },
+          create: {
+            emailAccountId,
             ...defaultSchedule,
-            lastOccurrenceAt: null,
-          }),
-        },
-        update: {},
-      });
+            lastOccurrenceAt: new Date(),
+            nextOccurrenceAt: calculateNextScheduleDate({
+              ...defaultSchedule,
+              lastOccurrenceAt: null,
+            }),
+          },
+          update: {},
+        });
 
-      const newsletterRule = await prisma.rule.findFirst({
-        where: { emailAccountId, systemType: SystemType.NEWSLETTER },
-        include: { actions: true },
-      });
+        const newsletterRule = await prisma.rule.findFirst({
+          where: { emailAccountId, systemType: SystemType.NEWSLETTER },
+          include: { actions: true },
+        });
 
-      if (
-        newsletterRule &&
-        !newsletterRule.actions.some((a) => a.type === ActionType.DIGEST)
-      ) {
-        await prisma.action.create({
-          data: { ruleId: newsletterRule.id, type: ActionType.DIGEST },
+        if (
+          newsletterRule &&
+          !newsletterRule.actions.some((a) => a.type === ActionType.DIGEST)
+        ) {
+          await prisma.action.create({
+            data: { ruleId: newsletterRule.id, type: ActionType.DIGEST },
+          });
+        }
+      } else {
+        await prisma.schedule.deleteMany({
+          where: { emailAccountId },
         });
       }
-    } else {
-      await prisma.schedule.deleteMany({
-        where: { emailAccountId },
-      });
-    }
 
-    return { success: true };
-  });
+      return { success: true };
+    },
+  );

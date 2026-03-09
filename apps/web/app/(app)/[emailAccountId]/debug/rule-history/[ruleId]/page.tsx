@@ -1,5 +1,5 @@
 import prisma from "@/utils/prisma";
-import { PageHeading } from "@/components/Typography";
+import { MutedText, PageHeading } from "@/components/Typography";
 import {
   Card,
   CardContent,
@@ -80,11 +80,11 @@ export default async function RuleHistoryPage(props: {
                       {triggerTypeLabels[history.triggerType] ||
                         history.triggerType}
                     </Badge>
-                    <span className="text-sm text-muted-foreground">
+                    <MutedText>
                       {formatDistanceToNow(history.createdAt, {
                         addSuffix: true,
                       })}
-                    </span>
+                    </MutedText>
                   </div>
                 </div>
                 {history.promptText && (
@@ -171,34 +171,36 @@ export default async function RuleHistoryPage(props: {
                     <div>
                       <h4 className="mb-1 font-semibold">Actions</h4>
                       <div className="space-y-1">
-                        {(history.actions as any[]).map(
-                          (action: any, index: number) => (
-                            <div key={index} className="text-sm">
-                              <Badge variant="secondary" className="mr-2">
-                                {action.type}
-                              </Badge>
-                              {action.label && (
-                                <span>
-                                  {
-                                    getEmailTerminology(
-                                      rule.emailAccount.account.provider,
-                                    ).label.action
-                                  }
-                                  : {action.label}
-                                </span>
-                              )}
-                              {action.subject && (
-                                <span>Subject: {action.subject}</span>
-                              )}
-                              {action.content && (
-                                <span>
-                                  Content: {action.content.substring(0, 50)}...
-                                </span>
-                              )}
-                              {action.to && <span>To: {action.to}</span>}
-                            </div>
-                          ),
-                        )}
+                        {(
+                          history.actions as Array<
+                            Record<string, string | undefined>
+                          >
+                        ).map((action, index) => (
+                          <div key={index} className="text-sm">
+                            <Badge variant="secondary" className="mr-2">
+                              {action.type}
+                            </Badge>
+                            {action.label && (
+                              <span>
+                                {
+                                  getEmailTerminology(
+                                    rule.emailAccount.account.provider,
+                                  ).label.action
+                                }
+                                : {action.label}
+                              </span>
+                            )}
+                            {action.subject && (
+                              <span>Subject: {action.subject}</span>
+                            )}
+                            {action.content && (
+                              <span>
+                                Content: {action.content.substring(0, 50)}...
+                              </span>
+                            )}
+                            {action.to && <span>To: {action.to}</span>}
+                          </div>
+                        ))}
                       </div>
                     </div>
                   )}

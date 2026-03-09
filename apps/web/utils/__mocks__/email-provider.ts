@@ -49,6 +49,7 @@ export const createMockEmailProvider = (
   getMessageByRfc822MessageId: vi.fn().mockResolvedValue(null),
   getFolders: vi.fn().mockResolvedValue([]),
   getSignatures: vi.fn().mockResolvedValue([]),
+  getInboxStats: vi.fn().mockResolvedValue({ total: 0, unread: 0 }),
   getMessage: vi.fn().mockResolvedValue({
     id: "msg1",
     threadId: "thread1",
@@ -94,6 +95,11 @@ export const createMockEmailProvider = (
   markReadThread: vi.fn().mockResolvedValue(undefined),
   getDraft: vi.fn().mockResolvedValue(null),
   deleteDraft: vi.fn().mockResolvedValue(undefined),
+  sendDraft: vi
+    .fn()
+    .mockResolvedValue({ messageId: "sent-msg1", threadId: "thread1" }),
+  createDraft: vi.fn().mockResolvedValue({ id: "draft-new" }),
+  updateDraft: vi.fn().mockResolvedValue(undefined),
   createLabel: vi
     .fn()
     .mockResolvedValue({ id: "label1", name: "Test Label", type: "user" }),
@@ -109,10 +115,19 @@ export const createMockEmailProvider = (
   getMessagesWithPagination: vi
     .fn()
     .mockResolvedValue({ messages: [], nextPageToken: undefined }),
+  searchMessages: vi
+    .fn()
+    .mockResolvedValue({ messages: [], nextPageToken: undefined }),
   getMessagesFromSender: vi
     .fn()
     .mockResolvedValue({ messages: [], nextPageToken: undefined }),
+  getMessagesWithAttachments: vi
+    .fn()
+    .mockResolvedValue({ messages: [], nextPageToken: undefined }),
   getThreadsWithParticipant: vi.fn().mockResolvedValue([]),
+  getThreadsWithLabel: vi.fn().mockResolvedValue([]),
+  getLatestMessageFromThreadSnapshot: vi.fn().mockResolvedValue(null),
+  getLatestMessageInThread: vi.fn().mockResolvedValue(null),
   getMessagesBatch: vi.fn().mockResolvedValue([]),
   getAccessToken: vi.fn().mockReturnValue("mock-token"),
   checkIfReplySent: vi.fn().mockResolvedValue(false),

@@ -3,28 +3,684 @@ import { useQueryState } from "nuqs";
 import type {
   UpdateAboutTool,
   UpdateRuleConditionsTool,
+  UpdateRuleConditionsOutput,
   UpdateRuleActionsTool,
+  UpdateRuleActionsOutput,
   UpdateLearnedPatternsTool,
   AddToKnowledgeBaseTool,
   CreateRuleTool,
+  ManageInboxTool,
 } from "@/utils/ai/assistant/chat";
-import { Card } from "@/components/ui/card";
+import { isDefined } from "@/utils/types";
+import {
+  Card,
+  CardContent,
+  CardFooter,
+  CardHeader,
+} from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { EyeIcon, SparklesIcon, TrashIcon, FileDiffIcon } from "lucide-react";
+import { Textarea } from "@/components/ui/textarea";
+import { Avatar, AvatarFallbackColor } from "@/components/ui/avatar";
+import {
+  ChevronRightIcon,
+  EyeIcon,
+  SparklesIcon,
+  TrashIcon,
+  FileDiffIcon,
+  ExternalLinkIcon,
+  Loader2,
+  PencilIcon,
+  CopyIcon,
+  CheckIcon,
+  SendIcon,
+} from "lucide-react";
 import { toastError, toastSuccess } from "@/components/Toast";
 import { Tooltip } from "@/components/Tooltip";
+import { confirmAssistantEmailAction } from "@/utils/actions/assistant-chat";
 import { deleteRuleAction } from "@/utils/actions/rule";
 import { useAccount } from "@/providers/EmailAccountProvider";
+import { useChat } from "@/providers/ChatProvider";
 import { ExpandableText } from "@/components/ExpandableText";
 import { RuleDialog } from "@/app/(app)/[emailAccountId]/assistant/RuleDialog";
 import { useDialogState } from "@/hooks/useDialogState";
 import { getEmailTerminology } from "@/utils/terminology";
+import { formatShortDate } from "@/utils/date";
+import { trimToNonEmptyString } from "@/utils/string";
+import { getEmailSearchUrl, getEmailUrlForMessage } from "@/utils/url";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
+
+export type ThreadLookup =
+  import("@/components/assistant-chat/email-lookup-context").EmailLookup;
+
+function getOutputField<T>(output: unknown, field: string): T | undefined {
+  if (typeof output === "object" && output !== null && field in output) {
+    return (output as Record<string, unknown>)[field] as T;
+  }
+  return undefined;
+}
 
 export function BasicToolInfo({ text }: { text: string }) {
   return (
     <ToolCard>
       <div className="text-sm">{text}</div>
     </ToolCard>
+  );
+}
+
+function CollapsibleToolCard({
+  summary,
+  children,
+  initialOpen = false,
+}: {
+  summary: string;
+  children: React.ReactNode;
+  initialOpen?: boolean;
+}) {
+  const [open, setOpen] = useState(initialOpen);
+
+  return (
+    <Card className="p-4">
+      <Collapsible open={open} onOpenChange={setOpen}>
+        <CollapsibleTrigger className="flex w-full items-center gap-2 text-left text-sm">
+          <ChevronRightIcon
+            className={`size-4 shrink-0 text-muted-foreground transition-transform duration-200 ${open ? "rotate-90" : ""}`}
+          />
+          {summary}
+        </CollapsibleTrigger>
+        <CollapsibleContent className="mt-3 space-y-2">
+          {children}
+        </CollapsibleContent>
+      </Collapsible>
+    </Card>
+  );
+}
+
+export function SearchInboxResult({ output }: { output: unknown }) {
+  const totalReturned = getOutputField<number>(output, "totalReturned") || 0;
+  const queryUsed = getOutputField<string | null>(output, "queryUsed");
+  const summary = getOutputField<{
+    total: number;
+    unread: number;
+    byCategory: Record<string, number>;
+  }>(output, "summary");
+  const messages = getOutputField<
+    Array<{
+      messageId: string;
+      subject: string;
+      from: string;
+      snippet: string;
+      date: string;
+      isUnread: boolean;
+    }>
+  >(output, "messages");
+
+  return (
+    <CollapsibleToolCard summary={`Searched inbox (${totalReturned} messages)`}>
+      {queryUsed && (
+        <div className="text-xs text-muted-foreground">
+          Query: <span className="font-mono">{queryUsed}</span>
+        </div>
+      )}
+
+      {summary && summary.unread > 0 && (
+        <div className="text-xs text-muted-foreground">
+          {summary.unread} unread
+        </div>
+      )}
+
+      {messages && messages.length > 0 && (
+        <div className="max-h-96 space-y-1 overflow-y-auto">
+          {messages.map((msg) => (
+            <div
+              key={msg.messageId}
+              className="rounded-md bg-muted px-3 py-2 text-sm"
+            >
+              <div className="flex items-baseline justify-between gap-2">
+                <span
+                  className={`truncate ${msg.isUnread ? "font-semibold" : ""}`}
+                >
+                  {msg.from}
+                </span>
+                <span className="shrink-0 text-xs text-muted-foreground">
+                  {formatShortDate(new Date(msg.date), { lowercase: true })}
+                </span>
+              </div>
+              <div className="truncate text-muted-foreground">
+                {msg.subject}
+              </div>
+              {msg.snippet && (
+                <div className="mt-0.5 truncate text-xs text-muted-foreground/70">
+                  {msg.snippet}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </CollapsibleToolCard>
+  );
+}
+
+export function ManageInboxResult({
+  input,
+  output,
+  threadIds,
+  threadLookup,
+  isInProgress = false,
+}: {
+  input?: ManageInboxTool["input"];
+  output: unknown;
+  threadIds?: string[];
+  threadLookup: ThreadLookup;
+  isInProgress?: boolean;
+}) {
+  const { provider, userEmail } = useAccount();
+  const outputAction = getOutputField<string>(output, "action");
+  const action = parseManageInboxAction(input?.action || outputAction);
+  const successCount = getOutputField<number>(output, "successCount");
+  const requestedCount = getOutputField<number>(output, "requestedCount");
+  const sendersCount = getOutputField<number>(output, "sendersCount");
+  const failedCount = getOutputField<number>(output, "failedCount");
+  const senders = getOutputField<string[]>(output, "senders");
+  const read =
+    input?.action === "mark_read_threads"
+      ? input.read !== false
+      : getOutputField<boolean>(output, "read");
+  const labelApplied =
+    input?.action === "archive_threads"
+      ? Boolean(input.labelId)
+      : Boolean(getOutputField<string>(output, "labelId"));
+  const actionLabel = getManageInboxActionLabel({
+    action,
+    read,
+    labelApplied,
+    inProgress: isInProgress,
+  });
+  const isSenderAction =
+    action === "bulk_archive_senders" || action === "unsubscribe_senders";
+  const completedCount = isSenderAction
+    ? (sendersCount ?? senders?.length)
+    : (successCount ?? requestedCount);
+  const countLabel = isSenderAction ? "sender" : "item";
+
+  const summaryText =
+    typeof completedCount === "number"
+      ? `${actionLabel} (${completedCount} ${countLabel}${completedCount === 1 ? "" : "s"})`
+      : actionLabel;
+
+  const resolvedThreads = threadIds
+    ?.map((id) => threadLookup.get(id))
+    .filter(isDefined);
+
+  return (
+    <CollapsibleToolCard summary={summaryText} initialOpen={isInProgress}>
+      <div className="space-y-1 text-sm">
+        {isInProgress && (
+          <div className="text-xs text-muted-foreground">
+            Processing senders now...
+          </div>
+        )}
+
+        {typeof failedCount === "number" && failedCount > 0 && (
+          <div className="text-xs text-red-500">Failed: {failedCount}</div>
+        )}
+
+        {resolvedThreads && resolvedThreads.length > 0 && (
+          <div className="space-y-1">
+            {resolvedThreads.map((thread, i) => (
+              <div key={i} className="rounded-md bg-muted px-3 py-2 text-sm">
+                <div className="truncate">{thread.from}</div>
+                <div className="truncate text-muted-foreground">
+                  {thread.subject}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {senders && senders.length > 0 && (
+          <div className="space-y-1">
+            {senders.map((sender) => (
+              <div
+                key={sender}
+                className="flex items-center justify-between gap-2 rounded-md bg-muted px-3 py-1.5 text-xs"
+              >
+                <span className="truncate">{sender}</span>
+                <a
+                  href={getEmailSearchUrl(sender, userEmail, provider)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="shrink-0 text-muted-foreground hover:text-foreground"
+                  aria-label={`View ${sender} in ${
+                    provider === "microsoft" ? "Outlook" : "Gmail"
+                  }`}
+                >
+                  <ExternalLinkIcon className="size-3.5" />
+                </a>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </CollapsibleToolCard>
+  );
+}
+
+type PendingEmailActionType = "send_email" | "reply_email" | "forward_email";
+
+type EmailConfirmationResult = {
+  actionType: PendingEmailActionType;
+  messageId?: string | null;
+  threadId?: string | null;
+  to?: string | null;
+  subject?: string | null;
+  confirmedAt: string;
+};
+
+export function ReadEmailResult({ output }: { output: unknown }) {
+  const { provider, userEmail } = useAccount();
+  const subject = getOutputField<string>(output, "subject");
+  const from = getOutputField<string>(output, "from");
+  const to = getOutputField<string>(output, "to");
+  const date = getOutputField<string>(output, "date");
+  const content = getOutputField<string>(output, "content");
+  const messageId = getOutputField<string>(output, "messageId");
+  const threadId = getOutputField<string>(output, "threadId");
+  const attachments = getOutputField<Array<unknown>>(output, "attachments");
+  const externalUrl = getExternalMessageUrl({
+    messageId,
+    threadId,
+    userEmail,
+    provider,
+  });
+
+  return (
+    <CollapsibleToolCard
+      summary={`Read email${subject ? `: ${subject}` : ""}`}
+      initialOpen={false}
+    >
+      <div className="space-y-2 text-sm">
+        {from && <ToolDetailRow label="From" value={from} />}
+        {to && <ToolDetailRow label="To" value={to} />}
+        {date && (
+          <ToolDetailRow
+            label="Date"
+            value={formatShortDate(new Date(date), { lowercase: true })}
+          />
+        )}
+        {Array.isArray(attachments) && attachments.length > 0 && (
+          <ToolDetailRow
+            label="Attachments"
+            value={`${attachments.length} file${attachments.length === 1 ? "" : "s"}`}
+          />
+        )}
+        {content && (
+          <div className="space-y-1">
+            <div className="text-xs font-medium text-muted-foreground">
+              Content
+            </div>
+            <div className="rounded-md bg-muted p-2 text-xs">
+              <ExpandableText text={content} />
+            </div>
+          </div>
+        )}
+        {externalUrl && (
+          <ToolExternalLink href={externalUrl}>
+            Open in {provider === "microsoft" ? "Outlook" : "Gmail"}
+          </ToolExternalLink>
+        )}
+      </div>
+    </CollapsibleToolCard>
+  );
+}
+
+export function SendEmailResult({
+  output,
+  chatMessageId,
+  toolCallId,
+  disableConfirm,
+}: {
+  output: unknown;
+  chatMessageId: string;
+  toolCallId: string;
+  disableConfirm: boolean;
+}) {
+  return (
+    <EmailActionResult
+      actionType="send_email"
+      output={output}
+      chatMessageId={chatMessageId}
+      toolCallId={toolCallId}
+      disableConfirm={disableConfirm}
+    />
+  );
+}
+
+export function ReplyEmailResult({
+  output,
+  chatMessageId,
+  toolCallId,
+  disableConfirm,
+}: {
+  output: unknown;
+  chatMessageId: string;
+  toolCallId: string;
+  disableConfirm: boolean;
+}) {
+  return (
+    <EmailActionResult
+      actionType="reply_email"
+      output={output}
+      chatMessageId={chatMessageId}
+      toolCallId={toolCallId}
+      disableConfirm={disableConfirm}
+    />
+  );
+}
+
+export function ForwardEmailResult({
+  output,
+  chatMessageId,
+  toolCallId,
+  disableConfirm,
+}: {
+  output: unknown;
+  chatMessageId: string;
+  toolCallId: string;
+  disableConfirm: boolean;
+}) {
+  return (
+    <EmailActionResult
+      actionType="forward_email"
+      output={output}
+      chatMessageId={chatMessageId}
+      toolCallId={toolCallId}
+      disableConfirm={disableConfirm}
+    />
+  );
+}
+
+function EmailActionResult({
+  actionType,
+  output,
+  chatMessageId,
+  toolCallId,
+  disableConfirm,
+}: {
+  actionType: PendingEmailActionType;
+  output: unknown;
+  chatMessageId: string;
+  toolCallId: string;
+  disableConfirm: boolean;
+}) {
+  const { emailAccountId, provider, userEmail } = useAccount();
+  const { chatId } = useChat();
+  const [isConfirming, setIsConfirming] = useState(false);
+  const [confirmationResultOverride, setConfirmationResultOverride] =
+    useState<EmailConfirmationResult | null>(null);
+  const [isEditing, setIsEditing] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  const pendingAction = getOutputField<Record<string, unknown>>(
+    output,
+    "pendingAction",
+  );
+  const reference = getOutputField<Record<string, unknown>>(
+    output,
+    "reference",
+  );
+  const requiresConfirmation =
+    getOutputField<boolean>(output, "requiresConfirmation") === true;
+  const confirmationState =
+    getOutputField<string>(output, "confirmationState") || "pending";
+  const parsedConfirmationResult = parseConfirmationResult(
+    getOutputField<unknown>(output, "confirmationResult"),
+  );
+  const confirmationResult =
+    confirmationResultOverride || parsedConfirmationResult;
+  const isProcessing = confirmationState === "processing";
+  const isChatBusy = disableConfirm;
+  const isConfirmed =
+    confirmationState === "confirmed" ||
+    Boolean(confirmationResult) ||
+    (!requiresConfirmation &&
+      getOutputField<boolean>(output, "success") === true);
+
+  const to = getPendingOrOutputString({
+    pendingAction,
+    output,
+    key: "to",
+  });
+  const cc = getPendingString(pendingAction, "cc");
+  const bcc = getPendingString(pendingAction, "bcc");
+  const subject = getPendingOrOutputString({
+    pendingAction,
+    output,
+    key: "subject",
+  });
+  const referenceSubject = getPendingString(reference, "subject");
+  const displaySubject = subject || referenceSubject;
+  const body = getActionBodyText({ actionType, pendingAction });
+  const [editedBody, setEditedBody] = useState(body || "");
+
+  const messageId =
+    confirmationResult?.messageId ||
+    getOutputField<string>(output, "messageId") ||
+    getPendingString(reference, "messageId");
+  const threadId =
+    confirmationResult?.threadId ||
+    getOutputField<string>(output, "threadId") ||
+    getPendingString(reference, "threadId");
+  const externalUrl = getExternalMessageUrl({
+    messageId,
+    threadId,
+    userEmail,
+    provider,
+  });
+
+  const actionLabel = getEmailActionLabel(actionType);
+  const recipientInitial = to ? to.charAt(0).toUpperCase() : "?";
+  const providerName = provider === "microsoft" ? "Outlook" : "Gmail";
+
+  const handleCopy = () => {
+    navigator.clipboard.writeText(editedBody || body || "").catch(() => {});
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handleSend = async () => {
+    setIsConfirming(true);
+    try {
+      if (!chatId) {
+        toastError({ description: "Could not confirm this email action." });
+        return;
+      }
+
+      const hasEdits = editedBody && editedBody !== body;
+      const result = await confirmAssistantEmailAction(emailAccountId, {
+        chatId,
+        chatMessageId,
+        toolCallId,
+        actionType,
+        ...(hasEdits ? { contentOverride: editedBody } : {}),
+      });
+
+      if (result?.serverError) {
+        toastError({ description: result.serverError });
+        return;
+      }
+
+      const parsed = parseConfirmationResult(result?.data?.confirmationResult);
+      if (!parsed) {
+        toastError({ description: "Could not confirm this email action." });
+        return;
+      }
+
+      setConfirmationResultOverride(parsed);
+      toastSuccess({
+        description: getAssistantEmailSuccessMessage(actionType),
+      });
+    } catch {
+      toastError({ description: "Could not confirm this email action." });
+    } finally {
+      setIsConfirming(false);
+    }
+  };
+
+  const sentLabel = isConfirmed
+    ? getEmailActionSentLabel(actionType)
+    : actionLabel;
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center gap-3 space-y-0 border-b px-4 py-3.5">
+        <Avatar className="size-8">
+          <AvatarFallbackColor content={recipientInitial} className="text-xs" />
+        </Avatar>
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-semibold leading-tight">
+            {sentLabel ? `${sentLabel} ` : ""}
+            {to}
+          </div>
+          {cc && (
+            <div className="mt-0.5 text-xs text-muted-foreground">CC: {cc}</div>
+          )}
+          {bcc && (
+            <div className="mt-0.5 text-xs text-muted-foreground">
+              BCC: {bcc}
+            </div>
+          )}
+        </div>
+        {isConfirmed && (
+          <div className="flex items-center gap-1 text-xs font-medium text-green-600">
+            <CheckIcon className="size-3.5" />
+            Sent
+          </div>
+        )}
+      </CardHeader>
+
+      <CardContent className="p-0">
+        {displaySubject && (
+          <div className="flex items-center gap-2 border-b px-4 py-2.5">
+            <span className="shrink-0 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+              Subject
+            </span>
+            <span className="truncate text-sm font-medium text-foreground">
+              {actionType !== "send_email" ? "Re: " : ""}
+              {displaySubject}
+            </span>
+          </div>
+        )}
+
+        <div className="px-4 py-3.5">
+          {isEditing ? (
+            <div className="space-y-2">
+              <Textarea
+                value={editedBody}
+                onChange={(e) => setEditedBody(e.target.value)}
+                className="min-h-[140px] resize-y text-sm leading-relaxed"
+              />
+              <div className="flex justify-end gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    setEditedBody(body || "");
+                    setIsEditing(false);
+                  }}
+                >
+                  Cancel
+                </Button>
+                <Button size="sm" onClick={() => setIsEditing(false)}>
+                  Save changes
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <div className="whitespace-pre-line text-sm leading-relaxed text-foreground">
+              {editedBody || body}
+            </div>
+          )}
+        </div>
+      </CardContent>
+
+      {!isEditing && (
+        <CardFooter className="flex items-center justify-between border-t px-4 py-3">
+          <div className="flex items-center gap-1">
+            {!isConfirmed && requiresConfirmation && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-8 gap-1.5 text-xs text-muted-foreground"
+                onClick={() => setIsEditing(true)}
+              >
+                <PencilIcon className="size-3.5" />
+                <span className="hidden sm:inline">Edit</span>
+              </Button>
+            )}
+            <Button
+              variant="ghost"
+              size="sm"
+              className={`h-8 gap-1.5 text-xs ${
+                copied ? "text-green-600" : "text-muted-foreground"
+              }`}
+              onClick={handleCopy}
+            >
+              {copied ? (
+                <CheckIcon className="size-3.5" />
+              ) : (
+                <CopyIcon className="size-3.5" />
+              )}
+              <span className="hidden sm:inline">
+                {copied ? "Copied" : "Copy"}
+              </span>
+            </Button>
+            {externalUrl && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-8 gap-1.5 text-xs text-muted-foreground"
+                asChild
+              >
+                <a href={externalUrl} target="_blank" rel="noopener noreferrer">
+                  <ExternalLinkIcon className="size-3.5" />
+                  <span className="hidden sm:inline">
+                    Open in {providerName}
+                  </span>
+                </a>
+              </Button>
+            )}
+          </div>
+
+          {!isConfirmed && requiresConfirmation && (
+            <Button
+              onClick={handleSend}
+              disabled={isConfirming || isProcessing || isChatBusy}
+              size="sm"
+              className="gap-2"
+            >
+              {isProcessing ? (
+                "Sending..."
+              ) : isConfirming ? (
+                <>
+                  <Loader2 className="size-4 animate-spin" />
+                  Sending...
+                </>
+              ) : (
+                <>
+                  <SendIcon className="hidden size-3.5 sm:inline" />
+                  Send
+                </>
+              )}
+            </Button>
+          )}
+        </CardFooter>
+      )}
+    </Card>
   );
 }
 
@@ -108,8 +764,8 @@ export function UpdatedRuleConditions({
 }: {
   args: UpdateRuleConditionsTool["input"];
   ruleId: string;
-  originalConditions?: UpdateRuleConditionsTool["output"]["originalConditions"];
-  updatedConditions?: UpdateRuleConditionsTool["output"]["updatedConditions"];
+  originalConditions?: UpdateRuleConditionsOutput["originalConditions"];
+  updatedConditions?: UpdateRuleConditionsOutput["updatedConditions"];
 }) {
   const [showChanges, setShowChanges] = useState(false);
 
@@ -197,8 +853,8 @@ export function UpdatedRuleActions({
 }: {
   args: UpdateRuleActionsTool["input"];
   ruleId: string;
-  originalActions?: UpdateRuleActionsTool["output"]["originalActions"];
-  updatedActions?: UpdateRuleActionsTool["output"]["updatedActions"];
+  originalActions?: UpdateRuleActionsOutput["originalActions"];
+  updatedActions?: UpdateRuleActionsOutput["updatedActions"];
 }) {
   const { provider } = useAccount();
   const [showChanges, setShowChanges] = useState(false);
@@ -426,7 +1082,7 @@ function RuleActions({ ruleId }: { ruleId: string }) {
 }
 
 function ToolCard({ children }: { children: React.ReactNode }) {
-  return <Card className="mb-4 space-y-3 p-4">{children}</Card>;
+  return <Card className="space-y-3 p-4">{children}</Card>;
 }
 
 function ToolCardHeader({
@@ -542,4 +1198,252 @@ function renderActionFields(fields: {
       </ul>
     </div>
   );
+}
+
+type ManageInboxAction =
+  | "archive_threads"
+  | "mark_read_threads"
+  | "bulk_archive_senders"
+  | "unsubscribe_senders";
+
+function parseManageInboxAction(
+  action: string | undefined,
+): ManageInboxAction | undefined {
+  if (
+    action === "archive_threads" ||
+    action === "mark_read_threads" ||
+    action === "bulk_archive_senders" ||
+    action === "unsubscribe_senders"
+  ) {
+    return action;
+  }
+
+  return undefined;
+}
+
+function getManageInboxActionLabel({
+  action,
+  read,
+  labelApplied,
+  inProgress,
+}: {
+  action: ManageInboxAction | undefined;
+  read?: boolean;
+  labelApplied: boolean;
+  inProgress?: boolean;
+}) {
+  if (action === "bulk_archive_senders") {
+    return inProgress ? "Bulk archiving senders" : "Bulk archived senders";
+  }
+  if (action === "unsubscribe_senders") {
+    return inProgress ? "Unsubscribing senders" : "Unsubscribed senders";
+  }
+  if (action === "archive_threads") {
+    if (inProgress) {
+      return labelApplied
+        ? "Archiving and labeling emails"
+        : "Archiving emails";
+    }
+    return labelApplied ? "Archived and labeled emails" : "Archived emails";
+  }
+  if (action === "mark_read_threads") {
+    if (inProgress) {
+      return read === false
+        ? "Marking emails as unread"
+        : "Marking emails as read";
+    }
+    return read === false ? "Marked emails as unread" : "Marked emails as read";
+  }
+  return "Updated emails";
+}
+
+function ToolDetailRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="text-xs text-muted-foreground">
+      <span className="font-medium">{label}:</span> {value}
+    </div>
+  );
+}
+
+function ToolExternalLink({
+  href,
+  children,
+}: {
+  href: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="inline-flex w-fit items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+    >
+      {children}
+      <ExternalLinkIcon className="size-3.5" />
+    </a>
+  );
+}
+
+function parseConfirmationResult(
+  value: unknown,
+): EmailConfirmationResult | null {
+  if (!isRecord(value)) return null;
+
+  const actionType = asPendingEmailActionType(value.actionType);
+  const confirmedAt = asString(value.confirmedAt);
+  if (!actionType || !confirmedAt) return null;
+
+  return {
+    actionType,
+    confirmedAt,
+    messageId: asString(value.messageId) || null,
+    threadId: asString(value.threadId) || null,
+    to: asString(value.to) || null,
+    subject: asString(value.subject) || null,
+  };
+}
+
+function getPendingString(
+  source: Record<string, unknown> | undefined,
+  key: string,
+) {
+  if (!source) return undefined;
+  return trimToNonEmptyString(source[key]);
+}
+
+function getPendingOrOutputString({
+  pendingAction,
+  output,
+  key,
+}: {
+  pendingAction?: Record<string, unknown>;
+  output: unknown;
+  key: string;
+}) {
+  return (
+    getPendingString(pendingAction, key) || getOutputField<string>(output, key)
+  );
+}
+
+function getActionBodyText({
+  actionType,
+  pendingAction,
+}: {
+  actionType: PendingEmailActionType;
+  pendingAction?: Record<string, unknown>;
+}) {
+  if (!pendingAction) return undefined;
+
+  if (actionType === "send_email") {
+    const messageHtml = getPendingString(pendingAction, "messageHtml");
+    if (!messageHtml) return undefined;
+    return htmlToText(messageHtml);
+  }
+
+  return getPendingString(pendingAction, "content");
+}
+
+function getEmailActionSummary({
+  actionType,
+  isConfirmed,
+  isProcessing,
+  to,
+}: {
+  actionType: PendingEmailActionType;
+  isConfirmed: boolean;
+  isProcessing: boolean;
+  to?: string | null;
+}) {
+  if (isProcessing) {
+    if (actionType === "send_email") return "Sending email...";
+    if (actionType === "reply_email") return "Sending reply...";
+    return "Forwarding email...";
+  }
+
+  if (!isConfirmed) {
+    if (actionType === "send_email") return "Email ready to send";
+    if (actionType === "reply_email") return "Reply ready to send";
+    return "Forward ready to send";
+  }
+
+  if (actionType === "send_email") return `Sent email${to ? ` to ${to}` : ""}`;
+  if (actionType === "reply_email") return "Sent reply";
+  return `Forwarded email${to ? ` to ${to}` : ""}`;
+}
+
+function getEmailActionLabel(actionType: PendingEmailActionType) {
+  if (actionType === "reply_email") return "Reply to";
+  if (actionType === "forward_email") return "Forward to";
+  return "";
+}
+
+function getEmailActionSentLabel(actionType: PendingEmailActionType) {
+  if (actionType === "send_email") return "Sent email to";
+  if (actionType === "reply_email") return "Replied to";
+  return "Forwarded to";
+}
+
+function getAssistantEmailSuccessMessage(actionType: PendingEmailActionType) {
+  if (actionType === "send_email") return "Email sent.";
+  if (actionType === "reply_email") return "Reply sent.";
+  return "Email forwarded.";
+}
+
+function getExternalMessageUrl({
+  messageId,
+  threadId,
+  userEmail,
+  provider,
+}: {
+  messageId?: string;
+  threadId?: string;
+  userEmail?: string | null;
+  provider?: string;
+}) {
+  const resolvedMessageId = messageId || threadId;
+  const resolvedThreadId = threadId || messageId;
+  if (!resolvedMessageId || !resolvedThreadId) return null;
+
+  return getEmailUrlForMessage(
+    resolvedMessageId,
+    resolvedThreadId,
+    userEmail,
+    provider,
+  );
+}
+
+function htmlToText(html: string) {
+  return html
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/[<>]/g, "")
+    .replace(/ {2,}/g, " ")
+    .replace(/\s+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function asPendingEmailActionType(
+  value: unknown,
+): PendingEmailActionType | null {
+  if (
+    value === "send_email" ||
+    value === "reply_email" ||
+    value === "forward_email"
+  ) {
+    return value;
+  }
+  return null;
+}
+
+function asString(value: unknown): string | null {
+  return trimToNonEmptyString(value) ?? null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }

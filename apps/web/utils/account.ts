@@ -13,9 +13,10 @@ import { redirect } from "next/navigation";
 import prisma from "@/utils/prisma";
 import {
   LAST_EMAIL_ACCOUNT_COOKIE,
-  type LastEmailAccountCookieValue,
+  parseLastEmailAccountCookieValue,
 } from "@/utils/cookies";
 import type { Logger } from "@/utils/logger";
+import { buildRedirectUrl } from "@/utils/redirect";
 
 export async function getGmailClientForEmail({
   emailAccountId,
@@ -133,7 +134,10 @@ async function getTokens({ emailAccountId }: { emailAccountId: string }) {
   };
 }
 
-export async function redirectToEmailAccountPath(path: `/${string}`) {
+export async function redirectToEmailAccountPath(
+  path: `/${string}`,
+  searchParams?: Record<string, string | string[] | undefined>,
+) {
   const session = await auth();
   const userId = session?.user.id;
   if (!userId) throw new Error("Not authenticated");
@@ -154,7 +158,10 @@ export async function redirectToEmailAccountPath(path: `/${string}`) {
     notFound();
   }
 
-  const redirectUrl = `/${emailAccountId}${path}`;
+  const redirectUrl = buildRedirectUrl(
+    `/${emailAccountId}${path}`,
+    searchParams,
+  );
 
   redirect(redirectUrl);
 }
@@ -165,20 +172,7 @@ async function getLastEmailAccountFromCookie(
   try {
     const cookieStore = await cookies();
     const cookieValue = cookieStore.get(LAST_EMAIL_ACCOUNT_COOKIE)?.value;
-    if (!cookieValue) return null;
-
-    // Handle backward compatibility: old cookies stored just the emailAccountId as a plain string
-    // New cookies store JSON with { userId, emailAccountId }
-    try {
-      const parsed = JSON.parse(cookieValue) as LastEmailAccountCookieValue;
-      // Validate userId matches to prevent stale data
-      if (parsed.userId !== userId) return null;
-      return parsed.emailAccountId;
-    } catch {
-      // If JSON parse fails, it's an old-format cookie (plain emailAccountId string)
-      // Return it as-is (the caller will still validate the user owns this account)
-      return cookieValue;
-    }
+    return parseLastEmailAccountCookieValue({ userId, cookieValue });
   } catch {
     return null;
   }

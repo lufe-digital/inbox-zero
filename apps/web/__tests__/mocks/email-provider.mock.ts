@@ -62,9 +62,14 @@ export function createMockEmailProvider(
     getThreadMessages: vi.fn().mockResolvedValue([defaultMessage]),
     getThreadMessagesInInbox: vi.fn().mockResolvedValue([defaultMessage]),
     getThreadsWithQuery: vi.fn().mockResolvedValue({ threads: [] }),
+    getThreadsWithLabel: vi.fn().mockResolvedValue([]),
     getThreadsWithParticipant: vi.fn().mockResolvedValue([]),
     getThreadsFromSenderWithSubject: vi.fn().mockResolvedValue([]),
     getPreviousConversationMessages: vi.fn().mockResolvedValue([]),
+    getLatestMessageFromThreadSnapshot: vi
+      .fn()
+      .mockResolvedValue(defaultMessage),
+    getLatestMessageInThread: vi.fn().mockResolvedValue(defaultMessage),
 
     // Message retrieval
     getSentMessages: vi.fn().mockResolvedValue([]),
@@ -75,7 +80,13 @@ export function createMockEmailProvider(
     getMessagesWithPagination: vi
       .fn()
       .mockResolvedValue({ messages: [], nextPageToken: undefined }),
+    searchMessages: vi
+      .fn()
+      .mockResolvedValue({ messages: [], nextPageToken: undefined }),
     getMessagesFromSender: vi
+      .fn()
+      .mockResolvedValue({ messages: [], nextPageToken: undefined }),
+    getMessagesWithAttachments: vi
       .fn()
       .mockResolvedValue({ messages: [], nextPageToken: undefined }),
 
@@ -111,6 +122,9 @@ export function createMockEmailProvider(
     draftEmail: vi.fn().mockResolvedValue({ draftId: "draft-123" }),
     getDraft: vi.fn().mockResolvedValue(null),
     deleteDraft: vi.fn().mockResolvedValue(undefined),
+    createDraft: vi.fn().mockResolvedValue({ id: "draft-new" }),
+    updateDraft: vi.fn().mockResolvedValue(undefined),
+    sendDraft: vi.fn().mockResolvedValue({ messageId: "msg-sent" }),
     replyToEmail: vi.fn().mockResolvedValue(undefined),
     sendEmail: vi.fn().mockResolvedValue(undefined),
     sendEmailWithHtml: vi
@@ -141,6 +155,7 @@ export function createMockEmailProvider(
     isSentMessage: vi.fn().mockReturnValue(false),
     getOrCreateFolderIdByName: vi.fn().mockResolvedValue("folder-123"),
     getSignatures: vi.fn().mockResolvedValue([]),
+    getInboxStats: vi.fn().mockResolvedValue({ total: 0, unread: 0 }),
 
     // Watch/webhooks
     processHistory: vi.fn().mockResolvedValue(undefined),

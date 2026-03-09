@@ -2,8 +2,8 @@
 
 import { useAction } from "next-safe-action/hooks";
 import Link from "next/link";
-import { Trash2, MoreVertical, Settings, ArrowLeftRight } from "lucide-react";
-import { useEffect, useState } from "react";
+import { Trash2, MoreVertical, Settings } from "lucide-react";
+import { useEffect } from "react";
 import { useSearchParams, useRouter, usePathname } from "next/navigation";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { LoadingContent } from "@/components/LoadingContent";
@@ -30,8 +30,8 @@ import { PageHeader } from "@/components/PageHeader";
 import { PageWrapper } from "@/components/PageWrapper";
 import { logOut } from "@/utils/user";
 import { getAndClearAuthErrorCookie } from "@/utils/auth-cookies";
-import { CopyRulesDialog } from "@/app/(app)/accounts/CopyRulesDialog";
 import { getActionErrorMessage } from "@/utils/error";
+import { BRAND_NAME } from "@/utils/branding";
 
 export default function AccountsPage() {
   const { data, isLoading, error, mutate } = useAccounts();
@@ -47,7 +47,6 @@ export default function AccountsPage() {
             <AccountItem
               key={emailAccount.id}
               emailAccount={emailAccount}
-              allAccounts={data.emailAccounts}
               onAccountDeleted={mutate}
             />
           ))}
@@ -60,7 +59,6 @@ export default function AccountsPage() {
 
 function AccountItem({
   emailAccount,
-  allAccounts,
   onAccountDeleted,
 }: {
   emailAccount: {
@@ -70,13 +68,6 @@ function AccountItem({
     image: string | null;
     isPrimary: boolean;
   };
-  allAccounts: Array<{
-    id: string;
-    name: string | null;
-    email: string;
-    image: string | null;
-    isPrimary: boolean;
-  }>;
   onAccountDeleted: () => void;
 }) {
   return (
@@ -84,7 +75,6 @@ function AccountItem({
       <Card className="cursor-pointer transition-colors hover:bg-slate-50 dark:hover:bg-slate-900">
         <AccountHeader
           emailAccount={emailAccount}
-          allAccounts={allAccounts}
           onAccountDeleted={onAccountDeleted}
         />
       </Card>
@@ -94,7 +84,6 @@ function AccountItem({
 
 function AccountHeader({
   emailAccount,
-  allAccounts,
   onAccountDeleted,
 }: {
   emailAccount: {
@@ -104,13 +93,6 @@ function AccountHeader({
     image: string | null;
     isPrimary: boolean;
   };
-  allAccounts: Array<{
-    id: string;
-    name: string | null;
-    email: string;
-    image: string | null;
-    isPrimary: boolean;
-  }>;
   onAccountDeleted: () => void;
 }) {
   return (
@@ -136,7 +118,6 @@ function AccountHeader({
       >
         <AccountOptionsDropdown
           emailAccount={emailAccount}
-          allAccounts={allAccounts}
           onAccountDeleted={onAccountDeleted}
         />
       </div>
@@ -146,7 +127,6 @@ function AccountHeader({
 
 function AccountOptionsDropdown({
   emailAccount,
-  allAccounts,
   onAccountDeleted,
 }: {
   emailAccount: {
@@ -154,17 +134,8 @@ function AccountOptionsDropdown({
     email: string;
     isPrimary: boolean;
   };
-  allAccounts: Array<{
-    id: string;
-    name: string | null;
-    email: string;
-    image: string | null;
-    isPrimary: boolean;
-  }>;
   onAccountDeleted: () => void;
 }) {
-  const [copyRulesDialogOpen, setCopyRulesDialogOpen] = useState(false);
-
   const { execute, isExecuting } = useAction(deleteEmailAccountAction, {
     onSuccess: async () => {
       toastSuccess({
@@ -185,78 +156,52 @@ function AccountOptionsDropdown({
     },
   });
 
-  const sourceAccounts = allAccounts.filter(
-    (account) => account.id !== emailAccount.id,
-  );
-
   return (
-    <>
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button variant="ghost" size="icon">
-            <MoreVertical className="h-4 w-4" />
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
-          <DropdownMenuItem asChild>
-            <Link
-              href={prefixPath(emailAccount.id, "/setup")}
-              className="flex items-center gap-2"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <Settings className="size-4" />
-              Setup
-            </Link>
-          </DropdownMenuItem>
-          {sourceAccounts.length > 0 && (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button variant="ghost" size="icon">
+          <MoreVertical className="h-4 w-4" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
+        <DropdownMenuItem asChild>
+          <Link
+            href={prefixPath(emailAccount.id, "/setup")}
+            className="flex items-center gap-2"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <Settings className="size-4" />
+            Setup
+          </Link>
+        </DropdownMenuItem>
+        <ConfirmDialog
+          trigger={
             <DropdownMenuItem
               onSelect={(e) => {
+                e?.preventDefault();
                 e?.stopPropagation?.();
-                setCopyRulesDialogOpen(true);
               }}
               onClick={(e) => e.stopPropagation()}
+              className="flex items-center gap-2 text-destructive focus:text-destructive"
+              disabled={isExecuting}
             >
-              <ArrowLeftRight className="size-4" />
-              Copy rules to...
+              <Trash2 className="size-4" />
+              Delete
             </DropdownMenuItem>
-          )}
-          <ConfirmDialog
-            trigger={
-              <DropdownMenuItem
-                onSelect={(e) => {
-                  e?.preventDefault();
-                  e?.stopPropagation?.();
-                }}
-                onClick={(e) => e.stopPropagation()}
-                className="flex items-center gap-2 text-destructive focus:text-destructive"
-                disabled={isExecuting}
-              >
-                <Trash2 className="size-4" />
-                Delete
-              </DropdownMenuItem>
-            }
-            title="Delete Account"
-            description={
-              emailAccount.isPrimary
-                ? `Are you sure you want to delete "${emailAccount.email}"? This is your primary account. You will be logged out and need to log in again. Your oldest remaining account will become your new primary account. All data for "${emailAccount.email}" will be permanently deleted from Inbox Zero.`
-                : `Are you sure you want to delete "${emailAccount.email}"? This will delete all data for it on Inbox Zero.`
-            }
-            confirmText="Delete"
-            onConfirm={() => {
-              execute({ emailAccountId: emailAccount.id });
-            }}
-          />
-        </DropdownMenuContent>
-      </DropdownMenu>
-
-      <CopyRulesDialog
-        open={copyRulesDialogOpen}
-        onOpenChange={setCopyRulesDialogOpen}
-        targetAccountId={emailAccount.id}
-        targetAccountEmail={emailAccount.email}
-        sourceAccounts={sourceAccounts}
-      />
-    </>
+          }
+          title="Delete Account"
+          description={
+            emailAccount.isPrimary
+              ? `Are you sure you want to delete "${emailAccount.email}"? This is your primary account. You will be logged out and need to log in again. Your oldest remaining account will become your new primary account. All data for "${emailAccount.email}" will be permanently deleted from ${BRAND_NAME}.`
+              : `Are you sure you want to delete "${emailAccount.email}"? This will delete all data for it on ${BRAND_NAME}.`
+          }
+          confirmText="Delete"
+          onConfirm={() => {
+            execute({ emailAccountId: emailAccount.id });
+          }}
+        />
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 
@@ -277,13 +222,11 @@ function useAccountNotifications() {
       > = {
         account_not_found_for_merge: {
           title: "Account not found",
-          description:
-            "This account doesn't exist in Inbox Zero yet. Please select 'No, it's a new account' instead.",
+          description: `This account doesn't exist in ${BRAND_NAME} yet. Please select 'No, it's a new account' instead.`,
         },
         account_already_exists_use_merge: {
           title: "Account already exists",
-          description:
-            "This account already exists in Inbox Zero. Please select 'Yes, it's an existing Inbox Zero account' to merge.",
+          description: `This account already exists in ${BRAND_NAME}. Please select 'Yes, it's an existing ${BRAND_NAME} account' to merge.`,
         },
         already_linked_to_self: {
           title: "Account already linked",
@@ -298,6 +241,26 @@ function useAccountNotifications() {
           title: "Authentication failed",
           description:
             "Failed to receive authentication code. Please try again.",
+        },
+        consent_declined: {
+          title: "Microsoft permissions were not granted",
+          description:
+            `Microsoft sign-in was canceled before ${BRAND_NAME} received the required permissions. Please try again and complete the consent screen.`,
+        },
+        admin_consent_required: {
+          title: "Admin approval required",
+          description:
+            "Your Microsoft 365 organization requires admin approval before Inbox Zero can access this account. Ask your Microsoft 365 admin to grant consent for the app, then try again.",
+        },
+        invalid_scope_configuration: {
+          title: "Microsoft app setup needs attention",
+          description:
+            "Microsoft rejected the requested permissions for this app. Ask your admin to verify the Inbox Zero app registration, delegated Microsoft Graph permissions, and redirect URLs, then try again.",
+        },
+        consent_incomplete: {
+          title: "More Microsoft permissions are required",
+          description:
+            `Microsoft connected the account, but did not grant all required permissions. Reconnect and approve every requested permission. If your organization restricts consent, ask your admin to approve ${BRAND_NAME} first.`,
         },
         link_failed: {
           title: "Account linking failed",
@@ -334,6 +297,10 @@ function useAccountNotifications() {
         account_created_and_linked: {
           title: "Account added successfully!",
           description: "Your new account has been linked.",
+        },
+        tokens_updated: {
+          title: "Account reconnected successfully!",
+          description: "Your account permissions were refreshed.",
         },
       };
 

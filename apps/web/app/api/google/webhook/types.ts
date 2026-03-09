@@ -1,6 +1,6 @@
 import type { gmail_v1 } from "@googleapis/gmail";
 import type { RuleWithActions } from "@/utils/types";
-import type { EmailAccountWithAI } from "@/utils/llms/types";
+import type { EmailAccountForDrafting } from "@/utils/ai/choose-rule/choose-args";
 import type { EmailAccount } from "@/generated/prisma/client";
 
 export const HistoryEventType = {
@@ -19,6 +19,9 @@ export type ProcessHistoryOptions = {
   rules: RuleWithActions[];
   hasAutomationRules: boolean;
   hasAiAccess: boolean;
-  emailAccount: Pick<EmailAccount, "autoCategorizeSenders"> &
-    EmailAccountWithAI;
+  emailAccount: Pick<
+    EmailAccount,
+    "autoCategorizeSenders" | "filingEnabled" | "filingPrompt"
+  > &
+    EmailAccountForDrafting;
 };

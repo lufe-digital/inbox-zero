@@ -4,8 +4,9 @@ import type { EmailProvider } from "@/utils/email/types";
 import type { Logger } from "@/utils/logger";
 import { captureException } from "@/utils/error";
 import { handleOutboundReply } from "./outbound";
-import { trackSentDraftStatus, cleanupThreadAIDrafts } from "./draft-tracking";
+import { cleanupThreadAIDrafts, trackSentDraftStatus } from "./draft-tracking";
 import { clearFollowUpLabel } from "@/utils/follow-up/labels";
+import { logReplyTrackerError } from "./error-logging";
 
 export async function handleOutboundMessage({
   emailAccount,
@@ -24,27 +25,48 @@ export async function handleOutboundMessage({
     threadId: message.threadId,
   });
 
-  logger.info("Handling outbound message");
-
+  logger.info("Handling outbound message", {
+    messageLabelIds: message.labelIds,
+    messageInternalDate: message.internalDate,
+  });
+  logger.trace("Outbound message details", {
+    messageFrom: message.headers.from,
+    messageTo: message.headers.to,
+    messageSubject: message.headers.subject,
+  });
   await Promise.allSettled([
     trackSentDraftStatus({
       emailAccountId: emailAccount.id,
       message,
       provider,
       logger,
-    }).catch((error) => {
-      logger.error("Error tracking sent draft status", { error });
-      captureException(error, { emailAccountId: emailAccount.id });
-    }),
+    }).catch((error) =>
+      logReplyTrackerError({
+        logger,
+        emailAccountId: emailAccount.id,
+        scope: "handle-outbound",
+        message: "Error tracking sent draft status",
+        operation: "track-sent-draft-status",
+        error,
+        capture: true,
+      }),
+    ),
     handleOutboundReply({
       emailAccount,
       message,
       provider,
       logger,
-    }).catch((error) => {
-      logger.error("Error handling outbound reply", { error });
-      captureException(error, { emailAccountId: emailAccount.id });
-    }),
+    }).catch((error) =>
+      logReplyTrackerError({
+        logger,
+        emailAccountId: emailAccount.id,
+        scope: "handle-outbound",
+        message: "Error handling outbound reply",
+        operation: "handle-outbound-reply",
+        error,
+        capture: true,
+      }),
+    ),
   ]);
 
   try {
@@ -53,6 +75,7 @@ export async function handleOutboundMessage({
       emailAccountId: emailAccount.id,
       provider,
       logger,
+      excludeMessageId: message.id,
     });
   } catch (error) {
     logger.error("Error during thread draft cleanup", { error });

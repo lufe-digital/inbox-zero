@@ -101,6 +101,7 @@ export function FixWithChat({
       },
       results: results.map((r) => ({
         ruleName: r.rule?.name ?? null,
+        systemType: r.rule?.systemType ?? null,
         reason: r.reason ?? "",
       })),
       expected:
@@ -108,7 +109,10 @@ export function FixWithChat({
           ? "new"
           : selectedRuleId === CONST_NONE_RULE_ID
             ? "none"
-            : { name: selectedRuleName || "Unknown" },
+            : {
+                id: selectedRuleId,
+                name: selectedRuleName || "Unknown",
+              },
     };
     setContext(context);
 

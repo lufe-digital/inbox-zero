@@ -5,6 +5,7 @@ import type { SendEmailBody } from "@/utils/gmail/mail";
 import type { ParsedMessage } from "@/utils/types";
 import type { EmailForAction } from "@/utils/ai/types";
 import { createOutlookReplyContent } from "@/utils/outlook/reply";
+import { escapeHtml } from "@/utils/string";
 import { forwardEmailHtml, forwardEmailSubject } from "@/utils/gmail/forward";
 import {
   buildReplyAllRecipients,
@@ -15,16 +16,20 @@ import { extractEmailAddress, extractNameFromEmail } from "@/utils/email";
 import { ensureEmailSendingEnabled } from "@/utils/mail";
 import type { Logger } from "@/utils/logger";
 
+type GraphRecipient = {
+  emailAddress: { address: string; name?: string };
+};
+
 interface OutlookMessageRequest {
-  subject: string;
+  bccRecipients?: GraphRecipient[];
   body: {
     contentType: string;
     content: string;
   };
-  toRecipients: { emailAddress: { address: string } }[];
-  ccRecipients?: { emailAddress: { address: string } }[];
-  bccRecipients?: { emailAddress: { address: string } }[];
-  replyTo?: { emailAddress: { address: string } }[];
+  ccRecipients?: GraphRecipient[];
+  replyTo?: GraphRecipient[];
+  subject: string;
+  toRecipients: GraphRecipient[];
 }
 
 type SentEmailResult = Pick<Message, "id" | "conversationId">;
@@ -42,38 +47,42 @@ export async function sendEmailWithHtml(
     return sendReplyUsingCreateReply(client, body, logger);
   }
 
-  // For new emails (no reply context), use sendMail
-  const message: OutlookMessageRequest = {
-    subject: body.subject,
-    body: {
-      contentType: "html",
-      content: body.messageHtml,
-    },
-    toRecipients: [{ emailAddress: { address: body.to } }],
-    ...(body.cc
-      ? { ccRecipients: [{ emailAddress: { address: body.cc } }] }
-      : {}),
-    ...(body.bcc
-      ? { bccRecipients: [{ emailAddress: { address: body.bcc } }] }
-      : {}),
-    ...(body.replyTo
-      ? { replyTo: [{ emailAddress: { address: body.replyTo } }] }
-      : {}),
-  };
+  const toRecipients = buildGraphRecipients(body.to);
+  if (!toRecipients?.length) throw new Error("Recipient address is required");
+  const ccRecipients = buildGraphRecipients(body.cc);
+  const bccRecipients = buildGraphRecipients(body.bcc);
+  const replyToRecipients = buildGraphRecipients(body.replyTo);
 
-  await withOutlookRetry(
+  // For new emails, create draft then send to get the conversationId.
+  // sendMail returns 202 with no body, so we use the draft approach instead.
+  const draft: Message = await withOutlookRetry(
     () =>
-      client.getClient().api("/me/sendMail").post({
-        message,
-        saveToSentItems: true,
-      }),
+      client
+        .getClient()
+        .api("/me/messages")
+        .post({
+          subject: body.subject,
+          body: {
+            contentType: "html",
+            content: body.messageHtml,
+          },
+          toRecipients,
+          ...(ccRecipients ? { ccRecipients } : {}),
+          ...(bccRecipients ? { bccRecipients } : {}),
+          ...(replyToRecipients ? { replyTo: replyToRecipients } : {}),
+        }),
     logger,
   );
 
-  // sendMail returns 202 with no body, so we can't get the sent message ID
+  await withOutlookRetry(
+    () => client.getClient().api(`/me/messages/${draft.id}/send`).post({}),
+    logger,
+  );
+
+  // Draft id is no longer valid after sending; Graph doesn't return sent message id
   return {
     id: "",
-    conversationId: body.replyToEmail?.threadId,
+    conversationId: draft.conversationId,
   };
 }
 
@@ -91,6 +100,7 @@ export async function replyToEmail(
   message: EmailForAction,
   reply: string,
   logger: Logger,
+  options?: { replyTo?: string; from?: string },
 ) {
   ensureEmailSendingEnabled();
 
@@ -108,6 +118,21 @@ export async function replyToEmail(
     logger,
   );
 
+  // Build the from field if a display name is provided
+  const fromField = options?.from
+    ? {
+        from: {
+          emailAddress: {
+            name: extractNameFromEmail(options.from),
+            address:
+              extractEmailAddress(options.from) ||
+              replyDraft.from?.emailAddress?.address ||
+              "",
+          },
+        },
+      }
+    : {};
+
   // Update the draft with our content
   await withOutlookRetry(
     () =>
@@ -119,6 +144,12 @@ export async function replyToEmail(
             contentType: "html",
             content: html,
           },
+          ...fromField,
+          ...(options?.replyTo
+            ? {
+                replyTo: [{ emailAddress: { address: options.replyTo } }],
+              }
+            : {}),
         }),
     logger,
   );
@@ -332,8 +363,9 @@ function convertTextToHtmlParagraphs(text?: string | null): string {
     .filter((paragraph) => paragraph.trim() !== "");
 
   // Wrap each paragraph with <p> tags and join them back together
+  // Escape HTML to prevent prompt injection attacks
   const htmlContent = paragraphs
-    .map((paragraph) => `<p>${paragraph.trim()}</p>`)
+    .map((paragraph) => `<p>${escapeHtml(paragraph.trim())}</p>`)
     .join("");
 
   return `<html><body>${htmlContent}</body></html>`;
@@ -347,6 +379,8 @@ async function sendReplyUsingCreateReply(
   const originalMessageId = body.replyToEmail!.messageId!;
 
   // Use createReply to create a properly threaded draft
+  // Microsoft Graph's createReply automatically sets In-Reply-To and References headers
+  // based on the original message, ensuring proper threading across email providers
   const replyDraft: Message = await withOutlookRetry(
     () =>
       client
@@ -357,6 +391,9 @@ async function sendReplyUsingCreateReply(
   );
 
   // Update the draft with our content and recipients
+  // Note: We cannot set In-Reply-To/References headers via internetMessageHeaders
+  // as Microsoft Graph only allows custom headers (starting with x-) there.
+  // The createReply endpoint handles standard threading headers automatically.
   await withOutlookRetry(
     () =>
       client
@@ -390,4 +427,38 @@ async function sendReplyUsingCreateReply(
     id: "",
     conversationId: replyDraft.conversationId,
   };
+}
+
+function buildGraphRecipients(
+  recipientList?: string,
+): GraphRecipient[] | undefined {
+  if (!recipientList) return undefined;
+
+  const parts = recipientList.split(/,(?=(?:[^"]*"[^"]*")*[^"]*$)/);
+  const recipients = parts
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part): GraphRecipient | null => {
+      const address = extractEmailAddress(part);
+      if (!address) return null;
+
+      const name = extractNameFromEmail(part).trim();
+      return {
+        emailAddress: {
+          address,
+          ...(name && name !== address ? { name } : {}),
+        },
+      };
+    })
+    .filter((recipient): recipient is GraphRecipient => recipient !== null);
+
+  if (!recipients.length) return undefined;
+
+  const seen = new Set<string>();
+  return recipients.filter((recipient) => {
+    const key = recipient.emailAddress.address.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }

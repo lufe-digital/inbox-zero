@@ -1,10 +1,19 @@
 "use client";
 
 import { SparklesIcon } from "lucide-react";
-import { CardBasic } from "@/components/ui/card";
+import {
+  Card,
+  CardBasic,
+  CardContent,
+  CardDescription,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
 import { Container } from "@/components/Container";
 import {
   PageHeading,
+  PageSubHeading,
   SectionDescription,
   SectionHeader,
   MessageText,
@@ -12,6 +21,7 @@ import {
   TypographyH3,
   TypographyH4,
   TextLink,
+  MutedText,
 } from "@/components/Typography";
 import { Button } from "@/components/Button";
 import { Button as ShadButton } from "@/components/ui/button";
@@ -27,16 +37,19 @@ import {
   MultiSelectFilter,
   useMultiSelectFilter,
 } from "@/components/MultiSelectFilter";
+import { TagInput } from "@/components/TagInput";
 import { TooltipExplanation } from "@/components/TooltipExplanation";
-import { Suspense } from "react";
+import { Suspense, useState } from "react";
 import { PremiumAiAssistantAlert } from "@/components/PremiumAlert";
 import { ActionType, ExecutedRuleStatus } from "@/generated/prisma/enums";
 import type { Rule } from "@/generated/prisma/client";
 import { SettingCard } from "@/components/SettingCard";
 import { IconCircle } from "@/app/(app)/[emailAccountId]/onboarding/IconCircle";
+import { isValidEmail } from "@/utils/email";
 import { ActionBadges } from "@/app/(app)/[emailAccountId]/assistant/Rules";
 import { DismissibleVideoCard } from "@/components/VideoCard";
 import { PremiumExpiredCardContent } from "@/components/PremiumCard";
+import { AnnouncementDialogDemo } from "@/components/feature-announcements/AnnouncementDialogDemo";
 import {
   ResultsDisplay,
   ResultDisplayContent,
@@ -52,11 +65,24 @@ export default function Components() {
   const { selectedValues, setSelectedValues } = useMultiSelectFilter([
     "alerts",
   ]);
-
+  const [basicTags, setBasicTags] = useState<string[]>(["react", "typescript"]);
+  const [emailTags, setEmailTags] = useState<string[]>([
+    "alice@example.com",
+    "bob@example.com",
+  ]);
   return (
     <Container>
       <div className="space-y-8 py-8">
         <h1>A Storybook style page demoing components we use.</h1>
+
+        <div className="space-y-1">
+          <div>
+            <TextLink href="/components/tools">Assistant Tools →</TextLink>
+          </div>
+          <div>
+            <TextLink href="/components/chat">Chat Components →</TextLink>
+          </div>
+        </div>
 
         <div className="space-y-6">
           <div className="underline">Typography</div>
@@ -64,15 +90,60 @@ export default function Components() {
           <TypographyH3>TypographyH3</TypographyH3>
           <TypographyH4>TypographyH4</TypographyH4>
           <SectionHeader>SectionHeader</SectionHeader>
+          <PageSubHeading>PageSubHeading</PageSubHeading>
           <SectionDescription>SectionDescription</SectionDescription>
           <MessageText>MessageText</MessageText>
           <TypographyP>TypographyP</TypographyP>
+          <MutedText>MutedText</MutedText>
           <TextLink href="#">TextLink</TextLink>
         </div>
 
         <div className="space-y-6">
           <div className="underline">Card</div>
           <CardBasic>This is a basic card.</CardBasic>
+
+          <div className="grid gap-6 md:grid-cols-2">
+            <Card>
+              <CardHeader>
+                <CardTitle>Default Card</CardTitle>
+                <CardDescription>
+                  This card uses the default size.
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <p>
+                  The default card has larger padding and text for better
+                  readability in standard layouts.
+                </p>
+              </CardContent>
+              <CardFooter>
+                <ShadButton variant="outline" className="w-full">
+                  Action
+                </ShadButton>
+              </CardFooter>
+            </Card>
+
+            <Card size="sm">
+              <CardHeader>
+                <CardTitle>Small Card</CardTitle>
+                <CardDescription>
+                  This card uses the small size variant.
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <p>
+                  The card component supports a size prop that can be set to
+                  &quot;sm&quot; for a more compact appearance.
+                </p>
+              </CardContent>
+              <CardFooter>
+                <ShadButton variant="outline" size="sm" className="w-full">
+                  Action
+                </ShadButton>
+              </CardFooter>
+            </Card>
+          </div>
+
           <div className="space-y-4">
             <ActionCard
               icon={<SparklesIcon className="size-5" />}
@@ -230,27 +301,23 @@ export default function Components() {
           <div className="underline">Premium Alerts</div>
           <div className="mt-4 space-y-4">
             <div>
-              <p className="mb-2 text-sm text-muted-foreground">
+              <MutedText className="mb-2">
                 Basic Plan (needs upgrade to Business):
-              </p>
+              </MutedText>
               <PremiumAiAssistantAlert
                 showSetApiKey={false}
                 tier={"BASIC_MONTHLY"}
               />
             </div>
             <div>
-              <p className="mb-2 text-sm text-muted-foreground">
-                Pro Plan (needs API key):
-              </p>
+              <MutedText className="mb-2">Pro Plan (needs API key):</MutedText>
               <PremiumAiAssistantAlert
                 showSetApiKey={true}
                 tier={"PRO_MONTHLY"}
               />
             </div>
             <div>
-              <p className="mb-2 text-sm text-muted-foreground">
-                Free Plan (needs upgrade):
-              </p>
+              <MutedText className="mb-2">Free Plan (needs upgrade):</MutedText>
               <PremiumAiAssistantAlert showSetApiKey={false} tier={null} />
             </div>
           </div>
@@ -269,6 +336,13 @@ export default function Components() {
               thumbnailSrc="https://img.youtube.com/vi/SoeNDVr7ve4/0.jpg"
               storageKey={`video-dismissible-${Date.now()}`}
             />
+          </div>
+        </div>
+
+        <div>
+          <div className="underline">AnnouncementDialog</div>
+          <div className="mt-4">
+            <AnnouncementDialogDemo />
           </div>
         </div>
 
@@ -392,9 +466,9 @@ export default function Components() {
             />
 
             <div className="mt-8">
-              <p className="mb-2 text-sm text-muted-foreground">
+              <MutedText className="mb-2">
                 Complex example with multiple batches:
-              </p>
+              </MutedText>
               <ResultsDisplay
                 results={[
                   // Batch 1 (most recent): 2 rules
@@ -584,24 +658,20 @@ export default function Components() {
         <div>
           <div className="underline">ActivityLog</div>
           <div className="mt-4 space-y-4">
-            <p className="text-sm text-muted-foreground">
-              Default with mixed states:
-            </p>
+            <MutedText>Default with mixed states:</MutedText>
             <ActivityLog
               entries={getActivityLogEntries()}
               processingCount={2}
             />
 
-            <p className="text-sm text-muted-foreground">Paused state:</p>
+            <MutedText>Paused state:</MutedText>
             <ActivityLog
               entries={getActivityLogEntries()}
               processingCount={2}
               paused={true}
             />
 
-            <p className="text-sm text-muted-foreground">
-              Long text truncation test:
-            </p>
+            <MutedText>Long text truncation test:</MutedText>
             <ActivityLog
               entries={[
                 {
@@ -622,7 +692,7 @@ export default function Components() {
               processingCount={1}
             />
 
-            <p className="text-sm text-muted-foreground">All completed:</p>
+            <MutedText>All completed:</MutedText>
             <ActivityLog
               entries={[
                 {
@@ -669,6 +739,50 @@ export default function Components() {
         </div>
 
         <div>
+          <div className="underline">TagInput</div>
+          <div className="mt-4 space-y-6">
+            <div>
+              <MutedText className="mb-2">
+                Basic (type and press Enter):
+              </MutedText>
+              <TagInput
+                value={basicTags}
+                onChange={setBasicTags}
+                placeholder="Add tags..."
+                label="Tags"
+                className="max-w-md"
+              />
+            </div>
+            <div>
+              <MutedText className="mb-2">With email validation:</MutedText>
+              <TagInput
+                value={emailTags}
+                onChange={setEmailTags}
+                placeholder="Enter email addresses"
+                label="Email addresses"
+                validate={(email) =>
+                  isValidEmail(email)
+                    ? null
+                    : "Please enter a valid email address"
+                }
+                className="max-w-md"
+              />
+            </div>
+            <div>
+              <MutedText className="mb-2">With external error:</MutedText>
+              <TagInput
+                value={["tag1", "tag2"]}
+                onChange={() => {}}
+                placeholder="Add tags..."
+                label="Tags"
+                error="This field has an error"
+                className="max-w-md"
+              />
+            </div>
+          </div>
+        </div>
+
+        <div>
           <div className="underline">SettingCard</div>
           <div className="mt-4 space-y-4">
             <SettingCard
@@ -701,9 +815,7 @@ export default function Components() {
           <div className="underline">Premium Expired Banners</div>
           <div className="mt-4 space-y-4">
             <div>
-              <p className="mb-2 text-sm text-muted-foreground">
-                Stripe Past Due:
-              </p>
+              <MutedText className="mb-2">Stripe Past Due:</MutedText>
               <PremiumExpiredCardContent
                 premium={{
                   lemonSqueezyRenewsAt: null,
@@ -715,23 +827,19 @@ export default function Components() {
               />
             </div>
             <div>
-              <p className="mb-2 text-sm text-muted-foreground">
-                Stripe Canceled:
-              </p>
+              <MutedText className="mb-2">Stripe Canceled:</MutedText>
               <PremiumExpiredCardContent
                 premium={{
                   lemonSqueezyRenewsAt: null,
                   stripeSubscriptionId: "sub_test456",
                   stripeSubscriptionStatus: "canceled",
                   lemonSqueezySubscriptionId: null,
-                  tier: "BUSINESS_MONTHLY",
+                  tier: "STARTER_MONTHLY",
                 }}
               />
             </div>
             <div>
-              <p className="mb-2 text-sm text-muted-foreground">
-                LemonSqueezy Expired:
-              </p>
+              <MutedText className="mb-2">LemonSqueezy Expired:</MutedText>
               <PremiumExpiredCardContent
                 premium={{
                   lemonSqueezyRenewsAt: new Date(
@@ -745,9 +853,9 @@ export default function Components() {
               />
             </div>
             <div>
-              <p className="mb-2 text-sm text-muted-foreground">
+              <MutedText className="mb-2">
                 No Banner (Active Premium):
-              </p>
+              </MutedText>
               <div className="min-h-[20px] text-xs text-muted-foreground">
                 <PremiumExpiredCardContent
                   premium={{
@@ -755,16 +863,16 @@ export default function Components() {
                     stripeSubscriptionId: "sub_active123",
                     stripeSubscriptionStatus: "active",
                     lemonSqueezySubscriptionId: null,
-                    tier: "BUSINESS_MONTHLY",
+                    tier: "STARTER_MONTHLY",
                   }}
                 />
                 Banner should not appear for active users
               </div>
             </div>
             <div>
-              <p className="mb-2 text-sm text-muted-foreground">
+              <MutedText className="mb-2">
                 No Banner (Never Had Premium):
-              </p>
+              </MutedText>
               <div className="min-h-[20px] text-xs text-muted-foreground">
                 <PremiumExpiredCardContent premium={null} />
                 Banner should not appear for users who never had premium

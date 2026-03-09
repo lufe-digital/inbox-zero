@@ -5,6 +5,8 @@ import { isDefined, type EmailForLLM } from "@/utils/types";
 import { getModel, type ModelType } from "@/utils/llms/model";
 import { createGenerateObject } from "@/utils/llms";
 import { getUserInfoPrompt, getUserRulesPrompt } from "@/utils/ai/helpers";
+import { PROMPT_SECURITY_INSTRUCTIONS } from "@/utils/ai/security";
+import { sortRulesForAutomation } from "@/utils/rule/sort";
 
 type GetAiResponseOptions = {
   email: EmailForLLM;
@@ -31,9 +33,11 @@ export async function aiChooseRule<
 }> {
   if (!rules.length) return { rules: [], reason: "No rules to evaluate" };
 
+  const orderedRules = sortRulesForAutomation(rules);
+
   const { result: aiResponse } = await getAiResponse({
     email,
-    rules,
+    rules: orderedRules,
     emailAccount,
     modelType,
   });
@@ -48,7 +52,7 @@ export async function aiChooseRule<
   const rulesWithMetadata = aiResponse.matchedRules
     .map((match) => {
       if (!match.ruleName) return undefined;
-      const rule = rules.find(
+      const rule = orderedRules.find(
         (r) => r.name.toLowerCase() === match.ruleName.toLowerCase(),
       );
       return rule ? { rule, isPrimary: match.isPrimary } : undefined;
@@ -117,6 +121,8 @@ async function getAiResponseSingleRule({
 }) {
   const system = `You are an AI assistant that helps people manage their emails.
 
+${PROMPT_SECURITY_INSTRUCTIONS}
+
 <instructions>
   IMPORTANT: Follow these instructions carefully when selecting a rule:
 
@@ -164,7 +170,7 @@ ${stringifyEmail(email, 500)}
         .describe("The reason you chose the rule. Keep it concise"),
       ruleName: z
         .string()
-        .nullish()
+        .nullable()
         .describe("The exact name of the rule you want to apply"),
       noMatchFound: z
         .boolean()
@@ -208,6 +214,8 @@ async function getAiResponseMultiRule({
     .join("\n");
 
   const system = `You are an AI assistant that helps people manage their emails.
+
+${PROMPT_SECURITY_INSTRUCTIONS}
 
 <instructions>
   IMPORTANT: Follow these instructions carefully when selecting rules:

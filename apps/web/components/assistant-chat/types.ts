@@ -2,8 +2,20 @@ import type { UIMessage } from "ai";
 import type {
   AddToKnowledgeBaseTool,
   CreateRuleTool,
+  ForwardEmailTool,
+  GetAccountOverviewTool,
+  GetAssistantCapabilitiesTool,
   GetLearnedPatternsTool,
   GetUserRulesAndSettingsTool,
+  ManageInboxTool,
+  ReadEmailTool,
+  ReplyEmailTool,
+  SearchInboxTool,
+  SaveMemoryTool,
+  SearchMemoriesTool,
+  SendEmailTool,
+  UpdateAssistantSettingsTool,
+  UpdateInboxFeaturesTool,
   UpdateAboutTool,
   UpdateLearnedPatternsTool,
   UpdateRuleActionsTool,
@@ -17,6 +29,13 @@ import type {
 // export type MessageMetadata = z.infer<typeof messageMetadataSchema>;
 
 export type ChatTools = {
+  getAssistantCapabilities: GetAssistantCapabilitiesTool;
+  updateAssistantSettings: UpdateAssistantSettingsTool;
+  getAccountOverview: GetAccountOverviewTool;
+  searchInbox: SearchInboxTool;
+  readEmail: ReadEmailTool;
+  manageInbox: ManageInboxTool;
+  updateInboxFeatures: UpdateInboxFeaturesTool;
   getUserRulesAndSettings: GetUserRulesAndSettingsTool;
   getLearnedPatterns: GetLearnedPatternsTool;
   createRule: CreateRuleTool;
@@ -25,6 +44,11 @@ export type ChatTools = {
   updateLearnedPatterns: UpdateLearnedPatternsTool;
   updateAbout: UpdateAboutTool;
   addToKnowledgeBase: AddToKnowledgeBaseTool;
+  saveMemory: SaveMemoryTool;
+  searchMemories: SearchMemoriesTool;
+  sendEmail: SendEmailTool;
+  replyEmail: ReplyEmailTool;
+  forwardEmail: ForwardEmailTool;
 };
 
 // biome-ignore lint/complexity/noBannedTypes: ignore

@@ -1,5 +1,14 @@
 import { describe, it, expect } from "vitest";
-import { generateSecret, generateEnvFile, type EnvConfig } from "./utils";
+import {
+  generateSecret,
+  generateEnvFile,
+  isSensitiveKey,
+  parseEnvFile,
+  parsePortConflict,
+  updateEnvValue,
+  redactValue,
+  type EnvConfig,
+} from "./utils";
 
 describe("generateSecret", () => {
   it("should generate a hex string of correct length", () => {
@@ -34,7 +43,7 @@ GOOGLE_CLIENT_ID=
 MICROSOFT_CLIENT_ID=
 DEFAULT_LLM_PROVIDER=
 DEFAULT_LLM_MODEL=
-ANTHROPIC_API_KEY=
+LLM_API_KEY=
 `;
 
   const baseEnv: EnvConfig = {
@@ -50,7 +59,7 @@ ANTHROPIC_API_KEY=
     DEFAULT_LLM_MODEL: "claude-sonnet-4-5-20250929",
     ECONOMY_LLM_PROVIDER: "anthropic",
     ECONOMY_LLM_MODEL: "claude-haiku-4-5-20251001",
-    ANTHROPIC_API_KEY: "sk-ant-xxx",
+    LLM_API_KEY: "sk-ant-xxx",
   };
 
   it("should replace existing values in template", () => {
@@ -74,12 +83,20 @@ ANTHROPIC_API_KEY=
       POSTGRES_USER: "postgres",
       POSTGRES_PASSWORD: "mypassword",
       POSTGRES_DB: "inboxzero",
+      POSTGRES_PORT: "5433",
+      REDIS_PORT: "6381",
+      REDIS_HTTP_PORT: "8080",
+      WEB_PORT: "3001",
     };
 
     const templateWithPostgres = `${baseTemplate}
 POSTGRES_USER=
 POSTGRES_PASSWORD=
 POSTGRES_DB=
+POSTGRES_PORT=
+REDIS_PORT=
+REDIS_HTTP_PORT=
+WEB_PORT=
 `;
 
     const result = generateEnvFile({
@@ -92,9 +109,13 @@ POSTGRES_DB=
     expect(result).toContain("POSTGRES_USER=postgres");
     expect(result).toContain("POSTGRES_PASSWORD=mypassword");
     expect(result).toContain("POSTGRES_DB=inboxzero");
+    expect(result).toContain("POSTGRES_PORT=5433");
+    expect(result).toContain("REDIS_PORT=6381");
+    expect(result).toContain("REDIS_HTTP_PORT=8080");
+    expect(result).toContain("WEB_PORT=3001");
   });
 
-  it("should set LLM provider API key", () => {
+  it("should set shared LLM_API_KEY", () => {
     const result = generateEnvFile({
       env: baseEnv,
       useDockerInfra: false,
@@ -102,30 +123,27 @@ POSTGRES_DB=
       template: baseTemplate,
     });
 
-    expect(result).toContain("ANTHROPIC_API_KEY=sk-ant-xxx");
+    expect(result).toContain("LLM_API_KEY=sk-ant-xxx");
     expect(result).toContain("DEFAULT_LLM_PROVIDER=anthropic");
   });
 
   it("should handle OpenAI provider", () => {
     const openaiEnv: EnvConfig = {
       ...baseEnv,
+      LLM_API_KEY: undefined,
       DEFAULT_LLM_PROVIDER: "openai",
       DEFAULT_LLM_MODEL: "gpt-4.1",
       OPENAI_API_KEY: "sk-openai-xxx",
     };
 
-    const templateWithOpenai = `${baseTemplate}
-OPENAI_API_KEY=
-`;
-
     const result = generateEnvFile({
       env: openaiEnv,
       useDockerInfra: false,
       llmProvider: "openai",
-      template: templateWithOpenai,
+      template: baseTemplate,
     });
 
-    expect(result).toContain("OPENAI_API_KEY=sk-openai-xxx");
+    expect(result).toContain("LLM_API_KEY=sk-openai-xxx");
     expect(result).toContain("DEFAULT_LLM_PROVIDER=openai");
   });
 
@@ -155,6 +173,37 @@ BEDROCK_REGION=
     expect(result).toContain("BEDROCK_ACCESS_KEY=AKIA-xxx");
     expect(result).toContain("BEDROCK_SECRET_KEY=secret-xxx");
     expect(result).toContain("BEDROCK_REGION=us-west-2");
+  });
+
+  it("should handle OpenAI-compatible provider settings", () => {
+    const openaiCompatibleEnv: EnvConfig = {
+      ...baseEnv,
+      LLM_API_KEY: "lm-studio-key",
+      DEFAULT_LLM_PROVIDER: "openai-compatible",
+      DEFAULT_LLM_MODEL: "llama-3.2-3b-instruct",
+      OPENAI_COMPATIBLE_BASE_URL: "http://localhost:1234/v1",
+      OPENAI_COMPATIBLE_MODEL: "llama-3.2-3b-instruct",
+    };
+
+    const templateWithOpenAICompatible = `${baseTemplate}
+OPENAI_COMPATIBLE_BASE_URL=
+OPENAI_COMPATIBLE_MODEL=
+`;
+
+    const result = generateEnvFile({
+      env: openaiCompatibleEnv,
+      useDockerInfra: false,
+      llmProvider: "openai-compatible",
+      template: templateWithOpenAICompatible,
+    });
+
+    expect(result).toContain(
+      "OPENAI_COMPATIBLE_BASE_URL=http://localhost:1234/v1",
+    );
+    expect(result).toContain("OPENAI_COMPATIBLE_MODEL=llama-3.2-3b-instruct");
+    expect(result).toContain("LLM_API_KEY=lm-studio-key");
+    expect(result).not.toContain("OPENAI_COMPATIBLE_API_KEY=");
+    expect(result).toContain("DEFAULT_LLM_PROVIDER=openai-compatible");
   });
 
   it("should handle commented lines in template", () => {
@@ -277,7 +326,7 @@ DEFAULT_LLM_PROVIDER=
 DEFAULT_LLM_MODEL=
 ECONOMY_LLM_PROVIDER=
 ECONOMY_LLM_MODEL=
-ANTHROPIC_API_KEY=
+LLM_API_KEY=
 
 # =============================================================================
 # Redis
@@ -319,7 +368,7 @@ UPSTASH_REDIS_TOKEN=
       DEFAULT_LLM_MODEL: "claude-sonnet-4-5-20250929",
       ECONOMY_LLM_PROVIDER: "anthropic",
       ECONOMY_LLM_MODEL: "claude-haiku-4-5-20251001",
-      ANTHROPIC_API_KEY: "sk-ant-api-key-value",
+      LLM_API_KEY: "sk-ant-api-key-value",
     };
 
     const result = generateEnvFile({
@@ -377,7 +426,7 @@ DEFAULT_LLM_PROVIDER=anthropic
 DEFAULT_LLM_MODEL=claude-sonnet-4-5-20250929
 ECONOMY_LLM_PROVIDER=anthropic
 ECONOMY_LLM_MODEL=claude-haiku-4-5-20251001
-ANTHROPIC_API_KEY=sk-ant-api-key-value
+LLM_API_KEY=sk-ant-api-key-value
 
 # =============================================================================
 # Redis
@@ -388,7 +437,7 @@ UPSTASH_REDIS_TOKEN=redis-token-abc123
     expect(result).toBe(expectedOutput);
   });
 
-  it("should not write 'undefined' string when env values are undefined", () => {
+  it("should not write undefined string when env values are undefined", () => {
     const template = `DATABASE_URL=placeholder
 UPSTASH_REDIS_URL=placeholder
 AUTH_SECRET=
@@ -413,5 +462,171 @@ AUTH_SECRET=
     expect(result).toContain("DATABASE_URL=placeholder");
     expect(result).toContain("UPSTASH_REDIS_URL=placeholder");
     expect(result).toContain("AUTH_SECRET=secret123");
+  });
+});
+
+describe("parseEnvFile", () => {
+  it("should parse KEY=value pairs", () => {
+    const content = `FOO=bar
+BAZ=qux`;
+    expect(parseEnvFile(content)).toEqual({ FOO: "bar", BAZ: "qux" });
+  });
+
+  it("should handle quoted values", () => {
+    const content = `URL="http://localhost:3000"
+NAME='hello world'`;
+    expect(parseEnvFile(content)).toEqual({
+      URL: "http://localhost:3000",
+      NAME: "hello world",
+    });
+  });
+
+  it("should skip comments and empty lines", () => {
+    const content = `# This is a comment
+FOO=bar
+
+# Another comment
+BAZ=qux
+`;
+    expect(parseEnvFile(content)).toEqual({ FOO: "bar", BAZ: "qux" });
+  });
+
+  it("should handle values with = signs", () => {
+    const content = "URL=postgresql://user:pass@host:5432/db?sslmode=require";
+    expect(parseEnvFile(content)).toEqual({
+      URL: "postgresql://user:pass@host:5432/db?sslmode=require",
+    });
+  });
+
+  it("should handle empty values", () => {
+    const content = `FOO=
+BAR=value`;
+    expect(parseEnvFile(content)).toEqual({ FOO: "", BAR: "value" });
+  });
+});
+
+describe("updateEnvValue", () => {
+  it("should update an existing uncommented value", () => {
+    const content = "FOO=old\nBAR=other";
+    const result = updateEnvValue(content, "FOO", "new");
+    expect(result).toContain("FOO=new");
+    expect(result).toContain("BAR=other");
+  });
+
+  it("should uncomment and set a commented value", () => {
+    const content = "# FOO=placeholder\nBAR=other";
+    const result = updateEnvValue(content, "FOO", "value");
+    expect(result).toContain("FOO=value");
+    expect(result).not.toContain("# FOO=");
+  });
+
+  it("should append if key not found", () => {
+    const content = "FOO=bar";
+    const result = updateEnvValue(content, "NEW_KEY", "new_value");
+    expect(result).toContain("FOO=bar");
+    expect(result).toContain("NEW_KEY=new_value");
+  });
+
+  it("should quote values with special characters", () => {
+    const content = "URL=old";
+    const result = updateEnvValue(content, "URL", "http://localhost:3000");
+    expect(result).toContain('URL="http://localhost:3000"');
+  });
+
+  it("should not quote simple values", () => {
+    const content = "FOO=old";
+    const result = updateEnvValue(content, "FOO", "simple");
+    expect(result).toContain("FOO=simple");
+    expect(result).not.toContain('"simple"');
+  });
+
+  it("should escape double quotes in values", () => {
+    const content = "FOO=old";
+    const result = updateEnvValue(content, "FOO", 'hello"world');
+    expect(result).toContain('FOO="hello\\"world"');
+  });
+});
+
+describe("redactValue", () => {
+  it("should redact sensitive keys", () => {
+    expect(redactValue("LLM_API_KEY", "sk-ant-12345")).toBe("sk-a****");
+    expect(redactValue("ANTHROPIC_API_KEY", "sk-ant-12345")).toBe("sk-a****");
+    expect(redactValue("GOOGLE_CLIENT_SECRET", "GOCSPX-abc")).toBe("GOCS****");
+  });
+
+  it("should show placeholder values as not configured", () => {
+    expect(redactValue("GOOGLE_CLIENT_ID", "your-google-client-id")).toBe(
+      "(not configured)",
+    );
+    expect(redactValue("GOOGLE_CLIENT_ID", "skipped")).toBe("(not configured)");
+  });
+
+  it("should show non-sensitive values in full", () => {
+    expect(redactValue("DEFAULT_LLM_PROVIDER", "anthropic")).toBe("anthropic");
+    expect(redactValue("NEXT_PUBLIC_BASE_URL", "http://localhost:3000")).toBe(
+      "http://localhost:3000",
+    );
+  });
+
+  it("should redact passwords in database URLs", () => {
+    const result = redactValue(
+      "DATABASE_URL",
+      "postgresql://postgres:secretpass@db:5432/inboxzero",
+    );
+    expect(result).toContain("****@");
+    expect(result).not.toContain("secretpass");
+  });
+
+  it("should fully redact short sensitive values", () => {
+    expect(redactValue("AUTH_SECRET", "ab")).toBe("****");
+  });
+});
+
+describe("isSensitiveKey", () => {
+  it("should identify known sensitive keys", () => {
+    expect(isSensitiveKey("LLM_API_KEY")).toBe(true);
+    expect(isSensitiveKey("ANTHROPIC_API_KEY")).toBe(true);
+    expect(isSensitiveKey("AUTH_SECRET")).toBe(true);
+    expect(isSensitiveKey("CRON_SECRET")).toBe(true);
+  });
+
+  it("should identify keys containing secret/password", () => {
+    expect(isSensitiveKey("MY_CUSTOM_SECRET")).toBe(true);
+    expect(isSensitiveKey("DB_PASSWORD")).toBe(true);
+  });
+
+  it("should not flag non-sensitive keys", () => {
+    expect(isSensitiveKey("DEFAULT_LLM_PROVIDER")).toBe(false);
+    expect(isSensitiveKey("NEXT_PUBLIC_BASE_URL")).toBe(false);
+  });
+});
+
+describe("parsePortConflict", () => {
+  it("should detect 'port is already allocated' errors", () => {
+    const stderr =
+      "Error response from daemon: failed to set up container networking: " +
+      "driver failed programming external connectivity on endpoint " +
+      "inbox-zero-services-redis-1 (abc123): Bind for 0.0.0.0:6380 failed: port is already allocated";
+    expect(parsePortConflict(stderr)).toBe(
+      "Port 6380 is already in use by another process.",
+    );
+  });
+
+  it("should detect 'address already in use' errors", () => {
+    expect(
+      parsePortConflict("listen tcp 0.0.0.0:3000: address already in use"),
+    ).toBe("Port 3000 is already in use by another process.");
+    expect(
+      parsePortConflict("listen tcp 127.0.0.1:8080: address already in use"),
+    ).toBe("Port 8080 is already in use by another process.");
+    expect(parsePortConflict("listen tcp :5432: address already in use")).toBe(
+      "Port 5432 is already in use by another process.",
+    );
+  });
+
+  it("should return null for unrelated errors", () => {
+    expect(parsePortConflict("image not found")).toBeNull();
+    expect(parsePortConflict("network timeout")).toBeNull();
+    expect(parsePortConflict("")).toBeNull();
   });
 });

@@ -1,27 +1,41 @@
+import { after } from "next/server";
 import prisma from "@/utils/prisma";
 import { runRules } from "@/utils/ai/choose-rule/run-rules";
 import { categorizeSender } from "@/utils/categorize/senders/categorize";
-import { isAssistantEmail } from "@/utils/assistant/is-assistant-email";
-import { processAssistantEmail } from "@/utils/assistant/process-assistant-email";
+import {
+  isFilebotEmail,
+  isFilebotNotificationMessage,
+} from "@/utils/filebot/is-filebot-email";
+import { processFilingReply } from "@/utils/drive/handle-filing-reply";
+import {
+  processAttachment,
+  getExtractableAttachments,
+} from "@/utils/drive/filing-engine";
 import { handleOutboundMessage } from "@/utils/reply-tracker/handle-outbound";
+import { cleanupThreadAIDrafts } from "@/utils/reply-tracker/draft-tracking";
 import { clearFollowUpLabel } from "@/utils/follow-up/labels";
 import { NewsletterStatus } from "@/generated/prisma/enums";
 import type { EmailAccount } from "@/generated/prisma/client";
-import { extractEmailAddress } from "@/utils/email";
+import { extractEmailAddress, extractNameFromEmail } from "@/utils/email";
 import { isIgnoredSender } from "@/utils/filter-ignored-senders";
 import type { EmailProvider } from "@/utils/email/types";
 import type { ParsedMessage, RuleWithActions } from "@/utils/types";
-import type { EmailAccountWithAI } from "@/utils/llms/types";
+import type { EmailAccountForDrafting } from "@/utils/ai/choose-rule/choose-args";
 import type { Logger } from "@/utils/logger";
+import { runWithBackgroundLoggerFlush } from "@/utils/logger-flush";
 import { captureException } from "@/utils/error";
+import { logErrorWithDedupe } from "@/utils/log-error-with-dedupe";
 
 export type SharedProcessHistoryOptions = {
   provider: EmailProvider;
   rules: RuleWithActions[];
   hasAutomationRules: boolean;
   hasAiAccess: boolean;
-  emailAccount: EmailAccountWithAI &
-    Pick<EmailAccount, "autoCategorizeSenders">;
+  emailAccount: EmailAccountForDrafting &
+    Pick<
+      EmailAccount,
+      "autoCategorizeSenders" | "filingEnabled" | "filingPrompt" | "email"
+    >;
   logger: Logger;
 };
 
@@ -79,37 +93,47 @@ export async function processHistoryItem(
       return;
     }
 
-    const isForAssistant = isAssistantEmail({
+    const isForFilebot = isFilebotEmail({
       userEmail,
       emailToCheck: parsedMessage.headers.to,
     });
 
-    if (isForAssistant) {
-      logger.info("Passing through assistant email.");
-      return processAssistantEmail({
+    if (isForFilebot) {
+      logger.info("Processing filebot reply.");
+      return processFilingReply({
         message: parsedMessage,
         emailAccountId,
         userEmail,
-        provider,
+        emailProvider: provider,
+        emailAccount,
         logger,
       });
     }
 
-    const isFromAssistant = isAssistantEmail({
-      userEmail,
-      emailToCheck: parsedMessage.headers.from,
-    });
-
-    if (isFromAssistant) {
-      logger.info("Skipping. Assistant email.");
-      return;
-    }
-
     const isOutbound = provider.isSentMessage(parsedMessage);
 
-    logger.info("Message direction check", { isOutbound });
+    logger.info("Message direction check", {
+      isOutbound,
+      labelIds: parsedMessage.labelIds,
+    });
+    logger.trace("Message direction details", {
+      from: parsedMessage.headers.from,
+      to: parsedMessage.headers.to,
+    });
 
     if (isOutbound) {
+      if (
+        isFilebotNotificationMessage({
+          userEmail,
+          from: parsedMessage.headers.from,
+          to: parsedMessage.headers.to,
+          replyTo: parsedMessage.headers["reply-to"],
+        })
+      ) {
+        logger.info("Skipping. Filebot notification message.");
+        return;
+      }
+
       await handleOutboundMessage({
         emailAccount,
         message: parsedMessage,
@@ -144,6 +168,7 @@ export async function processHistoryItem(
     // this is used for category filters in ai rules
     if (emailAccount.autoCategorizeSenders) {
       const sender = extractEmailAddress(parsedMessage.headers.from);
+      const senderName = extractNameFromEmail(parsedMessage.headers.from);
       const existingSender = await prisma.newsletter.findUnique({
         where: {
           email_emailAccountId: { email: sender, emailAccountId },
@@ -151,7 +176,13 @@ export async function processHistoryItem(
         select: { category: true },
       });
       if (!existingSender?.category) {
-        await categorizeSender(sender, emailAccount, provider);
+        await categorizeSender(
+          sender,
+          emailAccount,
+          provider,
+          undefined,
+          senderName !== sender ? senderName : undefined,
+        );
       }
     }
 
@@ -171,6 +202,51 @@ export async function processHistoryItem(
       });
     }
 
+    // Process attachments for document filing (runs in parallel with rules if both enabled)
+    if (
+      emailAccount.filingEnabled &&
+      emailAccount.filingPrompt &&
+      hasAiAccess
+    ) {
+      after(() =>
+        runWithBackgroundLoggerFlush({
+          logger,
+          task: async () => {
+            const extractableAttachments =
+              getExtractableAttachments(parsedMessage);
+
+            if (extractableAttachments.length > 0) {
+              logger.info("Processing attachments for filing", {
+                count: extractableAttachments.length,
+              });
+
+              // Process each attachment (don't await all - let them run in background)
+              for (const attachment of extractableAttachments) {
+                await processAttachment({
+                  emailAccount: {
+                    ...emailAccount,
+                    filingEnabled: emailAccount.filingEnabled,
+                    filingPrompt: emailAccount.filingPrompt,
+                    email: emailAccount.email,
+                  },
+                  message: parsedMessage,
+                  attachment,
+                  emailProvider: provider,
+                  logger,
+                }).catch((error) => {
+                  logger.error("Failed to process attachment", {
+                    filename: attachment.filename,
+                    error,
+                  });
+                });
+              }
+            }
+          },
+          extra: { operation: "process-attachments" },
+        }),
+      );
+    }
+
     // Remove follow-up label if present (they replied, so follow-up no longer needed)
     // This handles the case where we were awaiting a reply from them
     try {
@@ -183,6 +259,33 @@ export async function processHistoryItem(
     } catch (error) {
       logger.error("Error removing follow-up label on inbound", { error });
       captureException(error, { emailAccountId });
+    }
+
+    // Clean up old AI drafts (runs after response to avoid slowing down processing)
+    // Excludes drafts for the current message since rules may have just created one
+    if (actualThreadId) {
+      after(() =>
+        runWithBackgroundLoggerFlush({
+          logger,
+          task: async () => {
+            try {
+              await cleanupThreadAIDrafts({
+                threadId: actualThreadId,
+                emailAccountId,
+                provider,
+                logger,
+                excludeMessageId: messageId,
+              });
+            } catch (error) {
+              logger.error("Error during inbound thread draft cleanup", {
+                error,
+              });
+              captureException(error, { emailAccountId });
+            }
+          },
+          extra: { operation: "cleanup-thread-ai-drafts" },
+        }),
+      );
     }
   } catch (error: unknown) {
     // Handle provider-specific "not found" errors
@@ -205,7 +308,15 @@ export async function processHistoryItem(
       }
     }
 
-    logger.error("Error processing message", { error });
+    await logErrorWithDedupe({
+      logger,
+      message: "Error processing message",
+      error,
+      dedupeKeyParts: {
+        scope: "webhook/process-history-item",
+        emailAccountId,
+      },
+    });
     throw error;
   }
 }

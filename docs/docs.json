@@ -1,0 +1,184 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Inbox Zero Documentation",
+  "colors": {
+    "primary": "#2563eb",
+    "light": "#60a5fa",
+    "dark": "#2563eb"
+  },
+  "favicon": "/favicon.png",
+  "navigation": {
+    "anchors": [
+      {
+        "anchor": "Documentation",
+        "icon": "book-open",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction"
+            ]
+          },
+          {
+            "group": "Essentials",
+            "pages": [
+              "essentials/ai-chat",
+              "essentials/email-ai-personal-assistant"
+            ]
+          },
+          {
+            "group": "Cleanup",
+            "pages": [
+              "essentials/bulk-email-unsubscriber",
+              "essentials/bulk-archiver",
+              "essentials/email-analytics"
+            ]
+          },
+          {
+            "group": "Features",
+            "pages": [
+              "essentials/meeting-briefs",
+              "essentials/auto-file-attachments",
+              "essentials/inbox-zero-tabs-extension",
+              "essentials/calendar-integration",
+              "essentials/cold-email-blocker",
+              "essentials/reply-zero",
+              "essentials/faq"
+            ]
+          },
+          {
+            "group": "Integrations",
+            "pages": [
+              "essentials/slack-integration",
+              "essentials/telegram-integration"
+            ]
+          },
+          {
+            "group": "Automation",
+            "pages": [
+              "essentials/email-digest",
+              "essentials/delayed-actions",
+              "essentials/call-webhook"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "essentials/api-keys"
+            ]
+          }
+        ]
+      },
+      {
+        "anchor": "Developers",
+        "icon": "code",
+        "groups": [
+          {
+            "group": "Quick Start",
+            "pages": [
+              "hosting/quick-start"
+            ]
+          },
+          {
+            "group": "Setup Guides",
+            "pages": [
+              "hosting/setup-guides",
+              "hosting/google-oauth",
+              "hosting/google-pubsub",
+              "hosting/microsoft-oauth",
+              "hosting/llm-setup"
+            ]
+          },
+          {
+            "group": "Self-Hosting",
+            "pages": [
+              "hosting/self-hosting",
+              "hosting/vercel",
+              "hosting/environment-variables",
+              "hosting/troubleshooting"
+            ]
+          },
+          {
+            "group": "AWS Deployment",
+            "pages": [
+              "hosting/aws",
+              "hosting/ec2-deployment",
+              "hosting/terraform",
+              "hosting/aws-copilot"
+            ]
+          },
+          {
+            "group": "Contributing",
+            "pages": [
+              "contributing"
+            ]
+          },
+          {
+            "group": "Integrations",
+            "pages": [
+              "slack/setup",
+              "teams/setup",
+              "telegram/setup"
+            ]
+          },
+          {
+            "group": "API",
+            "pages": [
+              "api-reference/introduction",
+              "api-reference/endpoint/get-statsby-period",
+              "api-reference/endpoint/get-statsresponse-time",
+              "api-reference/endpoint/get-group-emails"
+            ]
+          }
+        ]
+      }
+    ],
+    "global": {
+      "anchors": [
+        {
+          "anchor": "Changelog",
+          "href": "/changelog",
+          "icon": "clock-rotate-left"
+        },
+        {
+          "anchor": "Community",
+          "href": "https://getinboxzero.com/discord",
+          "icon": "discord"
+        },
+        {
+          "anchor": "Blog",
+          "href": "https://www.getinboxzero.com/blog",
+          "icon": "newspaper"
+        }
+      ]
+    }
+  },
+  "logo": {
+    "light": "/logo/light.svg",
+    "dark": "/logo/dark.svg"
+  },
+  "api": {
+    "openapi": "openapi.json"
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Support",
+        "href": "mailto:elie@getinboxzero.com"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Dashboard",
+      "href": "https://www.getinboxzero.com/welcome"
+    }
+  },
+  "footer": {
+    "socials": {
+      "twitter": "https://www.getinboxzero.com/twitter",
+      "github": "https://www.getinboxzero.com/github",
+      "linkedin": "https://www.getinboxzero.com/linkedin"
+    }
+  }
+}

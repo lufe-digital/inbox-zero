@@ -12,6 +12,9 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import {
   adminDeleteAccountAction,
   adminProcessHistoryAction,
+  adminWatchEmailsAction,
+  adminDisableAllRulesAction,
+  adminCleanupDraftsAction,
 } from "@/utils/actions/admin";
 import { adminCheckPermissionsAction } from "@/utils/actions/permissions";
 import { toastError, toastSuccess } from "@/components/Toast";
@@ -55,6 +58,68 @@ export const AdminUserControls = () => {
         });
       },
     });
+  const { execute: watchEmails, isExecuting: isWatching } = useAction(
+    adminWatchEmailsAction,
+    {
+      onSuccess: (result) => {
+        const results = result.data?.results || [];
+        const successCount = results.filter(
+          (r) => r.status === "success",
+        ).length;
+        const errorCount = results.filter((r) => r.status === "error").length;
+        const description =
+          successCount > 0
+            ? `${successCount} succeeded, ${errorCount} failed`
+            : errorCount > 0
+              ? `0 succeeded, ${errorCount} failed`
+              : "No watchable email accounts found";
+        toastSuccess({
+          title: "Watch completed",
+          description,
+        });
+      },
+      onError: (error) => {
+        toastError({
+          title: "Error watching emails",
+          description: getActionErrorMessage(error.error),
+        });
+      },
+    },
+  );
+  const { execute: disableRules, isExecuting: isDisablingRules } = useAction(
+    adminDisableAllRulesAction,
+    {
+      onSuccess: (result) => {
+        toastSuccess({
+          title: "Rules disabled",
+          description: `Disabled rules and follow-up for ${result.data?.emailAccountCount} account(s)`,
+        });
+      },
+      onError: (error) => {
+        toastError({
+          title: "Error disabling rules",
+          description: getActionErrorMessage(error.error),
+        });
+      },
+    },
+  );
+  const { execute: cleanupDrafts, isExecuting: isCleaningDrafts } = useAction(
+    adminCleanupDraftsAction,
+    {
+      onSuccess: (result) => {
+        toastSuccess({
+          title: "Drafts cleaned up",
+          description: `Deleted ${result.data?.deleted ?? 0} draft(s), skipped ${result.data?.skippedModified ?? 0} modified`,
+        });
+      },
+      onError: (error) => {
+        toastError({
+          title: "Error cleaning up drafts",
+          description: getActionErrorMessage(error.error),
+        });
+      },
+    },
+  );
   const { execute: deleteAccount, isExecuting: isDeleting } = useAction(
     adminDeleteAccountAction,
     {
@@ -108,6 +173,33 @@ export const AdminUserControls = () => {
           }}
         >
           Check Permissions
+        </Button>
+        <Button
+          variant="outline"
+          loading={isWatching}
+          onClick={() => {
+            watchEmails({ email: getValues("email") });
+          }}
+        >
+          Watch
+        </Button>
+        <Button
+          variant="outline"
+          loading={isDisablingRules}
+          onClick={() => {
+            disableRules({ email: getValues("email") });
+          }}
+        >
+          Disable Rules
+        </Button>
+        <Button
+          variant="outline"
+          loading={isCleaningDrafts}
+          onClick={() => {
+            cleanupDrafts({ email: getValues("email") });
+          }}
+        >
+          Cleanup Drafts
         </Button>
         <Button
           variant="destructive"

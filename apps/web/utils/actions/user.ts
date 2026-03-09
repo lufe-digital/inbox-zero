@@ -16,6 +16,7 @@ import {
 } from "@/utils/actions/user.validation";
 import { clearLastEmailAccountCookie } from "@/utils/cookies.server";
 import { aliasPosthogUser } from "@/utils/posthog";
+import { cleanupAIDraftsForAccount } from "@/utils/ai/draft-cleanup";
 
 export const saveAboutAction = actionClient
   .metadata({ name: "saveAbout" })
@@ -72,6 +73,12 @@ export const deleteAccountAction = actionClientUser
         logger.error("Failed to sign out", { error });
       });
     await deleteUser({ userId, logger });
+  });
+
+export const cleanupAIDraftsAction = actionClient
+  .metadata({ name: "cleanupAIDrafts" })
+  .action(async ({ ctx: { emailAccountId, provider, logger } }) => {
+    return cleanupAIDraftsForAccount({ emailAccountId, provider, logger });
   });
 
 export const deleteEmailAccountAction = actionClientUser

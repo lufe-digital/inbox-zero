@@ -16,9 +16,11 @@ import {
   ChevronRightIcon,
   FileIcon,
   FileTextIcon,
+  HardDriveIcon,
   InboxIcon,
   type LucideIcon,
   MailsIcon,
+  MessageSquareIcon,
   MessagesSquareIcon,
   PenIcon,
   PersonStandingIcon,
@@ -82,34 +84,72 @@ export const useNavigation = () => {
   const showMeetingBriefs = useMeetingBriefsEnabled();
   const showIntegrations = useIntegrationsEnabled();
 
-  const { emailAccountId, emailAccount, provider } = useAccount();
+  const { emailAccount, emailAccountId, provider } = useAccount();
   const currentEmailAccountId = emailAccount?.id || emailAccountId;
 
-  const navItems: NavItem[] = useMemo(
+  const manageItems: NavItem[] = useMemo(
     () => [
+      {
+        name: "Chat",
+        href: prefixPath(currentEmailAccountId, "/assistant"),
+        icon: MessageSquareIcon,
+      },
       {
         name: "Assistant",
         href: prefixPath(currentEmailAccountId, "/automation"),
         icon: SparklesIcon,
       },
+    ],
+    [currentEmailAccountId],
+  );
+
+  const cleanupItems: NavItem[] = useMemo(
+    () => [
       {
         name: "Bulk Unsubscribe",
         href: prefixPath(currentEmailAccountId, "/bulk-unsubscribe"),
         icon: MailsIcon,
       },
-      ...(isGoogleProvider(provider)
+      {
+        name: "Bulk Archive",
+        href: prefixPath(currentEmailAccountId, "/bulk-archive"),
+        icon: ArchiveIcon,
+      },
+      {
+        name: "Analytics",
+        href: prefixPath(currentEmailAccountId, "/stats"),
+        icon: BarChartBigIcon,
+      },
+      ...(isGoogleProvider(provider) && showCleaner
         ? [
             {
               name: "Deep Clean",
               href: prefixPath(currentEmailAccountId, "/clean"),
               icon: BrushIcon,
+              beta: true,
+            },
+          ]
+        : []),
+    ],
+    [currentEmailAccountId, provider, showCleaner],
+  );
+
+  const moreItems: NavItem[] = useMemo(
+    () => [
+      ...(showMeetingBriefs
+        ? [
+            {
+              name: "Meeting Briefs",
+              href: prefixPath(currentEmailAccountId, "/briefs"),
+              icon: FileTextIcon,
             },
           ]
         : []),
       {
-        name: "Analytics",
-        href: prefixPath(currentEmailAccountId, "/stats"),
-        icon: BarChartBigIcon,
+        name: "Attachments",
+        href: prefixPath(currentEmailAccountId, "/drive"),
+        icon: HardDriveIcon,
+        new: false,
       },
       {
         name: "Calendars",
@@ -126,31 +166,14 @@ export const useNavigation = () => {
             },
           ]
         : []),
-      ...(showMeetingBriefs
-        ? [
-            {
-              name: "Meeting Briefs",
-              href: prefixPath(currentEmailAccountId, "/briefs"),
-              icon: FileTextIcon,
-            },
-          ]
-        : []),
     ],
-    [currentEmailAccountId, provider, showMeetingBriefs, showIntegrations],
-  );
-
-  const navItemsFiltered = useMemo(
-    () =>
-      navItems.filter((item) => {
-        if (item.href === `/${emailAccountId}/clean` || item.href === "/clean")
-          return showCleaner;
-        return true;
-      }),
-    [showCleaner, emailAccountId, navItems],
+    [currentEmailAccountId, showMeetingBriefs, showIntegrations],
   );
 
   return {
-    navItems: navItemsFiltered,
+    manageItems,
+    cleanupItems,
+    moreItems,
   };
 };
 
@@ -207,8 +230,6 @@ const bottomMailLinks: NavItem[] = [
 
 export function SideNav({ ...props }: React.ComponentProps<typeof Sidebar>) {
   const navigation = useNavigation();
-  const { emailAccountId, emailAccount } = useAccount();
-  const currentEmailAccountId = emailAccount?.id || emailAccountId;
   const path = usePathname();
   const showMailNav = path.includes("/mail") || path.includes("/compose");
 
@@ -226,7 +247,7 @@ export function SideNav({ ...props }: React.ComponentProps<typeof Sidebar>) {
     [showMailNav],
   );
 
-  const { state } = useSidebar();
+  const { state, isMobile, setOpenMobile } = useSidebar();
 
   return (
     <Sidebar collapsible="icon" {...props}>
@@ -253,10 +274,23 @@ export function SideNav({ ...props }: React.ComponentProps<typeof Sidebar>) {
           {showMailNav ? (
             <MailNav path={path} />
           ) : (
-            <SidebarGroup>
-              <SidebarGroupLabel>Platform</SidebarGroupLabel>
-              <SideNavMenu items={navigation.navItems} activeHref={path} />
-            </SidebarGroup>
+            <>
+              <SidebarGroup>
+                <SidebarGroupLabel>Manage</SidebarGroupLabel>
+                <SideNavMenu items={navigation.manageItems} activeHref={path} />
+              </SidebarGroup>
+              <SidebarGroup>
+                <SidebarGroupLabel>Cleanup</SidebarGroupLabel>
+                <SideNavMenu
+                  items={navigation.cleanupItems}
+                  activeHref={path}
+                />
+              </SidebarGroup>
+              <SidebarGroup>
+                <SidebarGroupLabel>More</SidebarGroupLabel>
+                <SideNavMenu items={navigation.moreItems} activeHref={path} />
+              </SidebarGroup>
+            </>
           )}
         </SidebarGroupContent>
       </SidebarContent>
@@ -271,14 +305,34 @@ export function SideNav({ ...props }: React.ComponentProps<typeof Sidebar>) {
         )}
 
         <SidebarMenuButton asChild>
-          <Link href="https://docs.getinboxzero.com" target="_blank">
+          <Link
+            href="https://docs.getinboxzero.com"
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={() => {
+              if (isMobile) {
+                setOpenMobile((prev) =>
+                  prev.filter((name) => name !== "left-sidebar"),
+                );
+              }
+            }}
+          >
             <BookIcon className="size-4" />
             <span className="font-semibold">Help Center</span>
           </Link>
         </SidebarMenuButton>
 
         <SidebarMenuButton asChild>
-          <Link href={prefixPath(currentEmailAccountId, "/settings")}>
+          <Link
+            href="/settings"
+            onClick={() => {
+              if (isMobile) {
+                setOpenMobile((prev) =>
+                  prev.filter((name) => name !== "left-sidebar"),
+                );
+              }
+            }}
+          >
             <SettingsIcon className="size-4" />
             <span className="font-semibold">Settings</span>
           </Link>

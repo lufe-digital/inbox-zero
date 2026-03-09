@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { containsUnsubscribeKeyword } from "./unsubscribe";
+import {
+  cleanUnsubscribeLink,
+  containsUnsubscribeKeyword,
+  containsUnsubscribeUrlPattern,
+  getHttpUnsubscribeLink,
+  parseListUnsubscribeHeader,
+} from "./unsubscribe";
 
 describe("containsUnsubscribeKeyword", () => {
   describe("detects unsubscribe keywords", () => {
@@ -87,5 +93,168 @@ describe("containsUnsubscribeKeyword", () => {
     it("returns false for keywords with typos", () => {
       expect(containsUnsubscribeKeyword("unsubscibe")).toBe(false);
     });
+  });
+});
+
+describe("containsUnsubscribeUrlPattern", () => {
+  describe("detects unsubscribe URL patterns", () => {
+    it("detects 'unsubscribe' in URL", () => {
+      expect(
+        containsUnsubscribeUrlPattern(
+          "https://example.com/unsubscribe?email=test",
+        ),
+      ).toBe(true);
+    });
+
+    it("detects 'unsub' in URL (short form)", () => {
+      expect(
+        containsUnsubscribeUrlPattern(
+          "https://click.example.com/campaign/unsub-email/123",
+        ),
+      ).toBe(true);
+    });
+
+    it("detects 'opt-out' in URL", () => {
+      expect(
+        containsUnsubscribeUrlPattern("https://example.com/opt-out/user123"),
+      ).toBe(true);
+    });
+
+    it("detects 'optout' in URL (no hyphen)", () => {
+      expect(
+        containsUnsubscribeUrlPattern(
+          "https://example.com/email/optout?id=abc",
+        ),
+      ).toBe(true);
+    });
+
+    it("detects 'list-manage' in URL (Mailchimp style)", () => {
+      expect(
+        containsUnsubscribeUrlPattern(
+          "https://list-manage.com/track/click?u=abc&id=123",
+        ),
+      ).toBe(true);
+    });
+  });
+
+  describe("URL pattern matching behavior", () => {
+    it("is case insensitive - matches UNSUB", () => {
+      expect(
+        containsUnsubscribeUrlPattern("https://example.com/UNSUB/email"),
+      ).toBe(true);
+    });
+
+    it("matches pattern in query string", () => {
+      expect(
+        containsUnsubscribeUrlPattern(
+          "https://example.com/email?action=unsubscribe",
+        ),
+      ).toBe(true);
+    });
+
+    it("matches pattern in path", () => {
+      expect(
+        containsUnsubscribeUrlPattern(
+          "https://example.com/unsubscribe/confirm",
+        ),
+      ).toBe(true);
+    });
+
+    it("matches Portuguese email example (unsub-email)", () => {
+      expect(
+        containsUnsubscribeUrlPattern(
+          "https://click.lindtbrasil.com/campaign/unsub-email/MTM",
+        ),
+      ).toBe(true);
+    });
+  });
+
+  describe("returns false for non-matching URLs", () => {
+    it("returns false for empty string", () => {
+      expect(containsUnsubscribeUrlPattern("")).toBe(false);
+    });
+
+    it("returns false for regular URLs", () => {
+      expect(containsUnsubscribeUrlPattern("https://example.com/about")).toBe(
+        false,
+      );
+    });
+
+    it("returns false for subscribe URLs (not unsubscribe)", () => {
+      expect(
+        containsUnsubscribeUrlPattern("https://example.com/subscribe"),
+      ).toBe(false);
+    });
+
+    it("returns false for URLs with 'sub' but not 'unsub'", () => {
+      expect(
+        containsUnsubscribeUrlPattern("https://example.com/submit-form"),
+      ).toBe(false);
+    });
+  });
+});
+
+describe("cleanUnsubscribeLink", () => {
+  it("removes surrounding angle brackets", () => {
+    expect(cleanUnsubscribeLink("<https://example.com/unsub>")).toBe(
+      "https://example.com/unsub",
+    );
+  });
+
+  it("trims whitespace", () => {
+    expect(cleanUnsubscribeLink("  https://example.com/unsub  ")).toBe(
+      "https://example.com/unsub",
+    );
+  });
+
+  it("returns undefined for empty strings", () => {
+    expect(cleanUnsubscribeLink("   ")).toBeUndefined();
+  });
+});
+
+describe("parseListUnsubscribeHeader", () => {
+  it("parses multiple header values", () => {
+    expect(
+      parseListUnsubscribeHeader(
+        "<mailto:unsubscribe@example.com>, <https://example.com/unsub?id=1>",
+      ),
+    ).toEqual([
+      "mailto:unsubscribe@example.com",
+      "https://example.com/unsub?id=1",
+    ]);
+  });
+
+  it("returns empty array for missing values", () => {
+    expect(parseListUnsubscribeHeader()).toEqual([]);
+  });
+});
+
+describe("getHttpUnsubscribeLink", () => {
+  it("prefers HTTP URLs from list-unsubscribe header", () => {
+    expect(
+      getHttpUnsubscribeLink({
+        listUnsubscribeHeader:
+          "<mailto:unsubscribe@example.com>, <https://example.com/unsub?id=1>",
+        unsubscribeLink: "https://fallback.example.com/unsub",
+      }),
+    ).toBe("https://example.com/unsub?id=1");
+  });
+
+  it("falls back to unsubscribe link when header has no HTTP URL", () => {
+    expect(
+      getHttpUnsubscribeLink({
+        listUnsubscribeHeader: "<mailto:unsubscribe@example.com>",
+        unsubscribeLink: "https://fallback.example.com/unsub",
+      }),
+    ).toBe("https://fallback.example.com/unsub");
+  });
+
+  it("returns undefined when no HTTP URL is present", () => {
+    expect(
+      getHttpUnsubscribeLink({
+        listUnsubscribeHeader: "<mailto:unsubscribe@example.com>",
+        unsubscribeLink: "mailto:alt@example.com",
+      }),
+    ).toBeUndefined();
   });
 });

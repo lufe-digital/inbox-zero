@@ -1,10 +1,13 @@
+import type { ComponentProps } from "react";
 import Link from "next/link";
+import { env } from "@/env";
 import { EXTENSION_URL } from "@/utils/config";
+import { BRAND_NAME, SUPPORT_EMAIL } from "@/utils/branding";
 
 export const footerNavigation = {
   main: [
     {
-      name: "Inbox Zero Tabs (Chrome Extension)",
+      name: `${BRAND_NAME} Tabs (Chrome Extension)`,
       href: EXTENSION_URL,
       target: "_blank",
     },
@@ -26,6 +29,12 @@ export const footerNavigation = {
     { name: "Customer Support", href: "/support" },
     { name: "E-commerce", href: "/ecommerce" },
   ],
+  industries: [
+    { name: "MSPs", href: "/msp" },
+    { name: "Property Management", href: "/property-management" },
+    { name: "Law Firms", href: "/law-firms" },
+    { name: "Accounting Firms", href: "/accounting-firms" },
+  ],
   compare: [
     { name: "vs Fyxer.ai", href: "/best-fyxer-alternative" },
     {
@@ -33,9 +42,26 @@ export const footerNavigation = {
       href: "/best-perplexity-email-assistant-alternative",
     },
   ],
+  tools: [
+    {
+      name: "Email Deliverability Checker",
+      href: "/tools/email-deliverability-checker",
+    },
+    { name: "Gmail Personality Quiz", href: "/tools/gmail-quiz" },
+    { name: "Subject Line Analyzer", href: "/tools/subject-line-analyzer" },
+    {
+      name: "Email Signature Generator",
+      href: "/tools/email-signature-generator",
+    },
+    { name: "Meeting Cost Calculator", href: "/tools/meeting-cost-calculator" },
+  ],
   support: [
-    { name: "Pricing", href: "/#pricing" },
-    { name: "Contact", href: "mailto:elie@getinboxzero.com", target: "_blank" },
+    { name: "Pricing", href: "/pricing" },
+    {
+      name: "Contact",
+      href: `mailto:${SUPPORT_EMAIL}`,
+      target: "_blank",
+    },
     {
       name: "Documentation",
       href: "https://docs.getinboxzero.com",
@@ -74,7 +100,7 @@ export const footerNavigation = {
       name: "Twitter",
       href: "/twitter",
       target: "_blank",
-      icon: (props: any) => (
+      icon: (props: ComponentProps<"svg">) => (
         <svg fill="currentColor" viewBox="0 0 24 24" {...props}>
           <title>Twitter</title>
           <path d="M8.29 20.251c7.547 0 11.675-6.253 11.675-11.675 0-.178 0-.355-.012-.53A8.348 8.348 0 0022 5.92a8.19 8.19 0 01-2.357.646 4.118 4.118 0 001.804-2.27 8.224 8.224 0 01-2.605.996 4.107 4.107 0 00-6.993 3.743 11.65 11.65 0 01-8.457-4.287 4.106 4.106 0 001.27 5.477A4.072 4.072 0 012.8 9.713v.052a4.105 4.105 0 003.292 4.022 4.095 4.095 0 01-1.853.07 4.108 4.108 0 003.834 2.85A8.233 8.233 0 012 18.407a11.616 11.616 0 006.29 1.84" />
@@ -85,7 +111,7 @@ export const footerNavigation = {
       name: "GitHub",
       href: "/github",
       target: "_blank",
-      icon: (props: any) => (
+      icon: (props: ComponentProps<"svg">) => (
         <svg fill="currentColor" viewBox="0 0 24 24" {...props}>
           <title>GitHub</title>
           <path
@@ -100,7 +126,7 @@ export const footerNavigation = {
       name: "Discord",
       href: "/discord",
       target: "_blank",
-      icon: (props: any) => (
+      icon: (props: ComponentProps<"svg">) => (
         <svg fill="currentColor" viewBox="0 0 48 48" {...props}>
           <title>Discord</title>
           <path d="M40,12c0,0-4.585-3.588-10-4l-0.488,0.976C34.408,10.174,36.654,11.891,39,14c-4.045-2.065-8.039-4-15-4s-10.955,1.935-15,4c2.346-2.109,5.018-4.015,9.488-5.024L18,8c-5.681,0.537-10,4-10,4s-5.121,7.425-6,22c5.162,5.953,13,6,13,6l1.639-2.185C13.857,36.848,10.715,35.121,8,32c3.238,2.45,8.125,5,16,5s12.762-2.55,16-5c-2.715,3.121-5.857,4.848-8.639,5.815L33,40c0,0,7.838-0.047,13-6C45.121,19.425,40,12,40,12z M17.5,30c-1.933,0-3.5-1.791-3.5-4c0-2.209,1.567-4,3.5-4s3.5,1.791,3.5,4C21,28.209,19.433,30,17.5,30z M30.5,30c-1.933,0-3.5-1.791-3.5-4c0-2.209,1.567-4,3.5-4s3.5,1.791,3.5,4C34,28.209,32.433,30,30.5,30z" />
@@ -110,7 +136,72 @@ export const footerNavigation = {
   ],
 };
 
+// Simple footer for self-hosted deployments
+const selfHostedFooter = {
+  resources: [
+    {
+      name: "Documentation",
+      href: "https://docs.getinboxzero.com",
+      target: "_blank",
+    },
+    { name: "GitHub", href: "/github", target: "_blank" },
+    { name: "Discord", href: "/discord", target: "_blank" },
+  ],
+  legal: [
+    { name: "Terms", href: "/terms" },
+    { name: "Privacy", href: "/privacy" },
+  ],
+};
+
 export function Footer() {
+  const copyrightName =
+    BRAND_NAME === "Inbox Zero" ? "Inbox Zero Inc." : BRAND_NAME;
+
+  if (env.NEXT_PUBLIC_BYPASS_PREMIUM_CHECKS) {
+    return (
+      <footer className="relative">
+        <div className="mx-auto max-w-7xl overflow-hidden px-6 py-12 lg:px-8">
+          <div className="flex flex-wrap justify-center gap-x-6 gap-y-2">
+            {selfHostedFooter.resources.map((item) => (
+              <Link
+                key={item.name}
+                href={item.href}
+                target={item.target}
+                rel={
+                  item.target === "_blank" ? "noopener noreferrer" : undefined
+                }
+                className="text-sm leading-6 text-gray-600 hover:text-gray-900"
+              >
+                {item.name}
+              </Link>
+            ))}
+            <span className="text-gray-300">|</span>
+            {selfHostedFooter.legal.map((item) => (
+              <Link
+                key={item.name}
+                href={item.href}
+                className="text-sm leading-6 text-gray-600 hover:text-gray-900"
+              >
+                {item.name}
+              </Link>
+            ))}
+          </div>
+          <p className="mt-6 text-center text-xs leading-5 text-gray-500">
+            Powered by{" "}
+            <Link
+              href="https://getinboxzero.com"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="hover:text-gray-900"
+            >
+              Inbox Zero
+            </Link>
+          </p>
+        </div>
+      </footer>
+    );
+  }
+
   return (
     <footer className="relative">
       <div className="mx-auto max-w-7xl overflow-hidden px-6 py-20 sm:py-24 lg:px-8">
@@ -122,11 +213,22 @@ export function Footer() {
             <FooterList title="Use Cases" items={footerNavigation.useCases} />
 
             <div className="mt-6">
+              <FooterList
+                title="Industries"
+                items={footerNavigation.industries}
+              />
+            </div>
+
+            <div className="mt-6">
               <FooterList title="Compare" items={footerNavigation.compare} />
             </div>
           </div>
           <div>
             <FooterList title="Support" items={footerNavigation.support} />
+
+            <div className="mt-6">
+              <FooterList title="Free Tools" items={footerNavigation.tools} />
+            </div>
           </div>
           <div>
             <FooterList title="Company" items={footerNavigation.company} />
@@ -149,7 +251,8 @@ export function Footer() {
           ))}
         </div>
         <p className="mt-10 text-center text-xs leading-5 text-gray-500">
-          &copy; {new Date().getFullYear()} Inbox Zero Inc. All rights reserved.
+          &copy; {new Date().getFullYear()} {copyrightName}. All rights
+          reserved.
         </p>
       </div>
     </footer>

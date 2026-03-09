@@ -2,15 +2,18 @@
 
 import { useState } from "react";
 import Image from "next/image";
+import Link from "next/link";
 import { Button } from "@/components/ui/button";
 import { PageHeading, TypographyP } from "@/components/Typography";
 import { useAccount } from "@/providers/EmailAccountProvider";
 import { toastError } from "@/components/Toast";
 import { getAccountLinkingUrl } from "@/utils/account-linking";
+import { BRAND_NAME } from "@/utils/branding";
 
 export default function PermissionsConsentPage() {
   const { provider, isLoading: accountLoading } = useAccount();
   const [isReconnecting, setIsReconnecting] = useState(false);
+  const isMicrosoft = provider === "microsoft";
 
   const handleReconnect = async () => {
     setIsReconnecting(true);
@@ -19,8 +22,7 @@ export default function PermissionsConsentPage() {
       const accountProvider = provider === "microsoft" ? "microsoft" : "google";
       const url = await getAccountLinkingUrl(accountProvider);
       window.location.href = url;
-    } catch (error) {
-      console.error("Error initiating reconnection:", error);
+    } catch {
       toastError({
         title: "Error initiating reconnection",
         description: "Please try again or contact support",
@@ -37,9 +39,22 @@ export default function PermissionsConsentPage() {
       </PageHeading>
 
       <TypographyP className="mx-auto mt-4 max-w-prose text-center">
-        You must sign in and give access to all permissions for Inbox Zero to
-        work.
+        {isMicrosoft
+          ? `Your Microsoft account is connected, but ${BRAND_NAME} is missing one or more required Microsoft 365 permissions.`
+          : `You must sign in and give access to all permissions for ${BRAND_NAME} to work.`}
       </TypographyP>
+
+      {isMicrosoft && (
+        <TypographyP className="mx-auto mt-3 max-w-prose text-center text-muted-foreground">
+          If your organization restricts user consent, ask your Microsoft 365
+          admin to approve {BRAND_NAME} and then reconnect your account.
+        </TypographyP>
+      )}
+      {!isMicrosoft && (
+        <TypographyP className="mx-auto mt-3 max-w-prose text-center text-muted-foreground">
+          Reconnect your account and approve every requested permission.
+        </TypographyP>
+      )}
 
       <Button
         className="mt-4"
@@ -49,6 +64,14 @@ export default function PermissionsConsentPage() {
       >
         Reconnect account
       </Button>
+
+      <p className="mt-8 text-center text-muted-foreground">
+        Having trouble?{" "}
+        <Link href="/logout" className="underline hover:text-primary">
+          Sign out
+        </Link>{" "}
+        and sign back in again.
+      </p>
 
       <div className="mt-8">
         <Image

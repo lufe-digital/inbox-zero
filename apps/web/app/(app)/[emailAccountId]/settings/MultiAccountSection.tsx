@@ -9,9 +9,9 @@ import { usePostHog } from "posthog-js/react";
 import { CrownIcon } from "lucide-react";
 import { capitalCase } from "capital-case";
 import { Button } from "@/components/ui/button";
-import { FormSection, FormSectionLeft } from "@/components/Form";
 import { Input } from "@/components/Input";
 import { LoadingContent } from "@/components/LoadingContent";
+import { SettingsSection } from "@/components/SettingsSection";
 import {
   saveMultiAccountPremiumBody,
   type SaveMultiAccountPremiumBody,
@@ -63,22 +63,23 @@ export function MultiAccountSection() {
   if (
     isPremium &&
     !isAdminForPremium(data?.admins || [], session?.user.id || "")
-  )
+  ) {
     return null;
+  }
 
   return (
-    <FormSection id="manage-users">
-      <FormSectionLeft
-        title="Manage Team Access"
-        description="Grant premium access to additional email accounts. Additional members are billed to your subscription. Each account maintains separate email privacy."
-      />
-
+    <SettingsSection
+      id="manage-users"
+      title="Manage Team Access"
+      description="Grant premium access to additional email accounts. Additional members are billed to your subscription. Each account maintains separate email privacy."
+      className="space-y-4"
+    >
       <LoadingContent loading={isLoadingPremium} error={errorPremium}>
         {isPremium ? (
           <LoadingContent loading={isLoading} error={error}>
             {data && (
               <div>
-                {!data?.admins.length && (
+                {!data.admins.length && (
                   <div className="mb-4">
                     <Button onClick={() => claimPremiumAdmin()}>
                       Claim Admin
@@ -107,18 +108,16 @@ export function MultiAccountSection() {
             )}
           </LoadingContent>
         ) : (
-          <div className="sm:col-span-2">
-            <AlertWithButton
-              title="Upgrade"
-              description="Upgrade to premium to share premium with other email addresses."
-              icon={<CrownIcon className="h-4 w-4" />}
-              button={<Button onClick={openModal}>Upgrade</Button>}
-            />
-            <PremiumModal />
-          </div>
+          <AlertWithButton
+            title="Upgrade"
+            description="Upgrade to premium to share premium with other email addresses."
+            icon={<CrownIcon className="h-4 w-4" />}
+            button={<Button onClick={openModal}>Upgrade</Button>}
+          />
         )}
       </LoadingContent>
-    </FormSection>
+      <PremiumModal />
+    </SettingsSection>
   );
 }
 
@@ -129,12 +128,14 @@ function MultiAccountForm({
   pendingInvites,
   onUpdate,
 }: {
-  emailAddresses: { email: string }[];
+  emailAddresses: { email: string; isOwnAccount: boolean }[];
   isLifetime: boolean;
   emailAccountsAccess: number;
   pendingInvites: string[];
   onUpdate?: () => void;
 }) {
+  const teamAccounts = emailAddresses.filter((e) => !e.isOwnAccount);
+
   const {
     register,
     handleSubmit,
@@ -143,19 +144,17 @@ function MultiAccountForm({
   } = useForm<SaveMultiAccountPremiumBody>({
     resolver: zodResolver(saveMultiAccountPremiumBody),
     defaultValues: {
-      emailAddresses: emailAddresses?.length
-        ? (() => {
-            // Deduplicate to prevent showing the same email twice
-            const existingEmails = new Set(emailAddresses.map((e) => e.email));
-            const uniquePendingInvites = pendingInvites.filter(
-              (email) => !existingEmails.has(email),
-            );
-            return [
-              ...emailAddresses,
-              ...uniquePendingInvites.map((email) => ({ email })),
-            ];
-          })()
-        : [{ email: "" }],
+      emailAddresses: (() => {
+        const existingEmails = new Set(teamAccounts.map((e) => e.email));
+        const uniquePendingInvites = pendingInvites.filter(
+          (email) => !existingEmails.has(email),
+        );
+        const initialEmails = [
+          ...teamAccounts.map((e) => ({ email: e.email })),
+          ...uniquePendingInvites.map((email) => ({ email })),
+        ];
+        return initialEmails.length ? initialEmails : [{ email: "" }];
+      })(),
     },
   });
 
@@ -187,10 +186,8 @@ function MultiAccountForm({
 
   const onSubmit: SubmitHandler<SaveMultiAccountPremiumBody> = useCallback(
     async (data) => {
-      if (!data.emailAddresses) return;
-      if (needsToPurchaseMoreSeats) return;
+      if (!data.emailAddresses || needsToPurchaseMoreSeats) return;
 
-      // Filter out empty email strings
       const emails = data.emailAddresses
         .map((e) => e.email.trim())
         .filter((email) => email.length > 0);
@@ -202,30 +199,26 @@ function MultiAccountForm({
   return (
     <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
       <div className="space-y-2">
-        {fields.map((f, i) => {
-          return (
-            <div key={f.id}>
-              <Input
-                type="text"
-                name={`rules.${i}.instructions`}
-                registerProps={register(`emailAddresses.${i}.email`)}
-                error={errors.emailAddresses?.[i]?.email}
-                onClickAdd={() => {
-                  append({ email: "" });
-                  posthog.capture("Clicked Add User");
-                }}
-                onClickRemove={() => {
-                  remove(i);
-                  posthog.capture("Clicked Remove User");
-                  // If this was the last field, add an empty one so the form isn't completely empty
-                  if (fields.length === 1) {
-                    append({ email: "" });
-                  }
-                }}
-              />
-            </div>
-          );
-        })}
+        {fields.map((field, i) => (
+          <Input
+            key={field.id}
+            type="text"
+            name={`emailAddresses.${i}.email`}
+            registerProps={register(`emailAddresses.${i}.email`)}
+            error={errors.emailAddresses?.[i]?.email}
+            onClickAdd={() => {
+              append({ email: "" });
+              posthog.capture("Clicked Add User");
+            }}
+            onClickRemove={() => {
+              remove(i);
+              posthog.capture("Clicked Remove User");
+              if (fields.length === 1) {
+                append({ email: "" });
+              }
+            }}
+          />
+        ))}
       </div>
 
       <Button type="submit" loading={isExecuting}>

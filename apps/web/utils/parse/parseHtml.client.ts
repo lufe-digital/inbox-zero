@@ -1,5 +1,9 @@
 import { containsCtaKeyword } from "@/utils/parse/cta";
-import { containsUnsubscribeKeyword } from "@/utils/parse/unsubscribe";
+import {
+  cleanUnsubscribeLink,
+  containsUnsubscribeKeyword,
+  containsUnsubscribeUrlPattern,
+} from "@/utils/parse/unsubscribe";
 
 // very similar to apps/web/utils/parse/parseHtml.server.ts
 export function findUnsubscribeLink(html?: string | null): string | undefined {
@@ -15,7 +19,13 @@ export function findUnsubscribeLink(html?: string | null): string | undefined {
     const text = element.textContent?.toLowerCase() ?? "";
     if (containsUnsubscribeKeyword(text)) {
       unsubscribeLink = element.getAttribute("href") ?? undefined;
-      return;
+      break;
+    }
+
+    const href = element.getAttribute("href") ?? "";
+    if (containsUnsubscribeUrlPattern(href)) {
+      unsubscribeLink = href;
+      break;
     }
   }
 
@@ -98,10 +108,4 @@ export function isMarketingEmail(html: string) {
   }
 }
 
-export function cleanUnsubscribeLink(unsubscribeLink?: string) {
-  // remove < > from start and end of unsubscribeLink
-  let cleanedLink = unsubscribeLink;
-  if (cleanedLink?.startsWith("<")) cleanedLink = cleanedLink.slice(1);
-  if (cleanedLink?.endsWith(">")) cleanedLink = cleanedLink.slice(0, -1);
-  return cleanedLink;
-}
+export { cleanUnsubscribeLink };

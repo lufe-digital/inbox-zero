@@ -2,18 +2,37 @@ import { z } from "zod";
 import {
   ActionType,
   CategoryFilterType,
+  DraftReplyConfidence,
   LogicalOperator,
   SystemType,
 } from "@/generated/prisma/enums";
 import { ConditionType } from "@/utils/config";
 import { NINETY_DAYS_MINUTES } from "@/utils/date";
 import { validateLabelNameBasic } from "@/utils/gmail/label-validation";
+import { addMissingRecipientIssue } from "@/utils/rule/recipient-validation";
 
 export const delayInMinutesSchema = z
   .number()
   .min(1, "Minimum supported delay is 1 minute")
   .max(NINETY_DAYS_MINUTES, "Maximum supported delay is 90 days")
   .nullish();
+
+export const updateRuleConditionSchema = z.object({
+  ruleName: z.string().describe("The name of the rule to update"),
+  condition: z.object({
+    aiInstructions: z.string().optional(),
+    static: z
+      .object({
+        from: z.string().nullish(),
+        to: z.string().nullish(),
+        subject: z.string().nullish(),
+      })
+      .nullish(),
+    conditionalOperator: z
+      .enum([LogicalOperator.AND, LogicalOperator.OR])
+      .nullish(),
+  }),
+});
 
 const zodActionType = z.enum([
   ActionType.ARCHIVE,
@@ -34,8 +53,8 @@ const zodConditionType = z.enum([ConditionType.AI, ConditionType.STATIC]);
 
 const zodSystemRule = z.enum([
   SystemType.TO_REPLY,
-  SystemType.FYI,
   SystemType.AWAITING_REPLY,
+  SystemType.FYI,
   SystemType.ACTIONED,
   SystemType.COLD_EMAIL,
   SystemType.NEWSLETTER,
@@ -113,13 +132,16 @@ const zodAction = z
       }
     }
 
-    if (data.type === ActionType.FORWARD && !data.to?.value?.trim()) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "Please enter an email address to forward to",
-        path: ["to"],
-      });
-    }
+    addRecipientRequirementIssue({
+      actionType: data.type,
+      recipient: data.to?.value,
+      ctx,
+      path: ["to"],
+      forwardMessage: "Please enter an email address to forward to",
+      sendEmailMessage:
+        "Please enter an email address to send to. Use Reply for auto-responses.",
+    });
+
     if (data.type === ActionType.CALL_WEBHOOK && !data.url?.value?.trim()) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -230,6 +252,13 @@ export type EnableMultiRuleSelectionBody = z.infer<
   typeof enableMultiRuleSelectionBody
 >;
 
+export const updateDraftReplyConfidenceBody = z.object({
+  confidence: z.nativeEnum(DraftReplyConfidence),
+});
+export type UpdateDraftReplyConfidenceBody = z.infer<
+  typeof updateDraftReplyConfidenceBody
+>;
+
 const categoryAction = z.enum([
   "label",
   "label_archive",
@@ -317,13 +346,15 @@ const importedAction = z
       }
     }
 
-    if (data.type === ActionType.FORWARD && !data.to?.trim()) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "Forward action requires a recipient email address",
-        path: ["to"],
-      });
-    }
+    addRecipientRequirementIssue({
+      actionType: data.type,
+      recipient: data.to,
+      ctx,
+      path: ["to"],
+      forwardMessage: "Forward action requires a recipient email address",
+      sendEmailMessage:
+        "Send email action requires a recipient email address. Use Reply for auto-responses.",
+    });
 
     if (data.type === ActionType.CALL_WEBHOOK && !data.url?.trim()) {
       ctx.addIssue({
@@ -383,3 +414,28 @@ export const importRulesBody = z.object({
 });
 export type ImportRulesBody = z.infer<typeof importRulesBody>;
 export type ImportedRule = z.infer<typeof importedRule>;
+
+function addRecipientRequirementIssue({
+  actionType,
+  recipient,
+  ctx,
+  path,
+  forwardMessage,
+  sendEmailMessage,
+}: {
+  actionType: ActionType;
+  recipient: string | null | undefined;
+  ctx: z.RefinementCtx;
+  path: (string | number)[];
+  forwardMessage: string;
+  sendEmailMessage: string;
+}) {
+  addMissingRecipientIssue({
+    actionType,
+    recipient,
+    ctx,
+    path,
+    forwardMessage,
+    sendEmailMessage,
+  });
+}

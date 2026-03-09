@@ -30,10 +30,10 @@ import {
 import { isGoogleProvider } from "@/utils/email/provider-types";
 
 interface NavigationItem {
-  name: string;
   href: string;
   icon: LucideIcon;
   keywords?: string[];
+  name: string;
 }
 
 function useNavigationItems(): NavigationItem[] {
@@ -56,16 +56,6 @@ function useNavigationItems(): NavigationItem[] {
         icon: MailsIcon,
         keywords: ["unsubscribe", "newsletters", "spam"],
       },
-      ...(isGoogleProvider(provider) && showCleaner
-        ? [
-            {
-              name: "Deep Clean",
-              href: prefixPath(emailAccountId, "/clean"),
-              icon: BrushIcon,
-              keywords: ["clean", "organize", "tidy"],
-            },
-          ]
-        : []),
       {
         name: "Analytics",
         href: prefixPath(emailAccountId, "/stats"),
@@ -95,6 +85,16 @@ function useNavigationItems(): NavigationItem[] {
               href: prefixPath(emailAccountId, "/briefs"),
               icon: FileTextIcon,
               keywords: ["briefs", "meeting", "summaries"],
+            },
+          ]
+        : []),
+      ...(isGoogleProvider(provider) && showCleaner
+        ? [
+            {
+              name: "Deep Clean",
+              href: prefixPath(emailAccountId, "/clean"),
+              icon: BrushIcon,
+              keywords: ["clean", "organize", "tidy"],
             },
           ]
         : []),
@@ -144,7 +144,7 @@ export function useCommandPaletteCommands() {
         section: "settings",
         priority: 1,
         keywords: ["settings", "preferences", "configuration"],
-        action: () => router.push(prefixPath(emailAccountId, "/settings")),
+        action: () => router.push("/settings"),
       },
       {
         id: "settings-assistant",

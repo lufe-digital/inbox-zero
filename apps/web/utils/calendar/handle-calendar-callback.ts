@@ -1,18 +1,19 @@
-import type { NextRequest, NextResponse } from "next/server";
+import { NextResponse, type NextRequest } from "next/server";
 import { env } from "@/env";
 import type { Logger } from "@/utils/logger";
 import type { CalendarOAuthProvider } from "./oauth-types";
 import {
   validateOAuthCallback,
-  parseAndValidateCalendarState,
   buildCalendarRedirectUrl,
-  verifyEmailAccountAccess,
   checkExistingConnection,
   createCalendarConnection,
+} from "./oauth-callback-helpers";
+import {
+  RedirectError,
   redirectWithMessage,
   redirectWithError,
-  RedirectError,
-} from "./oauth-callback-helpers";
+} from "@/utils/oauth/redirect";
+import { verifyEmailAccountAccess } from "@/utils/oauth/verify";
 import {
   acquireOAuthCodeLock,
   getOAuthCodeResult,
@@ -33,7 +34,7 @@ export async function handleCalendarCallback(
 
   try {
     // Step 1: Validate OAuth callback parameters
-    const { code, redirectUrl, response } = await validateOAuthCallback(
+    const { code, response, calendarState } = await validateOAuthCallback(
       request,
       logger,
     );
@@ -67,21 +68,7 @@ export async function handleCalendarCallback(
       );
     }
 
-    // The validated state is in the request query params (already validated by validateOAuthCallback)
-    const receivedState = request.nextUrl.searchParams.get("state");
-    if (!receivedState) {
-      throw new Error("Missing validated state");
-    }
-
-    // Step 2: Parse and validate the OAuth state
-    const decodedState = parseAndValidateCalendarState(
-      receivedState,
-      logger,
-      redirectUrl,
-      response.headers,
-    );
-
-    const { emailAccountId } = decodedState;
+    const { emailAccountId } = calendarState;
 
     // Step 3: Update redirect URL to include emailAccountId
     const finalRedirectUrl = buildCalendarRedirectUrl(emailAccountId);
@@ -163,6 +150,12 @@ export async function handleCalendarCallback(
     }
     // Handle redirect errors
     if (error instanceof RedirectError) {
+      if (error.redirectUrl.searchParams.get("error")) {
+        return NextResponse.redirect(error.redirectUrl, {
+          headers: error.responseHeaders,
+        });
+      }
+
       return redirectWithError(
         error.redirectUrl,
         "connection_failed",

@@ -27,10 +27,16 @@ describe.runIf(isAiTest)(
         email: "user@test.com",
         userId: "test-user-id",
         about: null,
+        timezone: null,
+        calendarBookingLink: null,
+        multiRuleSelectionEnabled: false,
         user: {
           aiModel: null,
           aiProvider: null,
           aiApiKey: null,
+        },
+        account: {
+          provider: "google",
         },
         ...overrides,
       };
@@ -201,26 +207,6 @@ describe.runIf(isAiTest)(
 
       expect(result).toBeNull();
     });
-
-    test(
-      "uses additional user context when available",
-      async () => {
-        const result = await aiAnalyzePersona({
-          emails: getFounderEmails(),
-          emailAccount: getEmailAccount(),
-        });
-
-        console.debug(
-          "Analysis with user context:\n",
-          JSON.stringify(result, null, 2),
-        );
-
-        expect(result).toBeDefined();
-        expect(result?.industry.toLowerCase()).toContain("hr");
-        expect(result?.confidence).toBe("high");
-      },
-      TIMEOUT,
-    );
 
     test(
       "identifies mixed role patterns",

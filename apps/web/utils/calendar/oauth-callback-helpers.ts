@@ -4,7 +4,6 @@ import { z } from "zod";
 import prisma from "@/utils/prisma";
 import { CALENDAR_STATE_COOKIE_NAME } from "@/utils/calendar/constants";
 import { parseOAuthState } from "@/utils/oauth/state";
-import { auth } from "@/utils/auth";
 import { prefixPath } from "@/utils/path";
 import { env } from "@/env";
 import type { Logger } from "@/utils/logger";
@@ -12,6 +11,8 @@ import type {
   OAuthCallbackValidation,
   CalendarOAuthState,
 } from "./oauth-types";
+
+import { RedirectError } from "@/utils/oauth/redirect";
 
 const calendarOAuthStateSchema = z.object({
   emailAccountId: z.string().min(1).max(64),
@@ -28,13 +29,56 @@ export async function validateOAuthCallback(
 ): Promise<OAuthCallbackValidation> {
   const searchParams = request.nextUrl.searchParams;
   const code = searchParams.get("code");
+  const oauthError = searchParams.get("error");
+  const errorDescription = searchParams.get("error_description");
+  const errorSubcode = searchParams.get("error_subcode");
   const receivedState = searchParams.get("state");
   const storedState = request.cookies.get(CALENDAR_STATE_COOKIE_NAME)?.value;
 
-  const redirectUrl = new URL("/calendars", env.NEXT_PUBLIC_BASE_URL);
-  const response = NextResponse.redirect(redirectUrl);
+  const baseRedirectUrl = new URL("/calendars", env.NEXT_PUBLIC_BASE_URL);
+  const response = NextResponse.redirect(baseRedirectUrl);
 
   response.cookies.delete(CALENDAR_STATE_COOKIE_NAME);
+
+  if (!storedState || !receivedState || storedState !== receivedState) {
+    logger.warn("Invalid state during calendar callback", {
+      receivedState,
+      hasStoredState: !!storedState,
+    });
+    baseRedirectUrl.searchParams.set("error", "invalid_state");
+    throw new RedirectError(baseRedirectUrl, response.headers);
+  }
+
+  const calendarState = parseAndValidateCalendarState(
+    receivedState,
+    logger,
+    baseRedirectUrl,
+    response.headers,
+  );
+
+  const redirectUrl = buildCalendarRedirectUrl(calendarState.emailAccountId);
+
+  if (oauthError) {
+    const aadstsCode = extractAadstsCode(errorDescription);
+    const mappedError = mapCalendarOAuthError({
+      oauthError,
+      errorSubcode,
+      aadstsCode,
+    });
+
+    logger.warn("OAuth error in calendar callback", {
+      oauthError,
+      errorSubcode,
+      aadstsCode,
+    });
+
+    redirectUrl.searchParams.set("error", mappedError);
+    const safeErrorDescription = getSafeOAuthErrorDescription(errorDescription);
+    if (safeErrorDescription) {
+      redirectUrl.searchParams.set("error_description", safeErrorDescription);
+    }
+    throw new RedirectError(redirectUrl, response.headers);
+  }
 
   if (!code || code.length < 10) {
     logger.warn("Missing or invalid code in calendar callback");
@@ -42,16 +86,7 @@ export async function validateOAuthCallback(
     throw new RedirectError(redirectUrl, response.headers);
   }
 
-  if (!storedState || !receivedState || storedState !== receivedState) {
-    logger.warn("Invalid state during calendar callback", {
-      receivedState,
-      hasStoredState: !!storedState,
-    });
-    redirectUrl.searchParams.set("error", "invalid_state");
-    throw new RedirectError(redirectUrl, response.headers);
-  }
-
-  return { code, redirectUrl, response };
+  return { code, redirectUrl, response, calendarState };
 }
 
 /**
@@ -95,40 +130,6 @@ export function buildCalendarRedirectUrl(emailAccountId: string): URL {
 }
 
 /**
- * Verify user owns the email account
- */
-export async function verifyEmailAccountAccess(
-  emailAccountId: string,
-  logger: Logger,
-  redirectUrl: URL,
-  responseHeaders: Headers,
-): Promise<void> {
-  const session = await auth();
-  if (!session?.user?.id) {
-    logger.warn("Unauthorized calendar callback - no session");
-    redirectUrl.searchParams.set("error", "unauthorized");
-    throw new RedirectError(redirectUrl, responseHeaders);
-  }
-
-  const emailAccount = await prisma.emailAccount.findFirst({
-    where: {
-      id: emailAccountId,
-      userId: session.user.id,
-    },
-    select: { id: true },
-  });
-
-  if (!emailAccount) {
-    logger.warn("Unauthorized calendar callback - invalid email account", {
-      emailAccountId,
-      userId: session.user.id,
-    });
-    redirectUrl.searchParams.set("error", "forbidden");
-    throw new RedirectError(redirectUrl, responseHeaders);
-  }
-}
-
-/**
  * Check if calendar connection already exists
  */
 export async function checkExistingConnection(
@@ -169,41 +170,45 @@ export async function createCalendarConnection(params: {
   });
 }
 
-/**
- * Redirect with success message
- */
-export function redirectWithMessage(
-  redirectUrl: URL,
-  message: string,
-  responseHeaders: Headers,
-): NextResponse {
-  redirectUrl.searchParams.set("message", message);
-  return NextResponse.redirect(redirectUrl, { headers: responseHeaders });
+export function extractAadstsCode(
+  errorDescription: string | null,
+): string | null {
+  if (!errorDescription) return null;
+  const match = errorDescription.match(/AADSTS\d+/);
+  return match ? match[0] : null;
 }
 
-/**
- * Redirect with error message
- */
-export function redirectWithError(
-  redirectUrl: URL,
-  error: string,
-  responseHeaders: Headers,
-): NextResponse {
-  redirectUrl.searchParams.set("error", error);
-  return NextResponse.redirect(redirectUrl, { headers: responseHeaders });
-}
-
-/**
- * Custom error class for redirect responses
- */
-export class RedirectError extends Error {
-  redirectUrl: URL;
-  responseHeaders: Headers;
-
-  constructor(redirectUrl: URL, responseHeaders: Headers) {
-    super("Redirect required");
-    this.name = "RedirectError";
-    this.redirectUrl = redirectUrl;
-    this.responseHeaders = responseHeaders;
+export function mapCalendarOAuthError(params: {
+  oauthError: string;
+  errorSubcode: string | null;
+  aadstsCode: string | null;
+}): string {
+  if (params.aadstsCode === "AADSTS65004") {
+    return "consent_declined";
   }
+
+  if (params.aadstsCode === "AADSTS65001") {
+    return "admin_consent_required";
+  }
+
+  if (
+    params.oauthError === "access_denied" &&
+    params.errorSubcode === "cancel"
+  ) {
+    return "consent_declined";
+  }
+
+  if (params.oauthError === "access_denied") {
+    return "access_denied";
+  }
+
+  return "oauth_error";
+}
+
+export function getSafeOAuthErrorDescription(
+  errorDescription: string | null,
+): string | null {
+  const aadstsCode = extractAadstsCode(errorDescription);
+  if (!aadstsCode) return null;
+  return `Microsoft error ${aadstsCode}.`;
 }

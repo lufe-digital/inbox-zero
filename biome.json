@@ -1,5 +1,5 @@
 {
-  "$schema": "https://biomejs.dev/schemas/2.2.2/schema.json",
+  "$schema": "https://biomejs.dev/schemas/2.4.2/schema.json",
   "linter": {
     "enabled": true,
     "rules": {
@@ -20,7 +20,8 @@
         "useDefaultSwitchClause": "off",
         "useCollapsedElseIf": "off",
         "useConsistentObjectDefinitions": "off",
-        "noMagicNumbers": "off"
+        "noMagicNumbers": "off",
+        "useConsistentTypeDefinitions": "off"
       },
       "suspicious": {
         "noConsole": "warn",
@@ -46,9 +47,6 @@
       "nursery": {
         "useSortedClasses": "off",
         "noShadow": "off",
-        "noUselessUndefined": "off",
-        "useMaxParams": "off",
-        "useConsistentTypeDefinitions": "off",
         "noUnnecessaryConditions": "off"
       },
       "performance": {
@@ -104,7 +102,8 @@
       "!.turbo",
       "!.next",
       "!sw.js",
-      "!.vscode"
+      "!.vscode",
+      "!.claude"
     ]
   },
   "assist": {
@@ -121,7 +120,6 @@
         "**/__tests__/**",
         "**/*.test.*",
         "**/*.spec.*",
-        "apps/unsubscriber/**",
         "packages/**",
         "**/*.tsx",
         "**/scripts/**"
@@ -135,5 +133,5 @@
       }
     }
   ],
-  "extends": ["ultracite"]
+  "extends": ["ultracite/core", "ultracite/next"]
 }

@@ -3,7 +3,6 @@
 import Link from "next/link";
 import {
   ChevronsUpDownIcon,
-  BarChartIcon,
   MessageCircleReplyIcon,
   ShieldCheckIcon,
   RibbonIcon,
@@ -32,7 +31,6 @@ import { SidebarMenuButton } from "@/components/ui/sidebar";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { EXTENSION_URL } from "@/utils/config";
 import { useUser } from "@/hooks/useUser";
-import { isOrganizationAdmin } from "@/utils/organizations/roles";
 import { env } from "@/env";
 
 export function NavUser() {
@@ -46,7 +44,6 @@ export function NavUser() {
       (member) => member.emailAccountId === currentEmailAccountId,
     ) || [];
   const hasOrganization = currentEmailAccountMembers.length > 0;
-  const isOrgAdmin = isOrganizationAdmin(currentEmailAccountMembers);
   const organizationName = currentEmailAccountMembers[0]?.organization?.name;
 
   return (
@@ -118,7 +115,7 @@ export function NavUser() {
               </Link>
             </DropdownMenuItem>
           )}
-          {hasOrganization && isOrgAdmin && (
+          {hasOrganization && (
             <DropdownMenuItem asChild>
               <Link href={prefixPath(currentEmailAccountId, "/organization")}>
                 <Building2Icon className="mr-2 size-4" />
@@ -170,13 +167,6 @@ export function NavUser() {
               </DropdownMenuItem>
             </>
           )}
-          <DropdownMenuItem asChild>
-            <Link href={prefixPath(currentEmailAccountId, "/usage")}>
-              <BarChartIcon className="mr-2 size-4" />
-              Usage
-            </Link>
-          </DropdownMenuItem>
-
           {!env.NEXT_PUBLIC_BYPASS_PREMIUM_CHECKS && (
             <DropdownMenuItem asChild>
               <Link href="/premium">

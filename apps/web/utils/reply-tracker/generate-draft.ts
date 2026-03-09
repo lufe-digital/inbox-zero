@@ -1,9 +1,10 @@
 import type { ParsedMessage } from "@/utils/types";
-import { internalDateToDate } from "@/utils/date";
+import { escapeHtml } from "@/utils/string";
+import { internalDateToDate, sortByInternalDate } from "@/utils/date";
 import { getEmailForLLM } from "@/utils/get-email-from-message";
 import { extractEmailAddress, extractEmailAddresses } from "@/utils/email";
-import { aiDraftWithKnowledge } from "@/utils/ai/reply/draft-with-knowledge";
-import { getReply, saveReply } from "@/utils/redis/reply";
+import { aiDraftReplyWithConfidence } from "@/utils/ai/reply/draft-reply";
+import { getReplyWithConfidence, saveReply } from "@/utils/redis/reply";
 import { getWritingStyle } from "@/utils/user/get";
 import type { EmailAccountWithAI } from "@/utils/llms/types";
 import type { Logger } from "@/utils/logger";
@@ -22,6 +23,13 @@ import {
   getMeetingContext,
   formatMeetingContextForPrompt,
 } from "@/utils/meeting-briefs/recipient-context";
+import { DraftReplyConfidence } from "@/generated/prisma/enums";
+import { meetsDraftReplyConfidenceRequirement } from "@/utils/ai/reply/draft-confidence";
+
+export type DraftGenerationResult = {
+  draft: string | null;
+  confidence: DraftReplyConfidence;
+};
 
 /**
  * Fetches thread messages and generates draft content in one step
@@ -33,20 +41,45 @@ export async function fetchMessagesAndGenerateDraft(
   testMessage: ParsedMessage | undefined,
   logger: Logger,
 ): Promise<string> {
+  const result = await fetchMessagesAndGenerateDraftWithConfidenceThreshold(
+    emailAccount,
+    threadId,
+    client,
+    testMessage,
+    logger,
+    DraftReplyConfidence.ALL_EMAILS,
+  );
+
+  if (result.draft == null) {
+    throw new Error("Draft generation did not return content");
+  }
+
+  return result.draft;
+}
+
+export async function fetchMessagesAndGenerateDraftWithConfidenceThreshold(
+  emailAccount: EmailAccountWithAI,
+  threadId: string,
+  client: EmailProvider,
+  testMessage: ParsedMessage | undefined,
+  logger: Logger,
+  minimumConfidence: DraftReplyConfidence,
+): Promise<DraftGenerationResult> {
   const { threadMessages, previousConversationMessages } = testMessage
     ? { threadMessages: [testMessage], previousConversationMessages: null }
     : await fetchThreadAndConversationMessages(threadId, client);
 
-  const result = await generateDraftContent(
+  const { draft, confidence } = await generateDraftContent(
     emailAccount,
     threadMessages,
     previousConversationMessages,
     client,
     logger,
+    minimumConfidence,
   );
 
-  if (typeof result !== "string") {
-    throw new Error("Draft result is not a string");
+  if (draft == null) {
+    return { draft: null, confidence };
   }
 
   const emailAccountWithSignatures = await prisma.emailAccount.findUnique({
@@ -57,7 +90,10 @@ export async function fetchMessagesAndGenerateDraft(
     },
   });
 
-  let finalResult = result;
+  // Escape AI-generated content to prevent prompt injection attacks
+  // (e.g., hidden divs with sensitive data that could be leaked)
+  // Signatures and other trusted HTML are added AFTER escaping
+  let finalResult = escapeHtml(draft);
 
   if (
     !env.NEXT_PUBLIC_DISABLE_REFERRAL_SIGNATURE &&
@@ -75,7 +111,7 @@ export async function fetchMessagesAndGenerateDraft(
     finalResult = `${finalResult}\n\n${emailAccountWithSignatures.signature}`;
   }
 
-  return finalResult;
+  return { draft: finalResult, confidence };
 }
 
 /**
@@ -88,7 +124,11 @@ async function fetchThreadAndConversationMessages(
   threadMessages: ParsedMessage[];
   previousConversationMessages: ParsedMessage[] | null;
 }> {
-  const threadMessages = await client.getThreadMessages(threadId);
+  // Normalize provider-specific ordering (Outlook returns newest-first).
+  // Downstream drafting logic expects chronological order (oldest -> newest).
+  const threadMessages = (await client.getThreadMessages(threadId)).sort(
+    sortByInternalDate("asc"),
+  );
   const previousConversationMessages =
     await client.getPreviousConversationMessages(
       threadMessages.map((msg) => msg.id),
@@ -106,18 +146,34 @@ async function generateDraftContent(
   previousConversationMessages: ParsedMessage[] | null,
   emailProvider: EmailProvider,
   logger: Logger,
-) {
+  minimumConfidence: DraftReplyConfidence,
+): Promise<DraftGenerationResult> {
   const lastMessage = threadMessages.at(-1);
 
   if (!lastMessage) throw new Error("No message provided");
 
-  // Check Redis cache for reply
-  const reply = await getReply({
+  const cachedReply = await getReplyWithConfidence({
     emailAccountId: emailAccount.id,
     messageId: lastMessage.id,
   });
 
-  if (reply) return reply;
+  if (cachedReply) {
+    const meetsThreshold = meetsDraftReplyConfidenceRequirement({
+      draftConfidence: cachedReply.confidence,
+      minimumConfidence,
+    });
+
+    if (meetsThreshold) {
+      return { draft: cachedReply.reply, confidence: cachedReply.confidence };
+    }
+
+    logger.info("Skipping cached draft due to low confidence", {
+      draftConfidence: cachedReply.confidence,
+      minimumConfidence,
+      threadId: lastMessage.threadId,
+      messageId: lastMessage.id,
+    });
+  }
 
   const messages = threadMessages.map((msg, index) => ({
     date: internalDateToDate(msg.internalDate),
@@ -203,13 +259,8 @@ async function generateDraftContent(
       })
     : null;
 
-  // 3. Draft with extracted knowledge
-  const meetingContext = formatMeetingContextForPrompt(
-    upcomingMeetings,
-    emailAccount.timezone,
-  );
-
-  const text = await aiDraftWithKnowledge({
+  // 3. Draft reply
+  const { reply, confidence } = await aiDraftReplyWithConfidence({
     messages,
     emailAccount,
     knowledgeBaseContent: knowledgeResult?.relevantContent || null,
@@ -218,16 +269,53 @@ async function generateDraftContent(
     calendarAvailability,
     writingStyle,
     mcpContext: mcpResult?.response || null,
-    meetingContext,
+    meetingContext: formatMeetingContextForPrompt(
+      upcomingMeetings,
+      emailAccount.timezone,
+    ),
   });
 
-  if (typeof text === "string") {
+  if (
+    !meetsDraftReplyConfidenceRequirement({
+      draftConfidence: confidence,
+      minimumConfidence,
+    })
+  ) {
+    logger.info("Skipping draft due to low confidence", {
+      draftConfidence: confidence,
+      minimumConfidence,
+      threadId: lastMessage.threadId,
+      messageId: lastMessage.id,
+    });
+
+    if (typeof reply === "string") {
+      try {
+        await saveReply({
+          emailAccountId: emailAccount.id,
+          messageId: lastMessage.id,
+          reply,
+          confidence,
+        });
+      } catch (error) {
+        logger.error("Failed to cache low-confidence draft", {
+          error,
+          messageId: lastMessage.id,
+          confidence,
+        });
+      }
+    }
+
+    return { draft: null, confidence };
+  }
+
+  if (typeof reply === "string") {
     await saveReply({
       emailAccountId: emailAccount.id,
       messageId: lastMessage.id,
-      reply: text,
+      reply,
+      confidence,
     });
   }
 
-  return text;
+  return { draft: reply, confidence };
 }

@@ -9,21 +9,52 @@ import prisma from "@/utils/prisma";
 import type { Prisma } from "@/generated/prisma/client";
 import { convertToUIMessages } from "@/components/assistant-chat/helpers";
 import { captureException } from "@/utils/error";
+import { recordChatEntry } from "@/utils/replay/recorder";
 import { messageContextSchema } from "@/app/api/chat/validation";
+import {
+  shouldCompact,
+  compactMessages,
+  extractMemories,
+  RECENT_MESSAGES_TO_KEEP,
+} from "@/utils/ai/assistant/compact";
+import { getInboxStatsForChatContext } from "@/utils/ai/assistant/get-inbox-stats-for-chat-context";
+import { formatUtcDate } from "@/utils/date";
+import { mapUiMessagesToChatMessageRows } from "@/app/api/chat/chat-message-persistence";
 
 export const maxDuration = 120;
 
 const textPartSchema = z.object({
+  type: z.literal("text"),
   text: z.string().min(1).max(3000),
-  type: z.enum(["text"]),
 });
+
+const filePartSchema = z.object({
+  type: z.literal("file"),
+  url: z
+    .string()
+    .max(6_000_000)
+    .refine((url) => /^data:image\/(jpeg|png|webp|gif);base64,/.test(url), {
+      message: "URL must be a base64 data URL with an allowed image MIME type",
+    }),
+  filename: z.string().optional(),
+  mediaType: z.enum(["image/jpeg", "image/png", "image/webp", "image/gif"]),
+});
+
+const messagePartSchema = z.discriminatedUnion("type", [
+  textPartSchema,
+  filePartSchema,
+]);
 
 const assistantInputSchema = z.object({
   id: z.string(),
   message: z.object({
     id: z.string(),
     role: z.enum(["user"]),
-    parts: z.array(textPartSchema),
+    parts: z
+      .array(messagePartSchema)
+      .refine((parts) => parts.filter((p) => p.type === "file").length <= 5, {
+        message: "Maximum 5 file attachments per message",
+      }),
   }),
   context: messageContextSchema.optional(),
 });
@@ -35,13 +66,19 @@ export const POST = withEmailAccount("chat", async (request) => {
 
   if (!user) return NextResponse.json({ error: "Not authenticated" });
 
+  const inboxStatsPromise = getInboxStatsForChatContext({
+    emailAccountId,
+    provider: user.account.provider,
+    logger: request.logger,
+  });
+
   const json = await request.json();
   const { data, error } = assistantInputSchema.safeParse(json);
 
   if (error) return NextResponse.json({ error: error.errors }, { status: 400 });
 
   const chat =
-    (await getChatById(data.id)) ||
+    (await getChatWithCompactions(data.id)) ||
     (await createNewChat({
       emailAccountId,
       chatId: data.id,
@@ -63,7 +100,6 @@ export const POST = withEmailAccount("chat", async (request) => {
   }
 
   const { message, context } = data;
-  const uiMessages = [...convertToUIMessages(chat), message];
 
   await saveChatMessage({
     chat: { connect: { id: chat.id } },
@@ -72,12 +108,133 @@ export const POST = withEmailAccount("chat", async (request) => {
     parts: message.parts,
   });
 
+  const latestCompaction = chat.compactions[0];
+
+  const messagesForModel = latestCompaction
+    ? chat.messages.filter(
+        (m) => m.createdAt >= latestCompaction.compactedBeforeCreatedAt,
+      )
+    : chat.messages;
+
+  const uiMessages = [
+    ...convertToUIMessages({ ...chat, messages: messagesForModel }),
+    message,
+  ];
+
+  let modelMessages = await convertToModelMessages(uiMessages);
+
+  if (latestCompaction) {
+    modelMessages = [
+      {
+        role: "system" as const,
+        content: `Summary of earlier conversation:\n${latestCompaction.summary}`,
+      },
+      ...modelMessages,
+    ];
+  }
+
+  if (shouldCompact(modelMessages)) {
+    try {
+      const preCompactionMessages = modelMessages;
+
+      const { compactedMessages, summary, compactedCount } =
+        await compactMessages({
+          messages: modelMessages,
+          user,
+          logger: request.logger,
+        });
+
+      if (compactedCount > 0 && summary.trim().length > 0) {
+        modelMessages = compactedMessages;
+
+        // Compute boundary: keep at least RECENT_MESSAGES_TO_KEEP DB messages.
+        // messagesForModel doesn't include the new user message (saved after query),
+        // so we keep RECENT_MESSAGES_TO_KEEP from the existing set.
+        const keepFromIndex = Math.max(
+          0,
+          messagesForModel.length - RECENT_MESSAGES_TO_KEEP,
+        );
+        const compactedBeforeCreatedAt =
+          messagesForModel[keepFromIndex]?.createdAt ?? new Date();
+
+        const [, memories] = await Promise.all([
+          prisma.$transaction([
+            prisma.chatCompaction.create({
+              data: {
+                chatId: chat.id,
+                summary,
+                messageCount: compactedCount,
+                compactedBeforeCreatedAt,
+              },
+            }),
+            prisma.chat.update({
+              where: { id: chat.id },
+              data: { compactionCount: { increment: 1 } },
+            }),
+          ]),
+          extractMemories({
+            messages: preCompactionMessages,
+            user,
+          }).catch((err) => {
+            request.logger.error("Failed to extract memories", {
+              error: err,
+            });
+            return [];
+          }),
+        ]);
+
+        if (memories.length > 0) {
+          await prisma.chatMemory.createMany({
+            data: memories.map((m) => ({
+              content: m.content,
+              chatId: chat.id,
+              emailAccountId,
+            })),
+            skipDuplicates: true,
+          });
+        }
+      }
+    } catch (compactionError) {
+      request.logger.error(
+        "Chat compaction failed, continuing with full history",
+        {
+          error: compactionError,
+        },
+      );
+    }
+  }
+
+  let memories: { content: string; date: string }[] = [];
   try {
+    const recentMemories = await prisma.chatMemory.findMany({
+      where: { emailAccountId },
+      orderBy: { createdAt: "desc" },
+      take: 20,
+      select: { content: true, createdAt: true },
+    });
+    memories = recentMemories.map((m) => ({
+      content: m.content,
+      date: formatUtcDate(m.createdAt),
+    }));
+  } catch (error) {
+    request.logger.warn("Failed to load memories for chat", { error });
+  }
+
+  try {
+    const [inboxStats, recordingSession] = await Promise.all([
+      inboxStatsPromise,
+      recordChatEntry(user.email, emailAccountId, data.message),
+    ]);
+
     const result = await aiProcessAssistantChat({
-      messages: convertToModelMessages(uiMessages),
+      messages: modelMessages,
       emailAccountId,
       user,
       context,
+      chatId: chat.id,
+      memories,
+      inboxStats,
+      recordingSession,
       logger: request.logger,
     });
 
@@ -107,7 +264,10 @@ async function createNewChat({
   try {
     const newChat = await prisma.chat.create({
       data: { emailAccountId, id: chatId },
-      include: { messages: true },
+      include: {
+        messages: { orderBy: { createdAt: "asc" } },
+        compactions: { orderBy: { createdAt: "desc" }, take: 1 },
+      },
     });
     logger.info("New chat created", { chatId: newChat.id, emailAccountId });
     return newChat;
@@ -117,12 +277,14 @@ async function createNewChat({
   }
 }
 
-async function getChatById(chatId: string) {
-  const chat = await prisma.chat.findUnique({
+async function getChatWithCompactions(chatId: string) {
+  return prisma.chat.findUnique({
     where: { id: chatId },
-    include: { messages: true },
+    include: {
+      messages: { orderBy: { createdAt: "asc" } },
+      compactions: { orderBy: { createdAt: "desc" }, take: 1 },
+    },
   });
-  return chat;
 }
 
 async function saveChatMessage(message: Prisma.ChatMessageCreateInput) {
@@ -136,11 +298,8 @@ async function saveChatMessages(
 ) {
   try {
     return prisma.chatMessage.createMany({
-      data: messages.map((message) => ({
-        chatId,
-        role: message.role,
-        parts: message.parts as Prisma.InputJsonValue,
-      })),
+      data: mapUiMessagesToChatMessageRows(messages, chatId),
+      skipDuplicates: true,
     });
   } catch (error) {
     logger.error("Failed to save chat messages", { error, chatId });

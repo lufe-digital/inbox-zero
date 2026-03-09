@@ -1,13 +1,17 @@
 import type { gmail_v1 } from "@googleapis/gmail";
-import { GroupItemSource, ActionType } from "@/generated/prisma/enums";
-import { saveLearnedPattern } from "@/utils/rule/learned-patterns";
+import {
+  ActionType,
+  GroupItemSource,
+  GroupItemType,
+  SystemType,
+} from "@/generated/prisma/enums";
 import { extractEmailAddress } from "@/utils/email";
 import type { EmailAccountWithAI } from "@/utils/llms/types";
 import type { EmailProvider } from "@/utils/email/types";
 import { GmailLabel } from "@/utils/gmail/label";
-import { shouldLearnFromLabelRemoval } from "@/utils/rule/consts";
 import type { Logger } from "@/utils/logger";
 import prisma from "@/utils/prisma";
+import { recordLabelRemovalLearning } from "@/utils/rule/record-label-removal-learning";
 import {
   isGmailRateLimitExceededError,
   isGmailQuotaExceededError,
@@ -50,13 +54,16 @@ export async function handleLabelRemovedEvent(
     return;
   }
 
-  // Filter out system labels early - we don't learn from system label removals
+  const hasSpamRemoval = allRemovedLabelIds.includes(GmailLabel.SPAM);
+
+  // Filter out system labels - we don't learn from system label removals
   // (e.g., archiving removes INBOX, starring adds/removes STARRED, etc.)
   const removedLabelIds = allRemovedLabelIds.filter(
     (labelId) => !SYSTEM_LABELS.includes(labelId),
   );
 
-  if (removedLabelIds.length === 0) {
+  // Nothing to process if no SPAM undo needed and no non-system labels removed
+  if (!hasSpamRemoval && removedLabelIds.length === 0) {
     logger.trace("No non-system labels removed, skipping", {
       messageId,
       threadId,
@@ -65,11 +72,14 @@ export async function handleLabelRemovedEvent(
     return;
   }
 
-  logger.info("Processing label removal for learning", {
-    labelCount: removedLabelIds.length,
-    removedLabels: removedLabelIds,
-  });
+  if (removedLabelIds.length > 0) {
+    logger.info("Processing label removal for learning", {
+      labelCount: removedLabelIds.length,
+      removedLabels: removedLabelIds,
+    });
+  }
 
+  // Fetch sender once for both spam undo and label-removal learning
   let sender: string | null = null;
 
   try {
@@ -116,6 +126,13 @@ export async function handleLabelRemovedEvent(
     return;
   }
 
+  // When SPAM label is removed (user moves email out of Junk),
+  // undo any cold email pattern that was learned from marking as junk.
+  // Only removes patterns with source = LABEL_ADDED (preserves AI/USER patterns).
+  if (hasSpamRemoval && sender) {
+    await undoSpamLearning({ sender, emailAccountId, logger });
+  }
+
   for (const labelId of removedLabelIds) {
     try {
       await learnFromRemovedLabel({
@@ -151,13 +168,7 @@ async function learnFromRemovedLabel({
   emailAccountId: string;
   logger: Logger;
 }) {
-  logger = logger.with({ labelId, sender });
-
-  // Can't learn patterns without knowing who to exclude
-  if (!sender) {
-    logger.info("No sender found, skipping learning");
-    return;
-  }
+  logger = logger.with({ labelId });
 
   // Find rule with matching label action
   const rule = await prisma.rule.findFirst({
@@ -174,26 +185,57 @@ async function learnFromRemovedLabel({
     select: { id: true, systemType: true },
   });
 
-  if (!rule?.systemType || !shouldLearnFromLabelRemoval(rule.systemType)) {
-    logger.info("Label removal does not match a learnable system rule", {
-      systemType: rule?.systemType,
-    });
-    return;
-  }
-
-  logger.info("Processing label removal for learning", {
-    systemType: rule.systemType,
-  });
-
-  await saveLearnedPattern({
-    emailAccountId,
-    from: sender,
-    ruleId: rule.id,
-    exclude: true,
-    logger,
+  await recordLabelRemovalLearning({
+    sender,
+    ruleId: rule?.id,
+    systemType: rule?.systemType,
     messageId,
     threadId,
-    reason: "Label removed",
-    source: GroupItemSource.LABEL_REMOVED,
+    emailAccountId,
+    logger,
   });
+}
+
+/**
+ * When the SPAM label is removed (user moves email out of Junk),
+ * delete any cold email GroupItem that was created by the LABEL_ADDED handler.
+ * Only removes patterns we created — preserves AI and USER patterns.
+ */
+async function undoSpamLearning({
+  sender,
+  emailAccountId,
+  logger,
+}: {
+  sender: string;
+  emailAccountId: string;
+  logger: Logger;
+}) {
+  const coldEmailRule = await prisma.rule.findFirst({
+    where: {
+      emailAccountId,
+      systemType: SystemType.COLD_EMAIL,
+      enabled: true,
+    },
+    select: { id: true, groupId: true },
+  });
+
+  if (!coldEmailRule?.groupId) return;
+
+  const deleted = await prisma.groupItem.deleteMany({
+    where: {
+      groupId: coldEmailRule.groupId,
+      type: GroupItemType.FROM,
+      value: sender,
+      source: GroupItemSource.LABEL_ADDED,
+    },
+  });
+
+  if (deleted.count > 0) {
+    logger.trace("Undid cold email learning from spam removal", {
+      sender,
+      deletedCount: deleted.count,
+    });
+  } else {
+    logger.trace("No LABEL_ADDED cold email pattern to undo", { sender });
+  }
 }

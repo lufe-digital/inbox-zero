@@ -1,6 +1,6 @@
-// based on: https://github.com/vercel/platforms/blob/main/lib/auth.ts
-
 import { sso } from "@better-auth/sso";
+import { expo } from "@better-auth/expo";
+import { oAuthProxy } from "better-auth/plugins";
 import { createContact as createLoopsContact } from "@inboxzero/loops";
 import { createContact as createResendContact } from "@inboxzero/resend";
 import type { Account, AuthContext } from "better-auth";
@@ -9,6 +9,11 @@ import { prismaAdapter } from "better-auth/adapters/prisma";
 import { nextCookies } from "better-auth/next-js";
 import { cookies, headers } from "next/headers";
 import { env } from "@/env";
+import { localBypassAuthPlugin } from "@/utils/auth/local-bypass-plugin";
+import {
+  isLocalAuthBypassEnabled,
+  isLocalBypassUserEmail,
+} from "@/utils/auth/local-bypass-config";
 import { trackDubSignUp } from "@/utils/dub";
 import {
   isGoogleProvider,
@@ -19,6 +24,10 @@ import { captureException } from "@/utils/error";
 import { getContactsClient as getGoogleContactsClient } from "@/utils/gmail/client";
 import { SCOPES as GMAIL_SCOPES } from "@/utils/gmail/scopes";
 import { createScopedLogger } from "@/utils/logger";
+import {
+  hasGoogleOauthConfig,
+  hasMicrosoftOauthConfig,
+} from "@/utils/oauth/provider-config";
 import { createOutlookClient } from "@/utils/outlook/client";
 import { SCOPES as OUTLOOK_SCOPES } from "@/utils/outlook/scopes";
 import {
@@ -29,6 +38,44 @@ import { clearSpecificErrorMessages, ErrorType } from "@/utils/error-messages";
 import prisma from "@/utils/prisma";
 
 const logger = createScopedLogger("auth");
+
+const mobileAuthOrigins = env.MOBILE_AUTH_ORIGIN
+  ? [env.MOBILE_AUTH_ORIGIN]
+  : [];
+
+const socialProviders = {
+  ...(hasGoogleOauthConfig()
+    ? {
+        google: {
+          clientId: env.GOOGLE_CLIENT_ID,
+          clientSecret: env.GOOGLE_CLIENT_SECRET,
+          scope: [...GMAIL_SCOPES],
+          accessType: "offline" as const,
+          prompt: "select_account consent" as const,
+          disableIdTokenSignIn: true,
+          // For preview deployments, redirect through staging (which proxies back to preview URL)
+          ...(env.OAUTH_PROXY_URL && {
+            redirectURI: `${env.OAUTH_PROXY_URL}/api/auth/callback/google`,
+          }),
+        },
+      }
+    : {}),
+  ...(hasMicrosoftOauthConfig()
+    ? {
+        microsoft: {
+          clientId: env.MICROSOFT_CLIENT_ID!,
+          clientSecret: env.MICROSOFT_CLIENT_SECRET!,
+          scope: [...OUTLOOK_SCOPES],
+          tenantId: env.MICROSOFT_TENANT_ID,
+          disableIdTokenSignIn: true,
+          // For preview deployments, redirect through staging (which proxies back to preview URL)
+          ...(env.OAUTH_PROXY_URL && {
+            redirectURI: `${env.OAUTH_PROXY_URL}/api/auth/callback/microsoft`,
+          }),
+        },
+      }
+    : {}),
+};
 
 export const betterAuthConfig = betterAuth({
   advanced: {
@@ -50,7 +97,12 @@ export const betterAuthConfig = betterAuth({
     },
   },
   baseURL: env.NEXT_PUBLIC_BASE_URL,
-  trustedOrigins: [env.NEXT_PUBLIC_BASE_URL],
+  trustedOrigins: [
+    env.NEXT_PUBLIC_BASE_URL,
+    ...(env.OAUTH_PROXY_URL ? [env.OAUTH_PROXY_URL] : []),
+    ...(env.ADDITIONAL_TRUSTED_ORIGINS ?? []),
+    ...mobileAuthOrigins,
+  ],
   secret: env.AUTH_SECRET || env.NEXTAUTH_SECRET,
   emailAndPassword: {
     enabled: false,
@@ -59,11 +111,21 @@ export const betterAuthConfig = betterAuth({
     provider: "postgresql",
   }),
   plugins: [
-    nextCookies(),
     sso({
       disableImplicitSignUp: false,
       organizationProvisioning: { disabled: true },
     }),
+    ...(mobileAuthOrigins.length > 0 ? [expo()] : []),
+    // OAuth proxy for preview deployments (Google doesn't allow wildcard redirect URIs)
+    ...(env.OAUTH_PROXY_URL || env.IS_OAUTH_PROXY_SERVER
+      ? [
+          oAuthProxy({
+            productionURL: env.OAUTH_PROXY_URL || env.NEXT_PUBLIC_BASE_URL,
+          }),
+        ]
+      : []),
+    ...(isLocalAuthBypassEnabled() ? [localBypassAuthPlugin()] : []),
+    nextCookies(), // Must be last
   ],
   session: {
     modelName: "Session",
@@ -89,6 +151,11 @@ export const betterAuthConfig = betterAuth({
       accessTokenExpiresAt: "expires_at",
       idToken: "id_token",
     },
+    storeStateStrategy: "cookie", // Required for oAuthProxy to encrypt state
+    accountLinking: {
+      enabled: true,
+      trustedProviders: ["google", "microsoft"],
+    },
   },
   verification: {
     modelName: "VerificationToken",
@@ -97,27 +164,13 @@ export const betterAuthConfig = betterAuth({
       expiresAt: "expires",
     },
   },
-  socialProviders: {
-    google: {
-      clientId: env.GOOGLE_CLIENT_ID,
-      clientSecret: env.GOOGLE_CLIENT_SECRET,
-      scope: [...GMAIL_SCOPES],
-      accessType: "offline",
-      prompt: "select_account consent",
-      disableIdTokenSignIn: true,
-    },
-    microsoft: {
-      clientId: env.MICROSOFT_CLIENT_ID || "",
-      clientSecret: env.MICROSOFT_CLIENT_SECRET || "",
-      scope: [...OUTLOOK_SCOPES],
-      tenantId: env.MICROSOFT_TENANT_ID,
-      disableIdTokenSignIn: true,
-    },
-  },
+  socialProviders,
   databaseHooks: {
     user: {
       create: {
         after: async (user) => {
+          if (isLocalBypassUserEmail(user.email)) return;
+
           await postSignUp({
             id: user.id,
             email: user.email,
@@ -389,10 +442,17 @@ async function handleLinkAccount(account: Account) {
       throw new Error("Primary email not found for linked account.");
     }
 
+    const normalizedEmail = primaryEmail.trim().toLowerCase();
+
     // Check if email already belongs to a different user
     const existingEmailAccount = await prisma.emailAccount.findUnique({
-      where: { email: primaryEmail.trim().toLowerCase() },
-      select: { userId: true },
+      where: { email: normalizedEmail },
+      select: {
+        id: true,
+        userId: true,
+        accountId: true,
+        account: { select: { provider: true } },
+      },
     });
 
     if (
@@ -407,6 +467,45 @@ async function handleLinkAccount(account: Account) {
       throw new Error("email_already_linked");
     }
 
+    const crossProviderRelink =
+      existingEmailAccount &&
+      existingEmailAccount.userId === account.userId &&
+      existingEmailAccount.accountId !== account.id &&
+      existingEmailAccount.account.provider !== account.providerId;
+
+    if (crossProviderRelink) {
+      logger.warn(
+        "[linkAccount] Skipping cross-provider EmailAccount reassignment",
+        {
+          userId: account.userId,
+          accountId: account.id,
+          currentProvider: existingEmailAccount.account.provider,
+          attemptedProvider: account.providerId,
+        },
+      );
+
+      await prisma.$transaction([
+        prisma.emailAccount.update({
+          where: { id: existingEmailAccount.id },
+          data: {
+            name: primaryName,
+            image: primaryPhotoUrl,
+          },
+        }),
+        prisma.account.update({
+          where: { id: account.id },
+          data: { disconnectedAt: null },
+        }),
+      ]);
+
+      await clearSpecificErrorMessages({
+        userId: account.userId,
+        errorTypes: [ErrorType.ACCOUNT_DISCONNECTED],
+        logger,
+      });
+
+      return;
+    }
     const user = await prisma.user.findUnique({
       where: { id: account.userId },
       select: { email: true, name: true, image: true },
@@ -426,14 +525,15 @@ async function handleLinkAccount(account: Account) {
       image: primaryPhotoUrl,
     };
 
-    await prisma.$transaction([
+    const [upsertedEmailAccount] = await prisma.$transaction([
       prisma.emailAccount.upsert({
-        where: { email: profileData?.email },
+        where: { email: normalizedEmail },
         update: data,
         create: {
           ...data,
-          email: primaryEmail,
+          email: normalizedEmail,
         },
+        select: { id: true },
       }),
       prisma.account.update({
         where: { id: account.id },
@@ -446,6 +546,15 @@ async function handleLinkAccount(account: Account) {
       errorTypes: [ErrorType.ACCOUNT_DISCONNECTED],
       logger,
     });
+
+    if (env.AUTO_JOIN_ORGANIZATION_ENABLED) {
+      await autoJoinOrganization(upsertedEmailAccount.id).catch((error) => {
+        logger.error("[linkAccount] Error auto-joining organization", {
+          error,
+        });
+        captureException(error, { extra: { userId: account.userId } });
+      });
+    }
 
     // Handle premium account seats
     await updateAccountSeats({ userId: account.userId }).catch((error) => {
@@ -567,3 +676,40 @@ export async function saveTokens({
 
 export const auth = async () =>
   betterAuthConfig.api.getSession({ headers: await headers() });
+
+async function autoJoinOrganization(emailAccountId: string) {
+  const orgs = await prisma.organization.findMany({
+    select: { id: true },
+    take: 2,
+  });
+
+  if (orgs.length !== 1) {
+    if (orgs.length === 0) {
+      logger.warn("[autoJoinOrganization] No organization found to auto-join");
+    } else {
+      logger.warn(
+        "[autoJoinOrganization] Multiple organizations found, skipping auto-join",
+      );
+    }
+    return;
+  }
+
+  const organizationId = orgs[0].id;
+
+  const member = await prisma.member.upsert({
+    where: { emailAccountId },
+    update: {},
+    create: {
+      organizationId,
+      emailAccountId,
+      role: "member",
+    },
+    select: { id: true, createdAt: true },
+  });
+
+  logger.info("[autoJoinOrganization] Auto-joined user to organization", {
+    emailAccountId,
+    organizationId,
+    memberId: member.id,
+  });
+}

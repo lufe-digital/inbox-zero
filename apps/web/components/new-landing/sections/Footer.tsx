@@ -1,17 +1,81 @@
 import Link from "next/link";
+import { env } from "@/env";
 import { Logo } from "@/components/new-landing/common/Logo";
 import { cn } from "@/utils";
 import { FooterLineLogo } from "@/components/new-landing/FooterLineLogo";
 import { Paragraph } from "@/components/new-landing/common/Typography";
 import { UnicornScene } from "@/components/new-landing/UnicornScene";
 import { footerNavigation } from "@/app/(landing)/home/Footer";
+import { BRAND_LOGO_URL } from "@/utils/branding";
 
 interface FooterProps {
   className: string;
   variant?: "default" | "simple";
 }
 
+// Simple footer for self-hosted deployments
+const selfHostedFooter = {
+  resources: [
+    {
+      name: "Documentation",
+      href: "https://docs.getinboxzero.com",
+      target: "_blank",
+    },
+    { name: "GitHub", href: "/github", target: "_blank" },
+    { name: "Discord", href: "/discord", target: "_blank" },
+  ],
+  legal: [
+    { name: "Terms", href: "/terms" },
+    { name: "Privacy", href: "/privacy" },
+  ],
+};
+
 export function Footer({ className, variant = "default" }: FooterProps) {
+  if (env.NEXT_PUBLIC_BYPASS_PREMIUM_CHECKS) {
+    return (
+      <footer className="relative z-50 border-t border-[#E7E7E7A3] bg-cover bg-center bg-no-repeat overflow-hidden">
+        <div className={cn("overflow-hidden px-6 py-12 lg:px-8", className)}>
+          <div className="flex flex-wrap justify-center gap-x-6 gap-y-2">
+            {selfHostedFooter.resources.map((item) => (
+              <Link
+                key={item.name}
+                href={item.href}
+                target={item.target}
+                rel={
+                  item.target === "_blank" ? "noopener noreferrer" : undefined
+                }
+                className="text-sm leading-6 text-gray-500 hover:text-gray-900"
+              >
+                {item.name}
+              </Link>
+            ))}
+            <span className="text-gray-300">|</span>
+            {selfHostedFooter.legal.map((item) => (
+              <Link
+                key={item.name}
+                href={item.href}
+                className="text-sm leading-6 text-gray-500 hover:text-gray-900"
+              >
+                {item.name}
+              </Link>
+            ))}
+          </div>
+          <p className="mt-6 text-center text-xs leading-5 text-gray-500">
+            Powered by{" "}
+            <Link
+              href="https://getinboxzero.com"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="hover:text-gray-900"
+            >
+              Inbox Zero
+            </Link>
+          </p>
+        </div>
+      </footer>
+    );
+  }
+
   return (
     <footer className="relative z-50 border-t border-[#E7E7E7A3] bg-cover bg-center bg-no-repeat overflow-hidden">
       {variant === "default" ? <UnicornScene className="opacity-15" /> : null}
@@ -24,9 +88,18 @@ export function Footer({ className, variant = "default" }: FooterProps) {
           </div>
           <div>
             <FooterList title="Use Cases" items={footerNavigation.useCases} />
+            <div className="mt-6">
+              <FooterList
+                title="Industries"
+                items={footerNavigation.industries}
+              />
+            </div>
           </div>
           <div>
             <FooterList title="Support" items={footerNavigation.support} />
+            <div className="mt-6">
+              <FooterList title="Free Tools" items={footerNavigation.tools} />
+            </div>
           </div>
           <div>
             <FooterList title="Company" items={footerNavigation.company} />
@@ -54,7 +127,7 @@ export function Footer({ className, variant = "default" }: FooterProps) {
           </div>
         </div>
       </div>
-      {variant === "default" ? (
+      {variant === "default" && !BRAND_LOGO_URL ? (
         <FooterLineLogo className="hidden xl:block absolute bottom-0 left-1/2 -translate-x-1/2 mx-auto px-6 lg:px-8 -z-10" />
       ) : null}
     </footer>

@@ -1,6 +1,5 @@
 import { after } from "next/server";
 import type { ParsedMessage, RuleWithActions } from "@/utils/types";
-import type { EmailAccountWithAI } from "@/utils/llms/types";
 import {
   ActionType,
   ExecutedRuleStatus,
@@ -10,7 +9,10 @@ import {
 import type { Rule } from "@/generated/prisma/client";
 import type { ActionItem } from "@/utils/ai/types";
 import { findMatchingRules } from "@/utils/ai/choose-rule/match-rules";
-import { getActionItemsWithAiArgs } from "@/utils/ai/choose-rule/choose-args";
+import {
+  getActionItemsWithAiArgs,
+  type EmailAccountForDrafting,
+} from "@/utils/ai/choose-rule/choose-args";
 import { executeAct } from "@/utils/ai/choose-rule/execute";
 import prisma from "@/utils/prisma";
 import { withPrismaRetry } from "@/utils/prisma-retry";
@@ -48,6 +50,7 @@ export type RunRulesResult = {
     Rule,
     | "id"
     | "name"
+    | "systemType"
     | "instructions"
     | "groupId"
     | "from"
@@ -79,7 +82,7 @@ export async function runRules({
   provider: EmailProvider;
   message: ParsedMessage;
   rules: RuleWithActions[];
-  emailAccount: EmailAccountWithAI;
+  emailAccount: EmailAccountForDrafting;
   isTest: boolean;
   modelType: ModelType;
   logger: Logger;
@@ -189,6 +192,7 @@ export async function runRules({
   }
 
   const executedRules: RunRulesResult[] = [];
+  const queuedSenderPatternAnalyses = new Set<string>();
 
   for (const result of finalMatches) {
     const ruleToExecute = result.rule;
@@ -200,6 +204,7 @@ export async function runRules({
         result,
         message,
         emailAccountId: emailAccount.id,
+        queuedSenderPatternAnalyses,
         logger,
       });
     }
@@ -242,15 +247,16 @@ function prepareRulesWithMetaRule(rules: RuleWithActions[]): {
   // If any conversation status rules are enabled, create a meta-rule
   if (conversationRules.some((r) => r.enabled)) {
     const template = conversationRules[0];
+
     const metaRule = {
       ...template,
       id: CONVERSATION_TRACKING_META_RULE_ID,
       name: "Conversations",
-      instructions: `Personal conversations and communication with real people. This covers all conversation states: emails you need to reply to, emails you're awaiting replies on, FYI updates from people, and resolved discussions.
+      instructions: `Conversations and communication with real people. This covers all conversation states: emails you need to reply to, emails you're awaiting replies on, FYI updates from people, and resolved discussions.
 
 Match when:
 - Questions or requests for information/action
-- Personal updates or FYI information from real people
+- Updates or FYI information from real people
 - Follow-ups on ongoing conversations
 - Conversations that have been resolved or concluded
 
@@ -274,7 +280,7 @@ NOTE: When this rule matches, it should typically be the primary match.`,
 async function executeMatchedRule(
   rule: RuleWithActions,
   message: ParsedMessage,
-  emailAccount: EmailAccountWithAI,
+  emailAccount: EmailAccountForDrafting,
   client: EmailProvider,
   reason: string | undefined,
   matchReasons: MatchReason[] | undefined,
@@ -443,26 +449,53 @@ async function analyzeSenderPatternIfAiMatch({
   result,
   message,
   emailAccountId,
+  queuedSenderPatternAnalyses,
   logger,
 }: {
   isTest: boolean;
   result: { rule?: Rule | null; matchReasons?: MatchReason[] };
   message: ParsedMessage;
   emailAccountId: string;
+  queuedSenderPatternAnalyses: Set<string>;
   logger: Logger;
 }) {
   if (shouldAnalyzeSenderPattern({ isTest, result })) {
     const fromAddress = extractEmailAddress(message.headers.from);
     if (fromAddress) {
-      after(() =>
-        analyzeSenderPattern(
+      const normalizedFromAddress = fromAddress.toLowerCase();
+      const analysisKey = `${emailAccountId}:${normalizedFromAddress}`;
+
+      if (queuedSenderPatternAnalyses.has(analysisKey)) return;
+      queuedSenderPatternAnalyses.add(analysisKey);
+
+      after(async () => {
+        let senderAlreadyAnalyzed = false;
+        try {
+          senderAlreadyAnalyzed = await isSenderPatternAlreadyAnalyzed({
+            emailAccountId,
+            from: normalizedFromAddress,
+          });
+        } catch (error) {
+          logger.error("Failed to check sender pattern analyzed status", {
+            error,
+          });
+        }
+
+        if (senderAlreadyAnalyzed) {
+          logger.trace(
+            "Skipping sender pattern analysis; sender already analyzed",
+          );
+          return;
+        }
+
+        await analyzeSenderPattern(
           {
             emailAccountId,
-            from: fromAddress,
+            from: normalizedFromAddress,
           },
           logger,
-        ),
-      );
+        );
+      });
     }
   }
 }
@@ -495,6 +528,30 @@ function shouldAnalyzeSenderPattern({
   }
 
   return true;
+}
+
+async function isSenderPatternAlreadyAnalyzed({
+  emailAccountId,
+  from,
+}: {
+  emailAccountId: string;
+  from: string;
+}) {
+  const existingCheck = await prisma.newsletter.findFirst({
+    where: {
+      emailAccountId,
+      patternAnalyzed: true,
+      email: {
+        equals: from,
+        mode: "insensitive",
+      },
+    },
+    select: {
+      id: true,
+    },
+  });
+
+  return !!existingCheck;
 }
 
 /**

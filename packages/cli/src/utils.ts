@@ -49,6 +49,10 @@ export function generateEnvFile(config: {
     setValue("POSTGRES_USER", env.POSTGRES_USER);
     setValue("POSTGRES_PASSWORD", env.POSTGRES_PASSWORD);
     setValue("POSTGRES_DB", env.POSTGRES_DB);
+    setValue("POSTGRES_PORT", env.POSTGRES_PORT);
+    setValue("REDIS_PORT", env.REDIS_PORT);
+    setValue("REDIS_HTTP_PORT", env.REDIS_HTTP_PORT);
+    setValue("WEB_PORT", env.WEB_PORT);
     setValue("DATABASE_URL", wrapInQuotes(env.DATABASE_URL));
     setValue("DIRECT_URL", wrapInQuotes(env.DIRECT_URL));
     setValue("UPSTASH_REDIS_URL", wrapInQuotes(env.UPSTASH_REDIS_URL));
@@ -116,25 +120,146 @@ export function generateEnvFile(config: {
   setValue("ECONOMY_LLM_PROVIDER", env.ECONOMY_LLM_PROVIDER);
   setValue("ECONOMY_LLM_MODEL", env.ECONOMY_LLM_MODEL);
 
+  // Shared fallback key for cloud LLM providers.
+  const legacyProviderApiKeyMap: Record<string, string> = {
+    anthropic: "ANTHROPIC_API_KEY",
+    openai: "OPENAI_API_KEY",
+    google: "GOOGLE_API_KEY",
+    openrouter: "OPENROUTER_API_KEY",
+    aigateway: "AI_GATEWAY_API_KEY",
+    groq: "GROQ_API_KEY",
+  };
+  const legacyApiKeyName = legacyProviderApiKeyMap[llmProvider];
+  setValue(
+    "LLM_API_KEY",
+    env.LLM_API_KEY || (legacyApiKeyName && env[legacyApiKeyName]),
+  );
+
   // Set the API key for the selected provider
   if (llmProvider === "bedrock") {
     setValue("BEDROCK_ACCESS_KEY", env.BEDROCK_ACCESS_KEY);
     setValue("BEDROCK_SECRET_KEY", env.BEDROCK_SECRET_KEY);
     setValue("BEDROCK_REGION", env.BEDROCK_REGION);
-  } else {
-    const apiKeyMap: Record<string, string> = {
-      anthropic: "ANTHROPIC_API_KEY",
-      openai: "OPENAI_API_KEY",
-      google: "GOOGLE_API_KEY",
-      openrouter: "OPENROUTER_API_KEY",
-      aigateway: "AI_GATEWAY_API_KEY",
-      groq: "GROQ_API_KEY",
-    };
-    const apiKeyName = apiKeyMap[llmProvider];
-    if (apiKeyName && env[apiKeyName]) {
-      setValue(apiKeyName, env[apiKeyName]);
-    }
+  } else if (llmProvider === "ollama") {
+    setValue("OLLAMA_BASE_URL", env.OLLAMA_BASE_URL);
+    setValue("OLLAMA_MODEL", env.OLLAMA_MODEL);
+  } else if (llmProvider === "openai-compatible") {
+    setValue("OPENAI_COMPATIBLE_BASE_URL", env.OPENAI_COMPATIBLE_BASE_URL);
+    setValue("OPENAI_COMPATIBLE_MODEL", env.OPENAI_COMPATIBLE_MODEL);
   }
 
   return content;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Env file reading and updating (used by `config` command)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const SENSITIVE_KEYS = new Set([
+  "GOOGLE_CLIENT_SECRET",
+  "GOOGLE_PUBSUB_VERIFICATION_TOKEN",
+  "MICROSOFT_CLIENT_SECRET",
+  "MICROSOFT_WEBHOOK_CLIENT_STATE",
+  "LLM_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "OPENAI_API_KEY",
+  "GOOGLE_API_KEY",
+  "OPENROUTER_API_KEY",
+  "AI_GATEWAY_API_KEY",
+  "GROQ_API_KEY",
+  "BEDROCK_ACCESS_KEY",
+  "BEDROCK_SECRET_KEY",
+  "AUTH_SECRET",
+  "EMAIL_ENCRYPT_SECRET",
+  "EMAIL_ENCRYPT_SALT",
+  "INTERNAL_API_KEY",
+  "API_KEY_SALT",
+  "CRON_SECRET",
+  "UPSTASH_REDIS_TOKEN",
+  "POSTGRES_PASSWORD",
+]);
+
+export function isSensitiveKey(key: string): boolean {
+  return (
+    SENSITIVE_KEYS.has(key) ||
+    key.toLowerCase().includes("secret") ||
+    key.toLowerCase().includes("password")
+  );
+}
+
+export function parseEnvFile(content: string): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const line of content.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eqIndex = trimmed.indexOf("=");
+    if (eqIndex === -1) continue;
+    const key = trimmed.slice(0, eqIndex).trim();
+    let value = trimmed.slice(eqIndex + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    env[key] = value;
+  }
+  return env;
+}
+
+export function updateEnvValue(
+  content: string,
+  key: string,
+  value: string,
+): string {
+  const needsQuotes = /[\s"'#]/.test(value) || value.includes("://");
+  const escaped = needsQuotes
+    ? value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
+    : value;
+  const formatted = needsQuotes ? `"${escaped}"` : value;
+
+  const uncommented = new RegExp(`^${key}=.*$`, "m");
+  if (uncommented.test(content)) {
+    return content.replace(uncommented, `${key}=${formatted}`);
+  }
+
+  const commented = new RegExp(`^# ${key}=.*$`, "m");
+  if (commented.test(content)) {
+    return content.replace(commented, `${key}=${formatted}`);
+  }
+
+  return `${content.trimEnd()}\n${key}=${formatted}\n`;
+}
+
+export function redactValue(key: string, value: string): string {
+  if (value.startsWith("your-") || value === "skipped") {
+    return "(not configured)";
+  }
+
+  if ((key === "DATABASE_URL" || key === "DIRECT_URL") && value.includes("@")) {
+    return value.replace(/:([^@]+)@/, ":****@");
+  }
+
+  if (isSensitiveKey(key)) {
+    if (value.length <= 4) return "****";
+    return `${value.slice(0, 4)}****`;
+  }
+
+  return value;
+}
+
+export function parsePortConflict(stderr: string): string | null {
+  const match = stderr.match(
+    /Bind for \S+:(\d+) failed: port is already allocated/,
+  );
+  if (match) {
+    return `Port ${match[1]} is already in use by another process.`;
+  }
+
+  const addrMatch = stderr.match(/:(\d+):\s*address already in use/);
+  if (addrMatch) {
+    return `Port ${addrMatch[1]} is already in use by another process.`;
+  }
+
+  return null;
 }

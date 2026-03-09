@@ -1,693 +1,166 @@
-import { type InferUITool, tool, type ModelMessage } from "ai";
-import { z } from "zod";
+import type { JSONValue, ModelMessage } from "ai";
 import type { Logger } from "@/utils/logger";
-import { createRuleSchema } from "@/utils/ai/rule/create-rule-schema";
-import prisma from "@/utils/prisma";
-import { isDuplicateError } from "@/utils/prisma-helpers";
-import {
-  createRule,
-  partialUpdateRule,
-  updateRuleActions,
-} from "@/utils/rule/rule";
-import {
-  ActionType,
-  GroupItemType,
-  LogicalOperator,
-} from "@/generated/prisma/enums";
-import type { EmailAccountWithAI } from "@/utils/llms/types";
-import { saveLearnedPatterns } from "@/utils/rule/learned-patterns";
-import { posthogCaptureEvent } from "@/utils/posthog";
-import { chatCompletionStream } from "@/utils/llms";
-import { filterNullProperties } from "@/utils";
-import { delayInMinutesSchema } from "@/utils/actions/rule.validation";
-import { isMicrosoftProvider } from "@/utils/email/provider-types";
 import type { MessageContext } from "@/app/api/chat/validation";
 import { stringifyEmail } from "@/utils/stringify-email";
 import { getEmailForLLM } from "@/utils/get-email-from-message";
 import type { ParsedMessage } from "@/utils/types";
+import { env } from "@/env";
+import type { EmailAccountWithAI } from "@/utils/llms/types";
+import { toolCallAgentStream } from "@/utils/llms";
+import type { RecordingSessionHandle } from "@/utils/replay/recorder";
+import { isConversationStatusType } from "@/utils/reply-tracker/conversation-status-config";
+import prisma from "@/utils/prisma";
+import type { SystemType } from "@/generated/prisma/enums";
+import {
+  addToKnowledgeBaseTool,
+  createRuleTool,
+  getLearnedPatternsTool,
+  getUserRulesAndSettingsTool,
+  type RuleReadState,
+  updateAboutTool,
+  updateLearnedPatternsTool,
+  updateRuleActionsTool,
+  updateRuleConditionsTool,
+} from "./chat-rule-tools";
+import {
+  getAssistantCapabilitiesTool,
+  updateAssistantSettingsCompatTool,
+  updateAssistantSettingsTool,
+} from "./chat-settings-tools";
+import {
+  forwardEmailTool,
+  getAccountOverviewTool,
+  manageInboxTool,
+  readEmailTool,
+  replyEmailTool,
+  searchInboxTool,
+  sendEmailTool,
+  updateInboxFeaturesTool,
+} from "./chat-inbox-tools";
+import { saveMemoryTool, searchMemoriesTool } from "./chat-memory-tools";
+import type { MessagingPlatform } from "@/utils/messaging/platforms";
 
 export const maxDuration = 120;
 
-// tools
-const getUserRulesAndSettingsTool = ({
-  email,
-  emailAccountId,
-  logger,
-}: {
-  email: string;
-  emailAccountId: string;
-  logger: Logger;
-}) =>
-  tool({
-    name: "getUserRulesAndSettings",
-    description:
-      "Retrieve all existing rules for the user, their about information",
-    inputSchema: z.object({}),
-    execute: async () => {
-      trackToolCall({
-        tool: "get_user_rules_and_settings",
-        email,
-        logger,
-      });
-
-      const emailAccount = await prisma.emailAccount.findUnique({
-        where: { id: emailAccountId },
-        select: {
-          about: true,
-          rules: {
-            select: {
-              name: true,
-              instructions: true,
-              from: true,
-              to: true,
-              subject: true,
-              conditionalOperator: true,
-              enabled: true,
-              runOnThreads: true,
-              actions: {
-                select: {
-                  type: true,
-                  content: true,
-                  label: true,
-                  to: true,
-                  cc: true,
-                  bcc: true,
-                  subject: true,
-                  url: true,
-                  folderName: true,
-                },
-              },
-            },
-          },
-        },
-      });
-
-      return {
-        about: emailAccount?.about || "Not set",
-        rules: emailAccount?.rules.map((rule) => {
-          const staticFilter = filterNullProperties({
-            from: rule.from,
-            to: rule.to,
-            subject: rule.subject,
-          });
-
-          const staticConditions =
-            Object.keys(staticFilter).length > 0 ? staticFilter : undefined;
-
-          return {
-            name: rule.name,
-            conditions: {
-              aiInstructions: rule.instructions,
-              static: staticConditions,
-              // only need to show conditional operator if there are multiple conditions
-              conditionalOperator:
-                rule.instructions && staticConditions
-                  ? rule.conditionalOperator
-                  : undefined,
-            },
-            actions: rule.actions.map((action) => ({
-              type: action.type,
-              fields: filterNullProperties({
-                label: action.label,
-                content: action.content,
-                to: action.to,
-                cc: action.cc,
-                bcc: action.bcc,
-                subject: action.subject,
-                url: action.url,
-                folderName: action.folderName,
-              }),
-            })),
-            enabled: rule.enabled,
-            runOnThreads: rule.runOnThreads,
-          };
-        }),
-      };
-    },
-  });
-
-export type GetUserRulesAndSettingsTool = InferUITool<
-  ReturnType<typeof getUserRulesAndSettingsTool>
->;
-
-const getLearnedPatternsTool = ({
-  email,
-  emailAccountId,
-  logger,
-}: {
-  email: string;
-  emailAccountId: string;
-  logger: Logger;
-}) =>
-  tool({
-    name: "getLearnedPatterns",
-    description: "Retrieve the learned patterns for a rule",
-    inputSchema: z.object({
-      ruleName: z
-        .string()
-        .describe("The name of the rule to get the learned patterns for"),
-    }),
-    execute: async ({ ruleName }) => {
-      trackToolCall({ tool: "get_learned_patterns", email, logger });
-
-      const rule = await prisma.rule.findUnique({
-        where: { name_emailAccountId: { name: ruleName, emailAccountId } },
-        select: {
-          group: {
-            select: {
-              items: {
-                select: {
-                  type: true,
-                  value: true,
-                  exclude: true,
-                },
-              },
-            },
-          },
-        },
-      });
-
-      if (!rule) {
-        return {
-          error:
-            "Rule not found. Try listing the rules again. The user may have made changes since you last checked.",
-        };
-      }
-
-      return {
-        patterns: rule.group?.items,
-      };
-    },
-  });
-
-export type GetLearnedPatternsTool = InferUITool<
-  ReturnType<typeof getLearnedPatternsTool>
->;
-
-const createRuleTool = ({
-  email,
-  emailAccountId,
-  provider,
-  logger,
-}: {
-  email: string;
-  emailAccountId: string;
-  provider: string;
-  logger: Logger;
-}) =>
-  tool({
-    name: "createRule",
-    description: "Create a new rule",
-    inputSchema: createRuleSchema(provider),
-    execute: async ({ name, condition, actions }) => {
-      trackToolCall({ tool: "create_rule", email, logger });
-
-      try {
-        const rule = await createRule({
-          result: {
-            name,
-            condition,
-            actions: actions.map((action) => ({
-              type: action.type,
-              fields: action.fields
-                ? {
-                    content: action.fields.content ?? null,
-                    to: action.fields.to ?? null,
-                    subject: action.fields.subject ?? null,
-                    label: action.fields.label ?? null,
-                    webhookUrl: action.fields.webhookUrl ?? null,
-                    cc: action.fields.cc ?? null,
-                    bcc: action.fields.bcc ?? null,
-                    ...(isMicrosoftProvider(provider) && {
-                      folderName: action.fields.folderName ?? null,
-                    }),
-                  }
-                : null,
-            })),
-          },
-          emailAccountId,
-          provider,
-          runOnThreads: true,
-          logger,
-        });
-
-        return { success: true, ruleId: rule.id };
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-
-        logger.error("Failed to create rule", { error });
-
-        return { error: "Failed to create rule", message };
-      }
-    },
-  });
-
-export type CreateRuleTool = InferUITool<ReturnType<typeof createRuleTool>>;
-
-const updateRuleConditionSchema = z.object({
-  ruleName: z.string().describe("The name of the rule to update"),
-  condition: z.object({
-    aiInstructions: z.string().optional(),
-    static: z
-      .object({
-        from: z.string().nullish(),
-        to: z.string().nullish(),
-        subject: z.string().nullish(),
-      })
-      .nullish(),
-    conditionalOperator: z
-      .enum([LogicalOperator.AND, LogicalOperator.OR])
-      .nullish(),
-  }),
-});
-export type UpdateRuleConditionSchema = z.infer<
-  typeof updateRuleConditionSchema
->;
-
-const updateRuleConditionsTool = ({
-  email,
-  emailAccountId,
-  logger,
-}: {
-  email: string;
-  emailAccountId: string;
-  logger: Logger;
-}) =>
-  tool({
-    name: "updateRuleConditions",
-    description: "Update the conditions of an existing rule",
-    inputSchema: updateRuleConditionSchema,
-    execute: async ({ ruleName, condition }) => {
-      trackToolCall({ tool: "update_rule_conditions", email, logger });
-
-      const rule = await prisma.rule.findUnique({
-        where: { name_emailAccountId: { name: ruleName, emailAccountId } },
-        select: {
-          id: true,
-          name: true,
-          instructions: true,
-          from: true,
-          to: true,
-          subject: true,
-          conditionalOperator: true,
-        },
-      });
-
-      if (!rule) {
-        return {
-          success: false,
-          ruleId: "",
-          error:
-            "Rule not found. Try listing the rules again. The user may have made changes since you last checked.",
-        };
-      }
-
-      // Store original state
-      const originalConditions = {
-        aiInstructions: rule.instructions,
-        static: filterNullProperties({
-          from: rule.from,
-          to: rule.to,
-          subject: rule.subject,
-        }),
-        conditionalOperator: rule.conditionalOperator,
-      };
-
-      await partialUpdateRule({
-        ruleId: rule.id,
-        data: {
-          instructions: condition.aiInstructions,
-          from: condition.static?.from,
-          to: condition.static?.to,
-          subject: condition.static?.subject,
-          conditionalOperator: condition.conditionalOperator ?? undefined,
-        },
-      });
-
-      // Prepare updated state
-      const updatedConditions = {
-        aiInstructions: condition.aiInstructions,
-        static: condition.static
-          ? filterNullProperties({
-              from: condition.static.from,
-              to: condition.static.to,
-              subject: condition.static.subject,
-            })
-          : undefined,
-        conditionalOperator: condition.conditionalOperator,
-      };
-
-      return {
-        success: true,
-        ruleId: rule.id,
-        originalConditions,
-        updatedConditions,
-      };
-    },
-  });
-
-export type UpdateRuleConditionsTool = InferUITool<
-  ReturnType<typeof updateRuleConditionsTool>
->;
-
-const updateRuleActionsTool = ({
-  email,
-  emailAccountId,
-  provider,
-  logger,
-}: {
-  email: string;
-  emailAccountId: string;
-  provider: string;
-  logger: Logger;
-}) =>
-  tool({
-    name: "updateRuleActions",
-    description:
-      "Update the actions of an existing rule. This replaces the existing actions.",
-    inputSchema: z.object({
-      ruleName: z.string().describe("The name of the rule to update"),
-      actions: z.array(
-        z.object({
-          type: z.enum([
-            ActionType.ARCHIVE,
-            ActionType.LABEL,
-            ActionType.DRAFT_EMAIL,
-            ActionType.FORWARD,
-            ActionType.REPLY,
-            ActionType.SEND_EMAIL,
-            ActionType.MARK_READ,
-            ActionType.MARK_SPAM,
-            ActionType.CALL_WEBHOOK,
-            ActionType.DIGEST,
-          ]),
-          fields: z.object({
-            label: z.string().nullish(),
-            content: z.string().nullish(),
-            webhookUrl: z.string().nullish(),
-            to: z.string().nullish(),
-            cc: z.string().nullish(),
-            bcc: z.string().nullish(),
-            subject: z.string().nullish(),
-            folderName: z.string().nullish(),
-          }),
-          delayInMinutes: delayInMinutesSchema,
-        }),
-      ),
-    }),
-    execute: async ({ ruleName, actions }) => {
-      trackToolCall({ tool: "update_rule_actions", email, logger });
-      const rule = await prisma.rule.findUnique({
-        where: { name_emailAccountId: { name: ruleName, emailAccountId } },
-        select: {
-          id: true,
-          name: true,
-          actions: {
-            select: {
-              type: true,
-              content: true,
-              label: true,
-              to: true,
-              cc: true,
-              bcc: true,
-              subject: true,
-              url: true,
-              folderName: true,
-            },
-          },
-        },
-      });
-
-      if (!rule) {
-        return {
-          success: false,
-          ruleId: "",
-          error:
-            "Rule not found. Try listing the rules again. The user may have made changes since you last checked.",
-        };
-      }
-
-      // Store original actions
-      const originalActions = rule.actions.map((action) => ({
-        type: action.type,
-        fields: filterNullProperties({
-          label: action.label,
-          content: action.content,
-          to: action.to,
-          cc: action.cc,
-          bcc: action.bcc,
-          subject: action.subject,
-          webhookUrl: action.url,
-          ...(isMicrosoftProvider(provider) && {
-            folderName: action.folderName,
-          }),
-        }),
-      }));
-
-      await updateRuleActions({
-        ruleId: rule.id,
-        actions: actions.map((action) => ({
-          type: action.type,
-          fields: {
-            label: action.fields?.label ?? null,
-            to: action.fields?.to ?? null,
-            cc: action.fields?.cc ?? null,
-            bcc: action.fields?.bcc ?? null,
-            subject: action.fields?.subject ?? null,
-            content: action.fields?.content ?? null,
-            webhookUrl: action.fields?.webhookUrl ?? null,
-            ...(isMicrosoftProvider(provider) && {
-              folderName: action.fields?.folderName ?? null,
-            }),
-          },
-          delayInMinutes: action.delayInMinutes ?? null,
-        })),
-        provider,
-        emailAccountId,
-        logger,
-      });
-
-      return {
-        success: true,
-        ruleId: rule.id,
-        originalActions,
-        updatedActions: actions,
-      };
-    },
-  });
-
-export type UpdateRuleActionsTool = InferUITool<
-  ReturnType<typeof updateRuleActionsTool>
->;
-
-const updateLearnedPatternsTool = ({
-  email,
-  emailAccountId,
-  logger,
-}: {
-  email: string;
-  emailAccountId: string;
-  logger: Logger;
-}) =>
-  tool({
-    name: "updateLearnedPatterns",
-    description: "Update the learned patterns of an existing rule",
-    inputSchema: z.object({
-      ruleName: z.string().describe("The name of the rule to update"),
-      learnedPatterns: z
-        .array(
-          z.object({
-            include: z
-              .object({
-                from: z.string().optional(),
-                subject: z.string().optional(),
-              })
-              .optional(),
-            exclude: z
-              .object({
-                from: z.string().optional(),
-                subject: z.string().optional(),
-              })
-              .optional(),
-          }),
-        )
-        .min(1, "At least one learned pattern is required"),
-    }),
-    execute: async ({ ruleName, learnedPatterns }) => {
-      trackToolCall({ tool: "update_learned_patterns", email, logger });
-
-      const rule = await prisma.rule.findUnique({
-        where: { name_emailAccountId: { name: ruleName, emailAccountId } },
-      });
-
-      if (!rule) {
-        return {
-          success: false,
-          ruleId: "",
-          error:
-            "Rule not found. Try listing the rules again. The user may have made changes since you last checked.",
-        };
-      }
-
-      // Convert the learned patterns format
-      const patternsToSave: Array<{
-        type: GroupItemType;
-        value: string;
-        exclude?: boolean;
-      }> = [];
-
-      for (const pattern of learnedPatterns) {
-        if (pattern.include?.from) {
-          patternsToSave.push({
-            type: GroupItemType.FROM,
-            value: pattern.include.from,
-            exclude: false,
-          });
-        }
-
-        if (pattern.include?.subject) {
-          patternsToSave.push({
-            type: GroupItemType.SUBJECT,
-            value: pattern.include.subject,
-            exclude: false,
-          });
-        }
-
-        if (pattern.exclude?.from) {
-          patternsToSave.push({
-            type: GroupItemType.FROM,
-            value: pattern.exclude.from,
-            exclude: true,
-          });
-        }
-
-        if (pattern.exclude?.subject) {
-          patternsToSave.push({
-            type: GroupItemType.SUBJECT,
-            value: pattern.exclude.subject,
-            exclude: true,
-          });
-        }
-      }
-
-      if (patternsToSave.length > 0) {
-        await saveLearnedPatterns({
-          emailAccountId,
-          ruleName: rule.name,
-          patterns: patternsToSave,
-          logger,
-        });
-      }
-
-      return { success: true, ruleId: rule.id };
-    },
-  });
-
-export type UpdateLearnedPatternsTool = InferUITool<
-  ReturnType<typeof updateLearnedPatternsTool>
->;
-
-const updateAboutTool = ({
-  email,
-  emailAccountId,
-  logger,
-}: {
-  email: string;
-  emailAccountId: string;
-  logger: Logger;
-}) =>
-  tool({
-    name: "updateAbout",
-    description:
-      "Update the user's about information. Read the user's about information first as this replaces the existing information.",
-    inputSchema: z.object({ about: z.string() }),
-    execute: async ({ about }) => {
-      trackToolCall({ tool: "update_about", email, logger });
-      const existing = await prisma.emailAccount.findUnique({
-        where: { id: emailAccountId },
-        select: { about: true },
-      });
-
-      if (!existing) return { error: "Account not found" };
-
-      await prisma.emailAccount.update({
-        where: { id: emailAccountId },
-        data: { about },
-      });
-
-      return {
-        success: true,
-        previousAbout: existing.about,
-        updatedAbout: about,
-      };
-    },
-  });
-
-export type UpdateAboutTool = InferUITool<ReturnType<typeof updateAboutTool>>;
-
-const addToKnowledgeBaseTool = ({
-  email,
-  emailAccountId,
-  logger,
-}: {
-  email: string;
-  emailAccountId: string;
-  logger: Logger;
-}) =>
-  tool({
-    name: "addToKnowledgeBase",
-    description: "Add content to the knowledge base",
-    inputSchema: z.object({
-      title: z.string(),
-      content: z.string(),
-    }),
-    execute: async ({ title, content }) => {
-      trackToolCall({ tool: "add_to_knowledge_base", email, logger });
-
-      try {
-        await prisma.knowledge.create({
-          data: {
-            emailAccountId,
-            title,
-            content,
-          },
-        });
-
-        return { success: true };
-      } catch (error) {
-        if (isDuplicateError(error, "title")) {
-          return {
-            error: "A knowledge item with this title already exists",
-          };
-        }
-
-        logger.error("Failed to add to knowledge base", { error });
-        return { error: "Failed to add to knowledge base" };
-      }
-    },
-  });
-
-export type AddToKnowledgeBaseTool = InferUITool<
-  ReturnType<typeof addToKnowledgeBaseTool>
->;
+export type {
+  AddToKnowledgeBaseTool,
+  CreateRuleTool,
+  GetLearnedPatternsTool,
+  GetUserRulesAndSettingsTool,
+  UpdateAboutTool,
+  UpdateLearnedPatternsTool,
+  UpdateRuleActionsOutput,
+  UpdateRuleActionsTool,
+  UpdateRuleConditionSchema,
+  UpdateRuleConditionsOutput,
+  UpdateRuleConditionsTool,
+} from "./chat-rule-tools";
+export type {
+  GetAssistantCapabilitiesTool,
+  UpdateAssistantSettingsTool,
+} from "./chat-settings-tools";
+export type {
+  ForwardEmailTool,
+  GetAccountOverviewTool,
+  ManageInboxTool,
+  ReadEmailTool,
+  ReplyEmailTool,
+  SearchInboxTool,
+  SendEmailTool,
+  UpdateInboxFeaturesTool,
+} from "./chat-inbox-tools";
+export type { SaveMemoryTool, SearchMemoriesTool } from "./chat-memory-tools";
 
 export async function aiProcessAssistantChat({
   messages,
   emailAccountId,
   user,
   context,
+  chatId,
+  memories,
+  inboxStats,
+  responseSurface = "web",
+  messagingPlatform,
+  recordingSession,
   logger,
 }: {
   messages: ModelMessage[];
   emailAccountId: string;
   user: EmailAccountWithAI;
   context?: MessageContext;
+  chatId?: string;
+  memories?: { content: string; date: string }[];
+  inboxStats?: { total: number; unread: number } | null;
+  responseSurface?: "web" | "messaging";
+  messagingPlatform?: MessagingPlatform;
+  recordingSession?: RecordingSessionHandle | null;
   logger: Logger;
 }) {
-  const system = `You are an assistant that helps create and update rules to manage a user's inbox. Our platform is called Inbox Zero.
-  
-You can't perform any actions on their inbox.
-You can only adjust the rules that manage the inbox.
+  const emailSendToolsEnabled = env.NEXT_PUBLIC_EMAIL_SEND_ENABLED;
+  let ruleReadState: RuleReadState | null = null;
+
+  if (recordingSession) {
+    await recordingSession.record("llm-request", {
+      label: "assistant-chat",
+      request: { messageCount: messages.length, context },
+    });
+  }
+
+  const system = `You are the Inbox Zero assistant. You help users understand their inbox, take inbox actions, update account features, and manage automation rules.
+
+Core responsibilities:
+1. Search and summarize inbox activity (especially what's new and what needs attention)
+2. Take inbox actions (archive, mark read, bulk archive by sender, and sender unsubscribe)
+3. Update account features (meeting briefs and auto-file attachments)
+4. Create and update rules
+
+Tool usage strategy (progressive disclosure):
+- Use the minimum number of tools needed.
+- Start with read-only context tools before write tools.
+- For write operations that affect many emails, first summarize what will change, then execute after clear user confirmation.
+- When the user asks what settings can or cannot be changed, call getAssistantCapabilities.
+- For supported account-setting updates, prefer updateAssistantSettings.
+- For personal instructions updates, append to existing instructions by default unless the user explicitly asks to replace.
+- For scheduled check-ins and draft knowledge base management, call getAssistantCapabilities when capability or destination context is missing or stale; otherwise reuse recent capability context and proceed with updateAssistantSettings.
+- For retroactive cleanup requests (for example "clean up my inbox"), first search the inbox to understand what the user is seeing (volume, types of emails, read/unread ratio). Then provide a concise grouped summary and recommend a next action.
+- Consider read vs unread status. If most inbox emails are read, the user may be comfortable with their inbox — focus on unread clutter or ask what they want to clean.
+- When you need the full content of an email (not just the snippet), use readEmail with the messageId from searchInbox results. Do not re-search trying to find more content.
+  - If the user asks for an inbox update, search recent messages first and prioritize "To Reply" items.
+- Never claim that chat-created pending email actions are saved in the user's Gmail/Outlook Drafts folder.
+${
+  emailSendToolsEnabled
+    ? `${getSendEmailSurfacePolicy({ responseSurface, messagingPlatform })}
+- When the user asks to forward an existing email, use forwardEmail with a messageId from searchInbox results. Do not recreate forwards with sendEmail.
+- When the user asks to reply to an existing email, use replyEmail with a messageId from searchInbox results. Do not recreate replies with sendEmail.
+- Only send emails when the user clearly asks to send now.
+- After calling these tools, briefly say the email is ready for them to review and send. Do not ask follow-up questions about CC, BCC, or whether to proceed — the UI handles confirmation.
+- Do not re-prepare or re-call the tool unless the user explicitly asks for changes.`
+    : `- Email sending actions are disabled in this environment. sendEmail, replyEmail, and forwardEmail tools are unavailable.
+- If the user asks to send, reply, or forward, clearly explain that this environment cannot prepare or send those actions.
+- Do not claim that an email was prepared, replied to, forwarded, or sent when send tools are unavailable.
+- Do not create or modify rules as a substitute unless the user explicitly asks for automation.`
+}
+
+Tool call policy:
+- When a request can be completed with available tools, call the tool instead of only describing what you would do.
+- Never claim that you changed a setting, rule, inbox state, or memory unless the corresponding write tool call in this turn succeeded.
+- If no write tool ran in this turn, explicitly say that nothing was changed yet.
+- If a write tool fails or is unavailable, clearly state that nothing changed and explain the reason.
+- If a write action needs IDs and the user did not provide them, call searchInbox first to fetch the right IDs.
+- Never invent thread IDs, label IDs, sender addresses, or existing rule names.
+${emailSendToolsEnabled ? '- For forwarding, always use a real messageId from searchInbox or user-provided context.\n- For pending email actions, do not treat "prepared" as "sent".' : ""}
+- "archive_threads" archives specific threads by ID. Use it when the user refers to specific emails shown in results.
+- "bulk_archive_senders" archives ALL emails from given senders server-side, not just the visible ones. Use it when the user asks to clean up by sender. Since it affects emails beyond what's shown, confirm the scope with the user before executing.
+- "unsubscribe_senders" attempts automatic unsubscribe using message unsubscribe headers/links, marks those senders as unsubscribed, and archives emails from those senders. Use it when the user explicitly asks to unsubscribe from senders. Since it affects all emails from those senders, confirm the scope with the user before executing.
+- Choose the tool that matches what the user actually asked for. Do not default to bulk archive when the user is referring to specific emails.
+- For new rules, generate concise names. For edits or removals, fetch existing rules first and use exact names.
+- For ambiguous destructive requests (for example archive vs mark read), ask a brief clarification question before writing.
+- Before changing an existing rule, call getUserRulesAndSettings immediately before the write.
+- If a rule has changed since that read, call getUserRulesAndSettings again and then apply the update.
+
+Provider context:
+- Current provider: ${user.account.provider}.
+${user.account.provider === "microsoft" ? "- Use KQL syntax for search: from:, to:, subject:, received>=YYYY-MM-DD, keyword search. Do not use Gmail-specific operators like in:, is:, label:, or after:/before:." : "- Use Gmail search syntax: from:, to:, subject:, in:inbox, is:unread, has:attachment, after:YYYY/MM/DD, before:YYYY/MM/DD, label:, newer_than:, older_than:."}
 
 A rule is comprised of:
 1. A condition
@@ -700,16 +173,27 @@ A condition can be:
 An action can be:
 1. Archive
 2. Label
-3. Draft a reply
+3. Draft a reply${
+    env.NEXT_PUBLIC_EMAIL_SEND_ENABLED
+      ? `
 4. Reply
 5. Send an email
-6. Forward
+6. Forward`
+      : ""
+  }
 7. Mark as read
 8. Mark spam
 9. Call a webhook
 
 You can use {{variables}} in the fields to insert AI generated content. For example:
 "Hi {{name}}, {{write a friendly reply}}, Best regards, Alice"
+
+Inbox triage guidance:
+- For "what came in today?" requests, use inbox search with a tight time range for today.
+- Group results into: must handle now, can wait, and can archive/mark read.
+- Prioritize messages labelled "To Reply" as must handle.
+- If labels are missing (new user), infer urgency from sender, subject, and snippet.
+- For low-priority repeated senders, you may suggest bulk archive by sender as an option, but default to archiving the specific threads shown.
 
 Rule matching logic:
 - All static conditions (from, to, subject) use AND logic - meaning all static conditions must match
@@ -721,24 +205,51 @@ Best practices:
 - You can use multiple conditions in a rule, but aim for simplicity.
 - When creating rules, in most cases, you should use the "aiInstructions" and sometimes you will use other fields in addition.
 - If a rule can be handled fully with static conditions, do so, but this is rarely possible.
-- IMPORTANT: prefer "draft a reply" over "reply". Only if the user explicitly asks to reply, then use "reply". Clarify beforehand this is the intention. Drafting a reply is safer as it means the user can approve before sending.
+${emailSendToolsEnabled ? `- IMPORTANT: for rules, prefer "draft a reply" action over "reply" action. For chat email sending, just use the appropriate tool directly when the user asks.` : ""}
 - Use short, concise rule names (preferably a single word). For example: 'Marketing', 'Newsletters', 'Urgent', 'Receipts'. Avoid verbose names like 'Archive and label marketing emails'.
 
 Always explain the changes you made.
 Use simple language and avoid jargon in your reply.
-If you are unable to fix the rule, say so.
+If you are unable to complete a requested action, say so and explain why.
+Keep responses concise by default.
+
+Formatting rules:
+- Always use markdown formatting. Structure multi-part answers with markdown headers (## for sections).
+- Use **bold** for key details (sender names, amounts, dates, action items).
+- When listing many emails, use a numbered list so the user can reference items by number.
+- When grouping emails (e.g. triage), use a markdown header (##) for each group and a numbered list under it.
+- Emojis are welcome when they improve tone or readability.
+- Do not present multi-option menus unless the user explicitly asks for options, or a safety-critical scope decision is required.
+- Prefer one recommended next step plus one direct confirmation question.
+- Ask at most one follow-up question at the end of a response.
+
+Inline email cards:
+- When presenting emails for triage or inbox summary, use <email> tags wrapped in an <emails> container to render an interactive inbox-style table.
+- Format:
+<emails>
+<email id="THREAD_ID" action="archive">Brief context</email>
+<email id="THREAD_ID" action="none">Brief context</email>
+</emails>
+- The id attribute must be a threadId from searchInbox results.
+- The action attribute controls which button to show: "archive" (or omitted) shows an Archive button, "none" hides the action button.
+- The inner text is your brief context or recommendation (e.g. "Subscription cancellation — confirm and outline next steps").
+- The UI automatically resolves the full email metadata (sender, subject, date) from the thread ID, so do NOT repeat those details in the tag content.
+- Use a separate <emails> block per category group, with a markdown header (##) before each block.
+- Only use <email> tags for triage and inbox summary flows, not for every search result.
 
 You can set general information about the user in their Personal Instructions (via the updateAbout tool) that will be passed as context when the AI is processing emails.
 
 Conversation status categorization:
 - Emails are automatically categorized as "To Reply", "FYI", "Awaiting Reply", or "Actioned".
-- IMPORTANT: Unlike regular automation rules, the prompts that determine these conversation statuses CANNOT be modified. They use fixed logic.
-- However, the user's Personal Instructions ARE passed to the AI when making these determinations. So if users want to influence how emails are categorized (e.g., "emails where I'm CC'd shouldn't be To Reply"), update their Personal Instructions with these preferences.
-- Use the updateAbout tool to add these preferences to the user's Personal Instructions.
+- Conversation status behavior should be customized by updating conversation rules directly (To Reply, FYI, Awaiting Reply, Actioned) using updateRuleConditions.
+- For requests like "if I'm CC'd I don't need to reply", update the To Reply rule instructions (and FYI when needed) instead of creating a new rule.
+- Keep conversation rule instructions self-contained: preserve the core intent and append new exclusions/inclusions instead of replacing them with a narrow one-off condition.
+- Use updateAbout for broad profile context, not as the primary place for conversation-status routing logic.
 
 Reply Zero is a feature that labels emails that need a reply "To Reply". And labels emails that are awaiting a response "Awaiting". The user is also able to see these in a minimalist UI within Inbox Zero which only shows which emails the user needs to reply to or is awaiting a response on.
 
 Don't tell the user which tools you're using. The tools you use will be displayed in the UI anyway.
+Never show internal IDs (threadId, messageId, labelId) to the user. These are for tool calls only.
 Don't use placeholders in rules you create. For example, don't use @company.com. Use the user's actual company email address. And if you don't know some information you need, ask the user.
 
 Static conditions:
@@ -755,218 +266,74 @@ Knowledge base:
 - The knowledge base is used to draft reply content.
 - It is only used when an action of type DRAFT_REPLY is used AND the rule has no preset draft content.
 
-Examples:
+Conversation memory:
+- You can search memories from previous conversations using the searchMemories tool when you need context from past interactions.
+- Use this when the user references something discussed before or when past context would help.
+- You can save memories using the saveMemory tool when the user asks you to remember something or when you identify a durable preference worth retaining across conversations.
+- Do not claim you will "remember" something without actually calling saveMemory.
+- Keep memories concise and self-contained.
+- IMPORTANT: Memories are only used in chat conversations. They do NOT affect how incoming emails are processed. If the user wants to influence how future emails are handled (e.g., "emails from X are urgent", "never archive emails from my boss"), use updateAbout with mode "append" to add to their personal instructions, or create/update a rule. Use saveMemory only for chat preferences (e.g., "don't use bulk archive", "always show me emails before archiving").
 
-<examples>
-  <example>
-    <input>
-      When I get a newsletter, archive it and label it as "Newsletter"
-    </input>
-    <output>
-      <create_rule>
-        {
-          "name": "Newsletters",
-          "condition": { "aiInstructions": "Newsletters" },
-          "actions": [
-            {
-              "type": "archive",
-              "fields": {}
-            },
-            {
-              "type": "label",
-              "fields": {
-                "label": "Newsletter"
-              }
-            }
-          ]
-        }
-      </create_rule>
-      <explanation>
-        I created a rule to label newsletters.
-      </explanation>
-    </output>
-  </example>
-
-  <example>
-    <input>
-      I run a marketing agency and use this email address for cold outreach.
-      If someone shows interest, label it "Interested".
-      If someone says they're interested in learning more, send them my Cal link (cal.com/alice).
-      If they ask for more info, send them my deck (https://drive.google.com/alice-deck.pdf).
-      If they're not interested, label it as "Not interested" and archive it.
-      If you don't know how to respond, label it as "Needs review".
-    </input>
-    <output>
-      <update_about>
-        I run a marketing agency and use this email address for cold outreach.
-        My cal link is https://cal.com/alice
-        My deck is https://drive.google.com/alice-deck.pdf
-        Write concise and friendly replies.
-      </update_about>
-      <create_rule>
-        {
-          "name": "Interested",
-          "condition": { "aiInstructions": "When someone shows interest in setting up a call or learning more." },
-          "actions": [
-            {
-              "type": "label",
-              "fields": {
-                "label": "Interested"
-              }
-            },
-            {
-              "type": "draft",
-              "fields": {
-                "content": "{{draft a reply}}"
-              }
-            }
-          ]
-        }
-      </create_rule>
-      <create_rule>
-        {
-          "name": "Not Interested",
-          "condition": { "aiInstructions": "When someone says they're not interested." },
-          "actions": [
-            {
-              "type": "label",
-              "fields": {
-                "label": "Not Interested"
-              }
-            },
-            {
-              "type": "archive",
-              "fields": {}
-            }
-          ]
-        }
-      </create_rule>
-      <create_rule>
-        {
-          "name": "Needs Review",
-          "condition": { "aiInstructions": "When you don't know how to respond." },
-          "actions": [
-            {
-              "type": "label",
-              "fields": {
-                "label": "Needs Review"
-              }
-            }
-          ]
-        }
-      </create_rule>
-      <explanation>
-        I created three rules to handle different types of responses.
-      </explanation>
-    </output>
-  </example>
-
-  <example>
-    <input>
-      Set a rule to archive emails older than 30 days.
-    </input>
-    <output>
-      Inbox Zero doesn't support time-based actions yet. We only process emails as they arrive in your inbox.
-    </output>
-  </example>
-
-  <example>
-    <input>
-      Create some good default rules for me.
-    </input>
-    <output>
-      <create_rule>
-        {
-          "name": "Urgent",
-          "condition": { "aiInstructions": "Urgent emails" },
-          "actions": [
-            { "type": "label", "fields": { "label": "Urgent" } }
-          ]
-        }
-      </create_rule>
-      <create_rule>
-        {
-          "name": "Newsletters",
-          "condition": { "aiInstructions": "Newsletters" },
-          "actions": [
-            { "type": "archive", "fields": {} },
-            { "type": "label", "fields": { "label": "Newsletter" } }
-          ]
-        }
-      </create_rule>
-      <create_rule>
-        {
-          "name": "Promotions",
-          "condition": { "aiInstructions": "Marketing and promotional emails" },
-          "actions": [
-            { "type": "archive", "fields": {} },
-            { "type": "label", "fields": { "label": "Promotions" } }
-          ]
-        }
-      </create_rule>
-      <create_rule>
-        {
-          "name": "Team",
-          "condition": { "static": { "from": "@company.com" } },
-          "actions": [
-            { "type": "label", "fields": { "label": "Team" } }
-          ]
-        }
-      </create_rule>
-      <explanation>
-        I created 4 rules to handle different types of emails.
-      </explanation>
-    </output>
-  </example>
-
-  <example>
-    <input>
-      I don't need to reply to emails from GitHub, stop labelling them as "To reply".
-    </input>
-    <output>
-      <update_rule>
-        {
-          "name": "To reply",
-          "learnedPatterns": [
-            { "exclude": { "from": "@github.com" } }
-          ]
-        }
-      </update_rule>
-      <explanation>
-        I updated the rule to stop labelling emails from GitHub as "To reply".
-      </explanation>
-    </output>
-  </example>
-
-  <example>
-    <input>
-      If I'm CC'd on an email it shouldn't be marked as "To Reply"
-    </input>
-    <output>
-      <update_about>
-        [existing about content...]
-        
-        - Emails where I am CC'd (not in the TO field) should not be marked as "To Reply" - they are FYI only.
-      </update_about>
-      <explanation>
-        I can't directly modify the conversation status prompts, but I've added this preference to your Personal Instructions. The AI will now take this into account when categorizing your emails.
-      </explanation>
-    </output>
-  </example>
-</examples>`;
+Behavior anchors (minimal examples):
+- For "Give me an update on what came in today", call searchInbox first with today's start in the user's timezone, then summarize into must-handle, can-wait, and can-archive.
+- For "Turn off meeting briefs and enable auto-file attachments", call updateInboxFeatures with meetingBriefsEnabled=false and filingEnabled=true.
+- For "If I'm CC'd on an email it shouldn't be marked To Reply", update the "To Reply" rule instructions with updateRuleConditions.
+- For "Archive emails older than 30 days", this is not possible as an automated rule, but you can do it as a one-time action: use searchInbox with a before: date filter, then archive the results with archive_threads.
+- For "what does that email say?" or "tell me about this email", use readEmail with the messageId from a prior searchInbox result to get the full body.
+- For "clean up my inbox" or retroactive bulk cleanup:
+  1. Check the inbox stats in your context to understand the scale and read/unread ratio.
+  2. Search inbox with limit 50 to sample messages. For Google accounts, use category filters (category:promotions, category:updates, category:social). For Microsoft accounts, use keyword queries (e.g. "newsletter", "promotion", "unsubscribe").
+  3. Group the results briefly and recommend one next action. Only present multiple options if the user asks for them or if scope is ambiguous and needs confirmation.
+  4. If the user confirms archiving the specific listed emails (e.g., "archive those", "archive the ones you listed"), use "archive_threads" with the thread IDs from the search results.
+  5. If the user explicitly asks for sender-level cleanup (e.g., "archive everything from those senders"), use "bulk_archive_senders". Warn the user that this will archive ALL emails from those senders, not just the ones shown.
+  6. If the user explicitly asks to unsubscribe from senders, use "unsubscribe_senders" with sender emails after confirming scope.
+  7. For ongoing batch cleanup with bulk_archive_senders, search again to find the next batch. Once the user has confirmed a category, continue processing subsequent batches without re-asking.`;
 
   const toolOptions = {
     email: user.email,
     emailAccountId,
+    userId: user.userId,
     provider: user.account.provider,
     logger,
+    setRuleReadState: (state: RuleReadState) => {
+      ruleReadState = state;
+    },
+    getRuleReadState: () => ruleReadState,
   };
+
+  const hasConversationStatusInResults =
+    context?.type === "fix-rule"
+      ? context.results.some((result) =>
+          isConversationStatusType(result.systemType),
+        )
+      : false;
+
+  const expectedFixSystemType =
+    context && context.type === "fix-rule" && !hasConversationStatusInResults
+      ? await getExpectedFixContextSystemTypeSafe({
+          context,
+          emailAccountId,
+          logger,
+        })
+      : null;
+
+  const isFirstMessage = messages.filter((m) => m.role === "user").length <= 1;
+
+  const inboxContextMessage =
+    inboxStats && isFirstMessage
+      ? [
+          {
+            role: "user" as const,
+            content: `[Automated inbox snapshot — not a message from the user] Current inbox: ${inboxStats.total} emails total, ${inboxStats.unread} unread.`,
+          },
+        ]
+      : [];
 
   const hiddenContextMessage =
     context && context.type === "fix-rule"
       ? [
           {
-            role: "system" as const,
+            role: "user" as const,
             content:
               "Hidden context for the user's request (do not repeat this to the user):\n\n" +
               `<email>\n${stringifyEmail(
@@ -984,29 +351,68 @@ Examples:
                   : context.expected === "none"
                     ? "No rule should be applied"
                     : `Should match the "${context.expected.name}" rule`
-              }`,
+              }` +
+              (isConversationStatusFixContext(context, expectedFixSystemType)
+                ? "\n\nThis fix is about conversation status classification. Prefer updating conversation rule instructions with updateRuleConditions (for example, To Reply/FYI rules)."
+                : ""),
           },
         ]
       : [];
 
-  const result = chatCompletionStream({
+  const contextMessages = [
+    ...inboxContextMessage,
+    ...(memories && memories.length > 0
+      ? [
+          {
+            role: "user" as const,
+            content: `Memories from previous conversations:\n${memories.map((m) => `- [${m.date}] ${m.content}`).join("\n")}`,
+          },
+        ]
+      : []),
+    ...hiddenContextMessage,
+  ];
+
+  const { messages: cacheOptimizedMessages, stablePrefixEndIndex } =
+    buildCacheOptimizedMessages({
+      system,
+      conversationMessages: messages,
+      contextMessages,
+    });
+
+  const messagesWithCacheControl = addAnthropicCacheControl(
+    cacheOptimizedMessages,
+    stablePrefixEndIndex,
+  );
+
+  const result = toolCallAgentStream({
     userAi: user.user,
+    userId: user.userId,
+    emailAccountId,
     userEmail: user.email,
     modelType: "chat",
     usageLabel: "assistant-chat",
-    messages: [
-      {
-        role: "system",
-        content: system,
-      },
-      ...hiddenContextMessage,
-      ...messages,
-    ],
+    providerOptions: getChatProviderOptionsForCaching({ chatId }),
+    messages: messagesWithCacheControl,
     onStepFinish: async ({ text, toolCalls }) => {
       logger.trace("Step finished", { text, toolCalls });
+      if (recordingSession) {
+        await recordingSession.record("chat-step", {
+          request: { toolCalls },
+          response: { text },
+        });
+      }
     },
     maxSteps: 10,
     tools: {
+      getAssistantCapabilities: getAssistantCapabilitiesTool(toolOptions),
+      updateAssistantSettings: updateAssistantSettingsTool(toolOptions),
+      updateAssistantSettingsCompat:
+        updateAssistantSettingsCompatTool(toolOptions),
+      getAccountOverview: getAccountOverviewTool(toolOptions),
+      searchInbox: searchInboxTool(toolOptions),
+      readEmail: readEmailTool(toolOptions),
+      manageInbox: manageInboxTool(toolOptions),
+      updateInboxFeatures: updateInboxFeaturesTool(toolOptions),
       getUserRulesAndSettings: getUserRulesAndSettingsTool(toolOptions),
       getLearnedPatterns: getLearnedPatternsTool(toolOptions),
       createRule: createRuleTool(toolOptions),
@@ -1015,21 +421,184 @@ Examples:
       updateLearnedPatterns: updateLearnedPatternsTool(toolOptions),
       updateAbout: updateAboutTool(toolOptions),
       addToKnowledgeBase: addToKnowledgeBaseTool(toolOptions),
+      searchMemories: searchMemoriesTool(toolOptions),
+      saveMemory: saveMemoryTool({ ...toolOptions, chatId }),
+      ...(emailSendToolsEnabled
+        ? {
+            sendEmail: sendEmailTool(toolOptions),
+            replyEmail: replyEmailTool(toolOptions),
+            forwardEmail: forwardEmailTool(toolOptions),
+          }
+        : {}),
     },
   });
 
   return result;
 }
 
-async function trackToolCall({
-  tool,
-  email,
+function buildCacheOptimizedMessages({
+  system,
+  conversationMessages,
+  contextMessages,
+}: {
+  system: string;
+  conversationMessages: ModelMessage[];
+  contextMessages: ModelMessage[];
+}) {
+  const systemMessage: ModelMessage = {
+    role: "system",
+    content: system,
+  };
+
+  if (!conversationMessages.length) {
+    return {
+      messages: [systemMessage, ...contextMessages],
+      stablePrefixEndIndex: 0,
+    };
+  }
+
+  const historyMessages = conversationMessages.slice(0, -1);
+  const latestMessage = conversationMessages.at(-1)!;
+
+  return {
+    messages: [
+      systemMessage,
+      ...historyMessages,
+      ...contextMessages,
+      latestMessage,
+    ],
+    stablePrefixEndIndex: historyMessages.length,
+  };
+}
+
+function addAnthropicCacheControl(
+  messages: ModelMessage[],
+  stablePrefixEndIndex: number,
+) {
+  const cacheControl: Record<string, JSONValue> = {
+    cacheControl: { type: "ephemeral" },
+  };
+
+  const cacheBreakpointIndexes = new Set([
+    0,
+    Math.max(0, Math.min(stablePrefixEndIndex, messages.length - 1)),
+  ]);
+
+  return messages.map((message, index) => {
+    if (!cacheBreakpointIndexes.has(index)) return message;
+
+    const messageWithOptions = message as ModelMessage & {
+      providerOptions?: Record<string, Record<string, JSONValue>>;
+    };
+
+    return {
+      ...messageWithOptions,
+      providerOptions: {
+        ...messageWithOptions.providerOptions,
+        anthropic: {
+          ...(messageWithOptions.providerOptions?.anthropic as Record<
+            string,
+            JSONValue
+          >),
+          ...cacheControl,
+        },
+      },
+    };
+  });
+}
+
+function getChatProviderOptionsForCaching({ chatId }: { chatId?: string }) {
+  if (!chatId) return undefined;
+
+  return {
+    openai: {
+      promptCacheKey: `assistant-chat:${chatId}`,
+    },
+  } satisfies Record<string, Record<string, JSONValue>>;
+}
+
+function isConversationStatusFixContext(
+  context: MessageContext,
+  expectedSystemType: SystemType | null,
+) {
+  return (
+    context.results.some((result) =>
+      isConversationStatusType(result.systemType),
+    ) || isConversationStatusType(expectedSystemType)
+  );
+}
+
+async function getExpectedFixContextSystemTypeSafe({
+  context,
+  emailAccountId,
   logger,
 }: {
-  tool: string;
-  email: string;
+  context: MessageContext;
+  emailAccountId: string;
   logger: Logger;
+}): Promise<SystemType | null> {
+  try {
+    return await getExpectedFixContextSystemType({
+      context,
+      emailAccountId,
+    });
+  } catch (error) {
+    logger.warn("Failed to resolve expected fix context system type", {
+      error,
+    });
+    return null;
+  }
+}
+
+async function getExpectedFixContextSystemType({
+  context,
+  emailAccountId,
+}: {
+  context: MessageContext;
+  emailAccountId: string;
+}): Promise<SystemType | null> {
+  if (context.expected === "new" || context.expected === "none") return null;
+
+  if ("id" in context.expected) {
+    const expectedRule = await prisma.rule.findUnique({
+      where: { id: context.expected.id },
+      select: { systemType: true, emailAccountId: true },
+    });
+
+    if (!expectedRule || expectedRule.emailAccountId !== emailAccountId) {
+      return null;
+    }
+
+    return expectedRule.systemType ?? null;
+  }
+
+  const expectedRule = await prisma.rule.findUnique({
+    where: {
+      name_emailAccountId: {
+        name: context.expected.name,
+        emailAccountId,
+      },
+    },
+    select: { systemType: true },
+  });
+
+  return expectedRule?.systemType ?? null;
+}
+
+function getSendEmailSurfacePolicy({
+  responseSurface,
+  messagingPlatform,
+}: {
+  responseSurface: "web" | "messaging";
+  messagingPlatform?: MessagingPlatform;
 }) {
-  logger.info("Tracking tool call", { tool, email });
-  return posthogCaptureEvent(email, "AI Assistant Chat Tool Call", { tool });
+  if (responseSurface === "web") {
+    return "- sendEmail, replyEmail, and forwardEmail prepare a pending action. The UI will show the user a Send button to confirm — you do not need to manage confirmation yourself.\n- These are app-side confirmations, not provider Drafts-folder saves.";
+  }
+
+  const threadContext = messagingPlatform ? "this thread" : "the thread";
+
+  return `- sendEmail, replyEmail, and forwardEmail prepare a pending action only. No email is sent yet.
+- These pending actions are app-side confirmations, not provider Drafts-folder saves.
+- A Send confirmation button is provided in ${threadContext}.`;
 }

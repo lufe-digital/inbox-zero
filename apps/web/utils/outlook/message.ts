@@ -9,10 +9,12 @@ import { escapeODataString } from "@/utils/outlook/odata-escape";
 import { withOutlookRetry } from "@/utils/outlook/retry";
 import { formatEmailWithName } from "@/utils/email";
 import type { Logger } from "@/utils/logger";
+import { isOutlookThrottlingError } from "@/utils/error";
 
 // Standard fields to select when fetching messages from Microsoft Graph API
+// internetMessageId is the RFC 5322 Message-ID header, needed for cross-provider email threading
 export const MESSAGE_SELECT_FIELDS =
-  "id,conversationId,conversationIndex,subject,bodyPreview,from,sender,toRecipients,ccRecipients,receivedDateTime,isDraft,isRead,body,categories,parentFolderId";
+  "id,conversationId,conversationIndex,internetMessageId,subject,bodyPreview,from,sender,toRecipients,ccRecipients,receivedDateTime,isDraft,isRead,body,categories,parentFolderId,hasAttachments";
 
 // Expand attachments to get metadata (name, type, size) without fetching content
 export const MESSAGE_EXPAND_ATTACHMENTS =
@@ -28,31 +30,50 @@ export const WELL_KNOWN_FOLDERS = {
   junkemail: "junkemail",
 } as const;
 
-export async function getFolderIds(client: OutlookClient, logger: Logger) {
+export async function getFolderIds(
+  client: OutlookClient,
+  logger: Logger,
+  options: { includeDrafts?: boolean } = {},
+) {
+  const includeDrafts = options.includeDrafts ?? true;
   const cachedFolderIds = client.getFolderIdCache();
-  if (cachedFolderIds) return cachedFolderIds;
+  if (cachedFolderIds && (!includeDrafts || cachedFolderIds.drafts)) {
+    return cachedFolderIds;
+  }
 
-  // First get the well-known folders
+  const folderEntries = Object.entries(WELL_KNOWN_FOLDERS).filter(
+    ([key]) => includeDrafts || key !== "drafts",
+  );
+
+  const existingFolderIds = cachedFolderIds ?? {};
+  const entriesToFetch = folderEntries.filter(
+    ([key]) => !existingFolderIds[key],
+  );
+
+  if (entriesToFetch.length === 0) {
+    return existingFolderIds;
+  }
+
   const wellKnownFolders = await Promise.all(
-    Object.entries(WELL_KNOWN_FOLDERS).map(async ([key, folderName]) => {
-      try {
-        const response = await client
-          .getClient()
-          .api(`/me/mailFolders/${folderName}`)
-          .select("id")
-          .get();
-        return [key, response.id];
-      } catch (error) {
-        logger.warn("Failed to get well-known folder", {
-          folderName,
-          error,
-        });
-        return [key, null];
-      }
+    entriesToFetch.map(async ([key, folderName]) => {
+      const response: { id?: string | null } = await withOutlookRetry(
+        () =>
+          client
+            .getClient()
+            .api(`/me/mailFolders/${folderName}`)
+            .select("id")
+            .get(),
+        logger,
+      ).catch((error) => {
+        logWellKnownFolderFetchError(logger, folderName, error);
+        return { id: null };
+      });
+
+      return [key, response.id ?? null] as [string, string | null];
     }),
   );
 
-  const userFolderIds = wellKnownFolders.reduce(
+  const fetchedFolderIds = wellKnownFolders.reduce(
     (acc, [key, id]) => {
       if (id) acc[key] = id;
       return acc;
@@ -60,14 +81,45 @@ export async function getFolderIds(client: OutlookClient, logger: Logger) {
     {} as Record<string, string>,
   );
 
-  client.setFolderIdCache(userFolderIds);
+  const mergedFolderIds = { ...existingFolderIds, ...fetchedFolderIds };
+  client.setFolderIdCache(mergedFolderIds);
 
-  return userFolderIds;
+  return mergedFolderIds;
+}
+
+export async function getCategoryMap(
+  client: OutlookClient,
+  logger: Logger,
+): Promise<Map<string, string>> {
+  const cachedMap = client.getCategoryMapCache();
+  if (cachedMap) return cachedMap;
+
+  try {
+    const response: { value: Array<{ id?: string; displayName?: string }> } =
+      await withOutlookRetry(
+        () => client.getClient().api("/me/outlook/masterCategories").get(),
+        logger,
+      );
+
+    const categoryMap = new Map<string, string>();
+    for (const category of response.value) {
+      if (category.displayName && category.id) {
+        categoryMap.set(category.displayName, category.id);
+      }
+    }
+
+    client.setCategoryMapCache(categoryMap);
+    return categoryMap;
+  } catch (error) {
+    logger.warn("Failed to fetch category map", { error });
+    return new Map();
+  }
 }
 
 function getOutlookLabels(
   message: Message,
   folderIds: Record<string, string>,
+  categoryMap?: Map<string, string>,
 ): string[] {
   const labels: string[] = [];
 
@@ -106,9 +158,12 @@ function getOutlookLabels(
     }
   }
 
-  // Add category labels
+  // Add category labels - map names to IDs when category map is available
   if (message.categories) {
-    labels.push(...message.categories);
+    for (const categoryName of message.categories) {
+      const categoryId = categoryMap?.get(categoryName);
+      labels.push(categoryId ?? categoryName);
+    }
   }
 
   // Remove duplicates
@@ -118,7 +173,9 @@ function getOutlookLabels(
 const OUTLOOK_SEARCH_DISALLOWED_CHARS = /[?]/g;
 
 // Pattern to detect KQL field syntax: fieldname:value (e.g., participants:email@example.com)
+// Excludes URL schemes (http, https, ftp, mailto, file) which should be treated as text
 const KQL_FIELD_PATTERN = /^(\w+):.+$/;
+const URL_SCHEME_PATTERN = /^(https?|ftp|mailto|file):/i;
 
 /**
  * Sanitizes a value for use in KQL queries.
@@ -136,7 +193,54 @@ export function sanitizeKqlValue(value: string): string {
     .replace(/"/g, '\\"');
 }
 
-function sanitizeOutlookSearchQuery(query: string): {
+/**
+ * Sanitizes a KQL field query (e.g., participants:email@example.com).
+ * Does NOT wrap the entire query in outer quotes - only quotes the value if it contains spaces.
+ */
+export function sanitizeKqlFieldQuery(query: string): string {
+  const colonIndex = query.indexOf(":");
+  if (colonIndex === -1) return query;
+
+  const field = query.substring(0, colonIndex);
+  const value = query.substring(colonIndex + 1);
+
+  if (!value) {
+    return `${field}:`;
+  }
+
+  let sanitizedValue = value
+    .replace(OUTLOOK_SEARCH_DISALLOWED_CHARS, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const hasSpaces = sanitizedValue.includes(" ");
+
+  sanitizedValue = sanitizedValue.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+
+  if (hasSpaces) {
+    return `${field}:"${sanitizedValue}"`;
+  }
+
+  return `${field}:${sanitizedValue}`;
+}
+
+/**
+ * Sanitizes a regular text query for KQL.
+ * Removes internal double quotes and wraps the entire query in outer quotes.
+ */
+export function sanitizeKqlTextQuery(query: string): string {
+  let sanitized = query
+    .replace(OUTLOOK_SEARCH_DISALLOWED_CHARS, " ")
+    .replace(/"/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  sanitized = sanitized.replace(/\\/g, "\\\\");
+
+  return `"${sanitized}"`;
+}
+
+export function sanitizeOutlookSearchQuery(query: string): {
   sanitized: string;
   wasSanitized: boolean;
 } {
@@ -146,30 +250,20 @@ function sanitizeOutlookSearchQuery(query: string): {
   }
 
   // Check if this is a KQL field syntax query (e.g., participants:email@example.com)
-  // If so, preserve the field structure and don't wrap in quotes
-  if (KQL_FIELD_PATTERN.test(normalized)) {
+  // but exclude URL schemes which should be treated as text
+  if (
+    KQL_FIELD_PATTERN.test(normalized) &&
+    !URL_SCHEME_PATTERN.test(normalized)
+  ) {
     return {
-      sanitized: normalized,
-      wasSanitized: false,
+      sanitized: sanitizeKqlFieldQuery(normalized),
+      wasSanitized: true,
     };
   }
 
-  // Remove disallowed characters
-  let sanitized = normalized
-    .replace(OUTLOOK_SEARCH_DISALLOWED_CHARS, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  // Escape backslashes and double quotes for KQL
-  sanitized = sanitized.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-
-  // Wrap in double quotes to treat as literal phrase search
-  // This prevents KQL from interpreting special characters like - . and numbers
-  sanitized = `"${sanitized}"`;
-
   return {
-    sanitized,
-    wasSanitized: true, // Always true now since we're wrapping in quotes
+    sanitized: sanitizeKqlTextQuery(normalized),
+    wasSanitized: true,
   };
 }
 
@@ -200,7 +294,10 @@ export async function queryBatchMessages(
     );
   }
 
-  const folderIds = await getFolderIds(client, logger);
+  const [folderIds, categoryMap] = await Promise.all([
+    getFolderIds(client, logger, { includeDrafts: false }),
+    getCategoryMap(client, logger),
+  ]);
 
   // If pageToken is a URL, fetch directly (per MS docs, don't extract $skiptoken)
   if (pageToken?.startsWith("http")) {
@@ -213,7 +310,11 @@ export async function queryBatchMessages(
     const filteredMessages = folderId
       ? response.value.filter((message) => message.parentFolderId === folderId)
       : response.value;
-    const messages = await convertMessages(filteredMessages, folderIds);
+    const messages = await convertMessages(
+      filteredMessages,
+      folderIds,
+      categoryMap,
+    );
 
     return { messages, nextPageToken: response["@odata.nextLink"] };
   }
@@ -265,7 +366,11 @@ export async function queryBatchMessages(
     const filteredMessages = folderId
       ? response.value.filter((message) => message.parentFolderId === folderId)
       : response.value;
-    const messages = await convertMessages(filteredMessages, folderIds);
+    const messages = await convertMessages(
+      filteredMessages,
+      folderIds,
+      categoryMap,
+    );
 
     nextPageToken = response["@odata.nextLink"];
 
@@ -310,7 +415,11 @@ export async function queryBatchMessages(
 
     const response: { value: Message[]; "@odata.nextLink"?: string } =
       await withOutlookRetry(() => request.get(), logger);
-    const messages = await convertMessages(response.value, folderIds);
+    const messages = await convertMessages(
+      response.value,
+      folderIds,
+      categoryMap,
+    );
 
     nextPageToken = response["@odata.nextLink"];
 
@@ -348,7 +457,10 @@ export async function queryMessagesWithFilters(
     );
   }
 
-  const folderIds = await getFolderIds(client, logger);
+  const [folderIds, categoryMap] = await Promise.all([
+    getFolderIds(client, logger, { includeDrafts: false }),
+    getCategoryMap(client, logger),
+  ]);
 
   // If pageToken is a URL, fetch directly (per MS docs, don't extract $skiptoken)
   if (pageToken?.startsWith("http")) {
@@ -358,7 +470,11 @@ export async function queryMessagesWithFilters(
         logger,
       );
 
-    const messages = await convertMessages(response.value, folderIds);
+    const messages = await convertMessages(
+      response.value,
+      folderIds,
+      categoryMap,
+    );
     return { messages, nextPageToken: response["@odata.nextLink"] };
   }
 
@@ -407,7 +523,11 @@ export async function queryMessagesWithFilters(
   const response: { value: Message[]; "@odata.nextLink"?: string } =
     await withOutlookRetry(() => request.get(), logger);
 
-  const messages = await convertMessages(response.value, folderIds);
+  const messages = await convertMessages(
+    response.value,
+    folderIds,
+    categoryMap,
+  );
 
   return { messages, nextPageToken: response["@odata.nextLink"] };
 }
@@ -415,10 +535,76 @@ export async function queryMessagesWithFilters(
 async function convertMessages(
   messages: Message[],
   folderIds: Record<string, string>,
+  categoryMap?: Map<string, string>,
 ): Promise<ParsedMessage[]> {
   return messages
     .filter((message: Message) => !message.isDraft) // Filter out drafts
-    .map((message: Message) => convertMessage(message, folderIds));
+    .map((message: Message) => convertMessage(message, folderIds, categoryMap));
+}
+
+export async function queryMessagesWithAttachments(
+  client: OutlookClient,
+  options: {
+    maxResults?: number;
+    pageToken?: string;
+  },
+  logger: Logger,
+): Promise<{
+  messages: ParsedMessage[];
+  nextPageToken?: string;
+}> {
+  const MAX_RESULTS = 20;
+  const maxResults = Math.min(options.maxResults || MAX_RESULTS, MAX_RESULTS);
+
+  const categoryMap = await getCategoryMap(client, logger);
+
+  // If pageToken is a URL, fetch directly (per MS docs, don't extract $skiptoken)
+  if (options.pageToken?.startsWith("http")) {
+    const response: { value: Message[]; "@odata.nextLink"?: string } =
+      await withOutlookRetry(
+        () => client.getClient().api(options.pageToken!).get(),
+        logger,
+      );
+
+    // Sort in memory for consistent ordering across all pages
+    const sortedMessages = response.value.sort((a, b) => {
+      const dateA = new Date(a.receivedDateTime || 0).getTime();
+      const dateB = new Date(b.receivedDateTime || 0).getTime();
+      return dateB - dateA;
+    });
+
+    const messages = await convertMessages(sortedMessages, {}, categoryMap);
+    return { messages, nextPageToken: response["@odata.nextLink"] };
+  }
+
+  // Build request with hasAttachments filter
+  // Note: createMessagesRequest already includes .expand(MESSAGE_EXPAND_ATTACHMENTS)
+  // Avoid adding .orderby() to prevent "restriction or sort order is too complex" error
+  const request = createMessagesRequest(client)
+    .top(maxResults)
+    .filter("hasAttachments eq true");
+
+  const response: { value: Message[]; "@odata.nextLink"?: string } =
+    await withOutlookRetry(() => request.get(), logger);
+
+  // Sort in memory to avoid "restriction or sort order is too complex" error
+  const sortedMessages = response.value.sort((a, b) => {
+    const dateA = new Date(a.receivedDateTime || 0).getTime();
+    const dateB = new Date(b.receivedDateTime || 0).getTime();
+    return dateB - dateA;
+  });
+
+  const messages = await convertMessages(sortedMessages, {}, categoryMap);
+
+  logger.info("Messages with attachments fetched", {
+    messageCount: messages.length,
+    hasNextPageToken: !!response["@odata.nextLink"],
+  });
+
+  return {
+    messages,
+    nextPageToken: response["@odata.nextLink"],
+  };
 }
 
 export async function getMessage(
@@ -431,9 +617,12 @@ export async function getMessage(
     logger,
   );
 
-  const folderIds = await getFolderIds(client, logger);
+  const [folderIds, categoryMap] = await Promise.all([
+    getFolderIds(client, logger, { includeDrafts: false }),
+    getCategoryMap(client, logger),
+  ]);
 
-  return convertMessage(message, folderIds, logger);
+  return convertMessage(message, folderIds, categoryMap, logger);
 }
 
 export async function getMessages(
@@ -457,9 +646,15 @@ export async function getMessages(
   const response: { value: Message[]; "@odata.nextLink"?: string } =
     await withOutlookRetry(() => request.get(), logger);
 
-  // Get folder IDs to properly map labels
-  const folderIds = await getFolderIds(client, logger);
-  const messages = await convertMessages(response.value, folderIds);
+  const [folderIds, categoryMap] = await Promise.all([
+    getFolderIds(client, logger, { includeDrafts: false }),
+    getCategoryMap(client, logger),
+  ]);
+  const messages = await convertMessages(
+    response.value,
+    folderIds,
+    categoryMap,
+  );
 
   return {
     messages,
@@ -520,6 +715,7 @@ function formatRecipientsList(
 export function convertMessage(
   message: Message,
   folderIds: Record<string, string> = {},
+  categoryMap?: Map<string, string>,
   logger?: Logger,
 ): ParsedMessage {
   const bodyContent = message.body?.content || "";
@@ -528,7 +724,7 @@ export function convertMessage(
     | "html"
     | undefined;
 
-  const labelIds = getOutlookLabels(message, folderIds);
+  const labelIds = getOutlookLabels(message, folderIds, categoryMap);
 
   logger?.trace("Converting Outlook message", () => ({
     messageId: message.id,
@@ -556,10 +752,13 @@ export function convertMessage(
       cc: formatRecipientsList(message.ccRecipients),
       subject: message.subject || "",
       date: message.receivedDateTime || new Date().toISOString(),
+      // RFC 5322 Message-ID header, needed for cross-provider email threading (e.g., Outlook -> Gmail)
+      "message-id": message.internetMessageId || "",
     },
     subject: message.subject || "",
     date: message.receivedDateTime || new Date().toISOString(),
     labelIds,
+    parentFolderId: message.parentFolderId || undefined,
     internalDate: message.receivedDateTime || new Date().toISOString(),
     historyId: "",
     inline: [],
@@ -592,4 +791,16 @@ function convertAttachments(
       "content-id": "",
     },
   }));
+}
+
+function logWellKnownFolderFetchError(
+  logger: Logger,
+  folderName: string,
+  error: unknown,
+) {
+  const log = isOutlookThrottlingError(error) ? logger.info : logger.warn;
+  log("Failed to get well-known folder", {
+    folderName,
+    error,
+  });
 }

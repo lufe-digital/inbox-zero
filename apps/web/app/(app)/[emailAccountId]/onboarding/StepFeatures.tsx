@@ -10,12 +10,13 @@ import {
   SparklesIcon,
   ZapIcon,
 } from "lucide-react";
-import { PageHeading, TypographyP } from "@/components/Typography";
+import { MutedText, PageHeading, TypographyP } from "@/components/Typography";
 import { IconCircle } from "@/app/(app)/[emailAccountId]/onboarding/IconCircle";
 import { OnboardingWrapper } from "@/app/(app)/[emailAccountId]/onboarding/OnboardingWrapper";
 import { cn } from "@/utils";
 import { Button } from "@/components/ui/button";
 import { saveOnboardingFeaturesAction } from "@/utils/actions/onboarding";
+import { BRAND_NAME } from "@/utils/branding";
 
 // `value` is the value that will be saved to the database
 const choices = [
@@ -64,7 +65,7 @@ export function StepFeatures({ onNext }: { onNext: () => void }) {
       </IconCircle>
 
       <div className="text-center mt-4">
-        <PageHeading>How would you like to use Inbox Zero?</PageHeading>
+        <PageHeading>{`How would you like to use ${BRAND_NAME}?`}</PageHeading>
         <TypographyP className="mt-2 max-w-lg mx-auto">
           Select as many as you want.
         </TypographyP>
@@ -89,33 +90,32 @@ export function StepFeatures({ onNext }: { onNext: () => void }) {
 
               <div>
                 <div className="font-medium">{choice.label}</div>
-                <div className="text-sm text-muted-foreground">
-                  {choice.description}
-                </div>
+                <MutedText>{choice.description}</MutedText>
               </div>
             </button>
           ))}
         </div>
 
-        <Button
-          type="button"
-          size="sm"
-          className="mt-6"
-          onClick={() => {
-            // Get all selected features (only the ones that are true)
-            const features = Array.from(selectedChoices.entries())
-              .filter(([_, isSelected]) => isSelected)
-              .map(([label]) => label);
+        <div className="flex w-full max-w-xs mx-auto mt-6">
+          <Button
+            type="button"
+            className="w-full"
+            onClick={() => {
+              // Get all selected features (only the ones that are true)
+              const features = Array.from(selectedChoices.entries())
+                .filter(([_, isSelected]) => isSelected)
+                .map(([label]) => label);
 
-            // Fire and forget - don't block navigation
-            saveOnboardingFeaturesAction({ features });
+              // Fire and forget - don't block navigation
+              saveOnboardingFeaturesAction({ features });
 
-            onNext();
-          }}
-        >
-          Continue
-          <ArrowRightIcon className="size-4 ml-2" />
-        </Button>
+              onNext();
+            }}
+          >
+            Continue
+            <ArrowRightIcon className="size-4 ml-2" />
+          </Button>
+        </div>
       </div>
     </OnboardingWrapper>
   );

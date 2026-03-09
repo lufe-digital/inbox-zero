@@ -36,6 +36,7 @@ export const sendEmailBody = z.object({
     })
     .optional(),
   to: z.string(),
+  from: z.string().optional(),
   cc: z.string().optional(),
   bcc: z.string().optional(),
   replyTo: z.string().optional(),
@@ -59,27 +60,27 @@ const createMail = async (options: Mail.Options) => {
   return encodeMessage(message);
 };
 
-const createRawMailMessage = async (
-  {
-    to,
-    cc,
-    bcc,
-    subject,
-    messageHtml,
-    messageText,
-    attachments,
-    replyToEmail,
-  }: Omit<SendEmailBody, "attachments"> & {
-    attachments?: Attachment[];
-    messageText: string;
-  },
-  from?: string,
-) => {
+const createRawMailMessage = async ({
+  to,
+  from,
+  cc,
+  bcc,
+  replyTo,
+  subject,
+  messageHtml,
+  messageText,
+  attachments,
+  replyToEmail,
+}: Omit<SendEmailBody, "attachments"> & {
+  attachments?: Attachment[];
+  messageText: string;
+}) => {
   return await createMail({
     from,
     to,
     cc,
     bcc,
+    replyTo,
     subject,
     alternatives: [
       {
@@ -118,7 +119,12 @@ export async function sendEmailWithHtml(
   } catch (error) {
     logger.error("Error converting email html to text", { error });
     // Strip HTML tags as a fallback
-    messageText = body.messageHtml.replace(/<[^>]*>/g, "");
+    // Keep new lines
+    messageText = body.messageHtml
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<\/p>/gi, "\n")
+      .replace(/<[^>]*>/g, "")
+      .trim();
   }
 
   const raw = await createRawMailMessage({ ...body, messageText });
@@ -150,6 +156,7 @@ export async function replyToEmail(
   >,
   reply: string,
   from?: string,
+  options?: { replyTo?: string },
 ) {
   ensureEmailSendingEnabled();
 
@@ -159,20 +166,19 @@ export async function replyToEmail(
   });
 
   // Only replying to the original sender
-  const raw = await createRawMailMessage(
-    {
-      to: message.headers["reply-to"] || message.headers.from,
-      subject: formatReplySubject(message.headers.subject),
-      messageText: text,
-      messageHtml: html,
-      replyToEmail: {
-        threadId: message.threadId,
-        headerMessageId: message.headers["message-id"] || "",
-        references: message.headers.references,
-      },
-    },
+  const raw = await createRawMailMessage({
+    to: message.headers["reply-to"] || message.headers.from,
     from,
-  );
+    replyTo: options?.replyTo,
+    subject: formatReplySubject(message.headers.subject),
+    messageText: text,
+    messageHtml: html,
+    replyToEmail: {
+      threadId: message.threadId,
+      headerMessageId: message.headers["message-id"] || "",
+      references: message.headers.references,
+    },
+  });
 
   const result = await withGmailRetry(() =>
     gmail.users.messages.send({
@@ -328,17 +334,17 @@ async function createDraft(
   return result;
 }
 
-function convertTextToHtmlParagraphs(text?: string | null): string {
+export function convertTextToHtmlParagraphs(text?: string | null): string {
   if (!text) return "";
 
-  // Split the text into paragraphs based on newline characters
-  const paragraphs = text
-    .split("\n")
-    .filter((paragraph) => paragraph.trim() !== "");
+  const normalizedText = text.replace(/\r\n/g, "\n");
+  const lines = normalizedText.split("\n");
 
-  // Wrap each paragraph with <p> tags and join them back together
-  const htmlContent = paragraphs
-    .map((paragraph) => `<p>${paragraph.trim()}</p>`)
+  const htmlContent = lines
+    .map((line) => {
+      const trimmed = line.trim();
+      return trimmed === "" ? "<br>" : `<p>${trimmed}</p>`;
+    })
     .join("");
 
   return `<html><body>${htmlContent}</body></html>`;

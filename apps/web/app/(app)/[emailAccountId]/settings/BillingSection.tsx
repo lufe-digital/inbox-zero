@@ -1,29 +1,71 @@
 "use client";
 
-import { FormSection, FormSectionLeft } from "@/components/Form";
+import Link from "next/link";
 import { usePremium } from "@/components/PremiumAlert";
 import { ManageSubscription } from "@/app/(app)/premium/ManageSubscription";
 import { LoadingContent } from "@/components/LoadingContent";
-import { MessageText } from "@/components/Typography";
+import { Button } from "@/components/ui/button";
+import {
+  Item,
+  ItemContent,
+  ItemTitle,
+  ItemActions,
+} from "@/components/ui/item";
+import type { PremiumTier } from "@/generated/prisma/enums";
 
 export function BillingSection() {
-  const { premium, isLoading } = usePremium();
-  return (
-    <FormSection>
-      <FormSectionLeft
-        title="Billing"
-        description="Manage your billing information and subscription."
-      />
+  const { premium, isPremium, isLoading } = usePremium();
 
-      <div>
-        <LoadingContent loading={isLoading}>
-          {premium?.lemonSqueezyCustomerId || premium?.stripeSubscriptionId ? (
+  return (
+    <LoadingContent loading={isLoading}>
+      {premium &&
+      (isPremium ||
+        premium.lemonSqueezyCustomerId ||
+        premium.stripeSubscriptionId) ? (
+        <Item size="sm">
+          <ItemContent>
+            <ItemTitle>{getPlanDisplayName(premium.tier)} plan</ItemTitle>
+          </ItemContent>
+          <ItemActions>
             <ManageSubscription premium={premium} />
-          ) : (
-            <MessageText>No billing information.</MessageText>
-          )}
-        </LoadingContent>
-      </div>
-    </FormSection>
+            <Button asChild variant="outline" size="sm">
+              <Link href="/premium">Change plan</Link>
+            </Button>
+          </ItemActions>
+        </Item>
+      ) : (
+        <Item size="sm">
+          <ItemContent>
+            <ItemTitle>No active plan</ItemTitle>
+          </ItemContent>
+          <ItemActions>
+            <Button asChild variant="outline" size="sm">
+              <Link href="/premium">Upgrade</Link>
+            </Button>
+          </ItemActions>
+        </Item>
+      )}
+    </LoadingContent>
   );
+}
+
+function getPlanDisplayName(tier: PremiumTier | null | undefined): string {
+  if (!tier) return "Premium";
+
+  const tierMap: Partial<Record<PremiumTier, string>> = {
+    STARTER_MONTHLY: "Starter",
+    STARTER_ANNUALLY: "Starter",
+    PLUS_MONTHLY: "Plus",
+    PLUS_ANNUALLY: "Plus",
+    PROFESSIONAL_MONTHLY: "Professional",
+    PROFESSIONAL_ANNUALLY: "Professional",
+    COPILOT_MONTHLY: "Enterprise",
+    BASIC_MONTHLY: "Basic",
+    BASIC_ANNUALLY: "Basic",
+    PRO_MONTHLY: "Pro",
+    PRO_ANNUALLY: "Pro",
+    LIFETIME: "Lifetime",
+  };
+
+  return tierMap[tier] ?? "Premium";
 }

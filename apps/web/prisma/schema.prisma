@@ -1,13 +1,10 @@
 datasource db {
-  provider  = "postgresql"
-  url       = env("DATABASE_URL")
-  directUrl = env("DIRECT_URL")
+  provider = "postgresql"
 }
 
 generator client {
   provider               = "prisma-client"
   output                 = "../generated/prisma"
-  engineType             = "client"
   generatedFileExtension = "ts"
   importFileExtension    = "ts"
 }
@@ -74,6 +71,8 @@ model User {
   lastLogin                DateTime?
   utms                     Json?
   errorMessages            Json? // eg. user set incorrect AI API key
+  announcementDismissedAt  DateTime?
+  dismissedHints           String[]  @default([])
 
   // survey answers (extracted from onboardingAnswers for easier querying)
   surveyFeatures     String[] // multiple choice: features user is interested in
@@ -141,12 +140,17 @@ model EmailAccount {
   rulesPrompt               String? // @deprecated
   autoCategorizeSenders     Boolean           @default(false)
   multiRuleSelectionEnabled Boolean           @default(false)
+  draftReplyConfidence      DraftReplyConfidence @default(ALL_EMAILS)
 
   meetingBriefingsEnabled       Boolean @default(false)
   meetingBriefingsMinutesBefore Int     @default(240) // 4 hours in minutes
+  meetingBriefsSendEmail        Boolean @default(true)
 
-  followUpAwaitingReplyDays Int?
-  followUpNeedsReplyDays    Int?
+  filingEnabled Boolean @default(false)
+  filingPrompt  String?
+
+  followUpAwaitingReplyDays Float?
+  followUpNeedsReplyDays    Float?
   followUpAutoDraftEnabled  Boolean @default(true)
 
   digestSchedule Schedule?
@@ -170,6 +174,7 @@ model EmailAccount {
   emailTokens      EmailToken[]
   knowledge        Knowledge[]
   chats            Chat[]
+  chatMemories     ChatMemory[]
   digests          Digest[]
   scheduledActions ScheduledAction[]
   responseTimes    ResponseTime[]
@@ -180,6 +185,10 @@ model EmailAccount {
   calendarConnections CalendarConnection[]
   mcpConnections      McpConnection[]
   meetingBriefings    MeetingBriefing[]
+  driveConnections    DriveConnection[]
+  messagingChannels   MessagingChannel[]
+  documentFilings     DocumentFiling[]
+  filingFolders       FilingFolder[]
 
   @@index([userId])
   @@index([lastSummaryEmailAt])
@@ -200,17 +209,18 @@ model Organization {
 }
 
 model Member {
-  id             String       @id @default(cuid())
-  organizationId String
-  emailAccountId String
-  role           String       @default("member") // "admin" | "member"
-  createdAt      DateTime     @default(now())
-  updatedAt      DateTime     @updatedAt
-  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  emailAccount   EmailAccount @relation(fields: [emailAccountId], references: [id], onDelete: Cascade)
+  id                     String       @id @default(cuid())
+  organizationId         String
+  emailAccountId         String
+  role                   String       @default("member") // "admin" | "member"
+  allowOrgAdminAnalytics Boolean      @default(false)
+  createdAt              DateTime     @default(now())
+  updatedAt              DateTime     @updatedAt
+  organization           Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  emailAccount           EmailAccount @relation(fields: [emailAccountId], references: [id], onDelete: Cascade)
 
   @@unique([organizationId, emailAccountId])
-  @@index([emailAccountId])
+  @@unique([emailAccountId])
 }
 
 model Invitation {
@@ -350,6 +360,9 @@ model Premium {
   stripeTrialEnd           DateTime? // Timestamp for when the free trial period ends (if applicable). Important for managing trial-to-paid transitions.
   stripeCanceledAt         DateTime? // Timestamp for when the subscription was definitively marked as canceled in Stripe (might be immediate or after period end). Historical data.
   stripeEndedAt            DateTime? // Timestamp for when the subscription ended permanently for any reason (cancellation, final payment failure). Historical data.
+  stripeAiOverageLastInvoiceId String?
+  stripeAiOverageLastPeriodEnd DateTime?
+  stripeAiOverageLastUnits     Int?
 
   tier PremiumTier?
 
@@ -523,6 +536,7 @@ model ExecutedRule {
   @@index([emailAccountId, threadId, messageId, ruleId])
   @@index([emailAccountId, messageId])
   @@index([emailAccountId, status, createdAt])
+  @@index([emailAccountId, createdAt])
 }
 
 model ExecutedAction {
@@ -752,7 +766,8 @@ model ThreadTracker {
   resolved  Boolean           @default(false)
   type      ThreadTrackerType
 
-  followUpAppliedAt DateTime? // When the follow-up label was added (prevents re-processing)
+  followUpAppliedAt DateTime?
+  followUpDraftId   String?
 
   emailAccountId String
   emailAccount   EmailAccount @relation(fields: [emailAccountId], references: [id], onDelete: Cascade)
@@ -892,9 +907,13 @@ model Chat {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  compactionCount Int @default(0)
+
   messages       ChatMessage[]
+  compactions    ChatCompaction[]
+  memories       ChatMemory[]
   emailAccountId String
-  emailAccount   EmailAccount  @relation(fields: [emailAccountId], references: [id], onDelete: Cascade)
+  emailAccount   EmailAccount     @relation(fields: [emailAccountId], references: [id], onDelete: Cascade)
 
   @@index([emailAccountId])
 }
@@ -912,6 +931,35 @@ model ChatMessage {
   chat   Chat   @relation(fields: [chatId], references: [id], onDelete: Cascade)
 
   @@index([chatId])
+}
+
+model ChatCompaction {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+
+  summary                  String   @db.Text
+  messageCount             Int
+  compactedBeforeCreatedAt DateTime // boundary: messages with createdAt >= this were NOT compacted
+
+  chatId String
+  chat   Chat   @relation(fields: [chatId], references: [id], onDelete: Cascade)
+
+  @@index([chatId])
+}
+
+model ChatMemory {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  content String
+
+  chatId         String?
+  chat           Chat?        @relation(fields: [chatId], references: [id], onDelete: SetNull)
+  emailAccountId String
+  emailAccount   EmailAccount @relation(fields: [emailAccountId], references: [id], onDelete: Cascade)
+
+  @@index([emailAccountId])
 }
 
 model CalendarConnection {
@@ -967,6 +1015,173 @@ model MeetingBriefing {
 
   @@unique([emailAccountId, calendarEventId]) // Prevent duplicate briefings
   @@index([emailAccountId])
+}
+
+model MessagingChannel {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  provider    MessagingProvider
+  isConnected Boolean           @default(true)
+
+  // Provider workspace/account
+  teamId         String // Slack workspace ID, Discord server ID, etc.
+  teamName       String? // Display name
+  providerUserId String? // Slack user ID of the person who authorized the connection
+  botUserId      String? // Slack bot user ID (for mention stripping)
+
+  // OAuth credentials (encrypted via prisma-extensions)
+  accessToken  String?
+  refreshToken String?
+  expiresAt    DateTime?
+
+  // Target channel for notifications (meeting briefs, alerts)
+  channelId   String?
+  channelName String?
+
+  // Feature toggles
+  sendMeetingBriefs   Boolean @default(false)
+  sendDocumentFilings Boolean @default(false)
+
+  emailAccountId String
+  emailAccount   EmailAccount    @relation(fields: [emailAccountId], references: [id], onDelete: Cascade)
+  automationJobs AutomationJob[]
+
+  @@unique([emailAccountId, provider, teamId])
+  @@unique([id, emailAccountId])
+  @@index([emailAccountId])
+  @@index([provider, teamId])
+}
+
+model AutomationJob {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  name           String
+  enabled        Boolean @default(true)
+  prompt         String? @db.Text
+  cronExpression String // UTC cron expression
+
+  nextRunAt DateTime
+
+  messagingChannelId String
+  messagingChannel   MessagingChannel @relation(fields: [messagingChannelId, emailAccountId], references: [id, emailAccountId], onDelete: Cascade)
+
+  emailAccountId String
+
+  runs AutomationJobRun[]
+
+  // Current product behavior is one automation job per account.
+  // Remove this when we support managing multiple jobs per account.
+  @@unique([emailAccountId])
+  @@index([emailAccountId, enabled, nextRunAt])
+  @@index([enabled, nextRunAt])
+  @@index([messagingChannelId, emailAccountId])
+}
+
+model AutomationJobRun {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+
+  status       AutomationJobRunStatus @default(PENDING)
+  scheduledFor DateTime
+  processedAt  DateTime?
+
+  outboundMessage   String? @db.Text
+  providerMessageId String? // Provider message ID (e.g. Slack `ts`)
+  error             String? @db.Text
+
+  automationJobId String
+  automationJob   AutomationJob @relation(fields: [automationJobId], references: [id], onDelete: Cascade)
+
+  @@unique([automationJobId, scheduledFor])
+  @@index([automationJobId, createdAt])
+  @@index([status, createdAt])
+}
+
+// Drive connection for document auto-organization (Google Drive or OneDrive/SharePoint)
+// One connection per provider. But we can remove unique constraint in the future if we want
+model DriveConnection {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  provider     String // "google" or "microsoft"
+  email        String // can differ from emailAccount - e.g. connect work Drive to personal email
+  accessToken  String?
+  refreshToken String?
+  expiresAt    DateTime?
+  isConnected  Boolean   @default(true)
+
+  emailAccountId String
+  emailAccount   EmailAccount @relation(fields: [emailAccountId], references: [id], onDelete: Cascade)
+
+  documentFilings DocumentFiling[]
+  filingFolders   FilingFolder[]
+
+  @@unique([emailAccountId, provider])
+  @@index([emailAccountId])
+}
+
+model FilingFolder {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  folderId   String
+  folderName String
+  folderPath String
+
+  driveConnectionId String
+  driveConnection   DriveConnection @relation(fields: [driveConnectionId], references: [id], onDelete: Cascade)
+  emailAccountId    String
+  emailAccount      EmailAccount    @relation(fields: [emailAccountId], references: [id], onDelete: Cascade)
+
+  @@unique([emailAccountId, folderId])
+  @@index([driveConnectionId])
+}
+
+model DocumentFiling {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Source email attachment
+  messageId    String
+  attachmentId String
+  filename     String
+
+  // Result (after filing or prediction)
+  folderId   String? // null if AI suggests creating a new folder
+  folderPath String
+  fileId     String?
+  reasoning  String?
+  confidence Float?
+
+  status DocumentFilingStatus @default(FILED)
+
+  wasAsked     Boolean   @default(false)
+  wasCorrected Boolean   @default(false)
+  originalPath String?
+  correctedAt  DateTime?
+
+  // Feedback (for preview and corrections)
+  feedbackPositive Boolean?
+  feedbackAt       DateTime?
+
+  notificationMessageId String?   @unique
+  notificationSentAt    DateTime?
+
+  driveConnectionId String
+  driveConnection   DriveConnection @relation(fields: [driveConnectionId], references: [id], onDelete: Cascade)
+  emailAccountId    String
+  emailAccount      EmailAccount    @relation(fields: [emailAccountId], references: [id], onDelete: Cascade)
+
+  @@index([emailAccountId, status])
+  @@index([driveConnectionId])
+  @@index([messageId])
 }
 
 model Referral {
@@ -1084,6 +1299,12 @@ enum Frequency {
   // ANNUALLY
 }
 
+enum DraftReplyConfidence {
+  ALL_EMAILS
+  STANDARD
+  HIGH_CONFIDENCE
+}
+
 enum NewsletterStatus {
   APPROVED
   UNSUBSCRIBED
@@ -1093,6 +1314,14 @@ enum NewsletterStatus {
 enum ColdEmailStatus {
   AI_LABELED_COLD
   USER_REJECTED_COLD
+}
+
+enum DocumentFilingStatus {
+  PENDING // Waiting for user input
+  FILED // Document is filed (auto or after user confirmation)
+  REJECTED // User said skip
+  ERROR // Filing failed
+  PREVIEW // Preview feedback only (not filed)
 }
 
 // @deprecated - No longer used
@@ -1109,10 +1338,12 @@ enum PremiumTier {
   BASIC_ANNUALLY
   PRO_MONTHLY
   PRO_ANNUALLY
-  BUSINESS_MONTHLY
-  BUSINESS_ANNUALLY
-  BUSINESS_PLUS_MONTHLY
-  BUSINESS_PLUS_ANNUALLY
+  STARTER_MONTHLY       @map("BUSINESS_MONTHLY")
+  STARTER_ANNUALLY      @map("BUSINESS_ANNUALLY")
+  PLUS_MONTHLY
+  PLUS_ANNUALLY
+  PROFESSIONAL_MONTHLY  @map("BUSINESS_PLUS_MONTHLY")
+  PROFESSIONAL_ANNUALLY @map("BUSINESS_PLUS_ANNUALLY")
   COPILOT_MONTHLY
   LIFETIME
 }
@@ -1211,4 +1442,19 @@ enum GroupItemSource {
   AI
   USER
   LABEL_REMOVED
+  LABEL_ADDED
+}
+
+enum MessagingProvider {
+  SLACK
+  TEAMS
+  TELEGRAM
+}
+
+enum AutomationJobRunStatus {
+  PENDING
+  RUNNING
+  SENT
+  SKIPPED
+  FAILED
 }

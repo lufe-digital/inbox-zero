@@ -3,10 +3,11 @@
 import Image from "next/image";
 import { MailIcon } from "lucide-react";
 import { CardBasic } from "@/components/ui/card";
-import { PageHeading, TypographyP } from "@/components/Typography";
+import { MutedText, PageHeading, TypographyP } from "@/components/Typography";
 import { IconCircle } from "@/app/(app)/[emailAccountId]/onboarding/IconCircle";
 import { OnboardingWrapper } from "@/app/(app)/[emailAccountId]/onboarding/OnboardingWrapper";
 import { ContinueButton } from "@/app/(app)/[emailAccountId]/onboarding/ContinueButton";
+import { BRAND_NAME } from "@/utils/branding";
 
 export function StepIntro({ onNext }: { onNext: () => void }) {
   return (
@@ -16,7 +17,7 @@ export function StepIntro({ onNext }: { onNext: () => void }) {
       </IconCircle>
 
       <div className="text-center mt-4">
-        <PageHeading>Get to know Inbox Zero</PageHeading>
+        <PageHeading>{`Get to know ${BRAND_NAME}`}</PageHeading>
         <TypographyP className="mt-2 max-w-lg mx-auto">
           We'll take you through the steps to get you started and set you up for
           success.
@@ -26,8 +27,8 @@ export function StepIntro({ onNext }: { onNext: () => void }) {
         <div className="grid gap-4 sm:gap-8">
           <Benefit
             index={1}
-            title="Emails sorted automatically"
-            description="Emails are automatically organized into categories like 'To Reply', 'Newsletters', and 'Cold Emails'. You can create any categories you want."
+            title="We sort your emails"
+            description="Every email is automatically organized into categories like 'To Reply', 'Newsletters', and 'Cold Emails'. Create any categories you want."
             image="/images/onboarding/newsletters.png"
           />
           <Benefit
@@ -74,9 +75,7 @@ function Benefit({
         <IconCircle>{index}</IconCircle>
         <div>
           <div className="font-semibold text-lg sm:text-xl">{title}</div>
-          <div className="text-sm text-muted-foreground mt-1 leading-6">
-            <p>{description}</p>
-          </div>
+          <MutedText className="mt-1 leading-6">{description}</MutedText>
         </div>
       </div>
       <div className="col-span-3 text-sm text-muted-foreground rounded-tl-2xl pl-4 pt-4 bg-slate-50 border-t border-l border-slate-200 overflow-hidden">
