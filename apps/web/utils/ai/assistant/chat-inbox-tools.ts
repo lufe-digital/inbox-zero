@@ -12,13 +12,20 @@ import type { ParsedMessage } from "@/utils/types";
 import { getEmailForLLM } from "@/utils/get-email-from-message";
 import { getFormattedSenderAddress } from "@/utils/email/get-formatted-sender-address";
 import { runWithBoundedConcurrency } from "@/utils/async";
+import { resolveLabelNameAndId } from "@/utils/label/resolve-label";
 import { findUnsubscribeLink } from "@/utils/parse/parseHtml.server";
+import {
+  manageInboxActions,
+  requiresSenderEmails,
+  requiresThreadIds,
+} from "@/utils/ai/assistant/manage-inbox-actions";
 import {
   type AutomaticUnsubscribeResult,
   unsubscribeSenderAndMark,
 } from "@/utils/senders/unsubscribe";
+import { isMicrosoftProvider } from "@/utils/email/provider-types";
 
-const emptyInputSchema = z.object({}).describe("No parameters required");
+const emptyInputSchema = z.object({});
 const recipientListSchema = z
   .string()
   .trim()
@@ -48,8 +55,12 @@ const recipientFieldsSchema = {
 const sendEmailToolInputSchema = z
   .object({
     ...recipientFieldsSchema,
-    subject: z.string().trim().min(1).max(300),
-    messageHtml: z.string().trim().min(1),
+    subject: z.string().trim().min(1).max(300).describe("Email subject line."),
+    messageHtml: z
+      .string()
+      .trim()
+      .min(1)
+      .describe("HTML body content for the email draft."),
   })
   .strict();
 const replyEmailToolInputSchema = z
@@ -61,14 +72,30 @@ const replyEmailToolInputSchema = z
       .describe(
         "Message ID to reply to. Use a messageId returned by searchInbox.",
       ),
-    content: z.string().trim().min(1).max(10_000),
+    content: z
+      .string()
+      .trim()
+      .min(1)
+      .max(10_000)
+      .describe("Reply body content to include in the draft."),
   })
   .strict();
 const forwardEmailToolInputSchema = z
   .object({
-    messageId: z.string().trim().min(1),
+    messageId: z
+      .string()
+      .trim()
+      .min(1)
+      .describe(
+        "Message ID to forward. Use a messageId returned by searchInbox.",
+      ),
     ...recipientFieldsSchema,
-    content: z.string().trim().max(5000).nullish(),
+    content: z
+      .string()
+      .trim()
+      .max(5000)
+      .nullish()
+      .describe("Optional note to add above the forwarded message."),
   })
   .strict();
 
@@ -85,7 +112,7 @@ export const getAccountOverviewTool = ({
 }) =>
   tool({
     description:
-      "Get account context for inbox operations: provider, labels, meeting briefs settings, and auto-filing attachment settings.",
+      "Get account context for inbox operations such as provider details, label availability, meeting-brief settings, and attachment-filing settings.",
     inputSchema: emptyInputSchema,
     execute: async () => {
       trackToolCall({ tool: "get_account_overview", email, logger });
@@ -166,8 +193,8 @@ export type GetAccountOverviewTool = InferUITool<
 >;
 
 function getSearchQueryDescription(provider: string): string {
-  if (provider === "microsoft") {
-    return "Search query using KQL syntax. Supports: from:, to:, subject:, received>=YYYY-MM-DD, keyword search. Do not use Gmail-specific operators like in:, is:, label:, or after:/before:.";
+  if (isMicrosoftProvider(provider)) {
+    return "Search query using KQL syntax. Supports: unread, read, from:, to:, subject:, received>=YYYY-MM-DD, keyword search. For unread inbox triage, use unread. Do not use Gmail-specific operators like in:, is:, label:, or after:/before:.";
   }
   return "Search query using Gmail syntax. Supports: from:, to:, subject:, in:inbox, is:unread, has:attachment, after:YYYY/MM/DD, before:YYYY/MM/DD, label:, newer_than:, older_than:.";
 }
@@ -277,7 +304,7 @@ export const readEmailTool = ({
 }) =>
   tool({
     description:
-      "Read the content of an email by message ID (up to 4000 characters, HTML converted to plain text). Use after searchInbox when you need more than the snippet.",
+      "Read the full content of an email by message ID, up to 4000 characters with HTML converted to plain text.",
     inputSchema: readEmailInputSchema,
     execute: async ({ messageId }) => {
       trackToolCall({ tool: "read_email", email, logger });
@@ -313,48 +340,26 @@ export const readEmailTool = ({
 
 export type ReadEmailTool = InferUITool<ReturnType<typeof readEmailTool>>;
 
-const threadIdsSchema = z
-  .array(z.string())
-  .min(1)
-  .max(100)
-  .transform((ids) => [...new Set(ids)]);
-
-const senderEmailsSchema = z
-  .array(z.string().trim().min(3))
-  .min(1)
-  .max(100)
-  .transform((emails) => [...new Set(emails)]);
-
-const manageInboxInputSchema = z.object({
-  action: z
-    .enum([
-      "archive_threads",
-      "mark_read_threads",
-      "bulk_archive_senders",
-      "unsubscribe_senders",
-    ])
-    .describe("Inbox action to run."),
-  threadIds: threadIdsSchema
-    .nullish()
-    .describe(
-      "Thread IDs to archive or mark read/unread. Provide IDs from searchInbox results.",
-    ),
-  labelId: z
+const readAttachmentInputSchema = z.object({
+  messageId: z
     .string()
-    .nullish()
     .describe(
-      "Optional provider label/category ID to apply while archiving threads.",
+      "The message ID containing the attachment (from readEmail results)",
     ),
-  read: z
-    .boolean()
-    .nullish()
-    .describe("For mark_read_threads: true for read, false for unread."),
-  fromEmails: senderEmailsSchema
-    .nullish()
-    .describe("Sender email addresses to bulk archive or unsubscribe."),
+  attachmentId: z
+    .string()
+    .describe("The attachment ID (from readEmail attachment metadata)"),
+  mimeType: z
+    .string()
+    .optional()
+    .describe("MIME type from readEmail attachment metadata"),
+  filename: z
+    .string()
+    .optional()
+    .describe("Filename from readEmail attachment metadata"),
 });
 
-export const manageInboxTool = ({
+export const readAttachmentTool = ({
   email,
   emailAccountId,
   provider,
@@ -367,12 +372,173 @@ export const manageInboxTool = ({
 }) =>
   tool({
     description:
-      "Run inbox actions: archive threads, mark threads read/unread, bulk archive by sender, or unsubscribe senders.",
-    inputSchema: manageInboxInputSchema,
+      "Read the text content of an email attachment. Supports PDF, DOCX, plain text, CSV, and HTML. Returns metadata only for binary files (images, etc.).",
+    inputSchema: readAttachmentInputSchema,
+    execute: async ({
+      messageId,
+      attachmentId,
+      mimeType: inputMimeType,
+      filename: inputFilename,
+    }) => {
+      trackToolCall({ tool: "read_attachment", email, logger });
+
+      try {
+        const emailProvider = await createEmailProvider({
+          emailAccountId,
+          provider,
+          logger,
+        });
+
+        let resolvedMimeType = inputMimeType;
+        let resolvedFilename = inputFilename;
+
+        if (!resolvedMimeType || !resolvedFilename) {
+          try {
+            const message = await emailProvider.getMessage(messageId);
+            const matchedAttachment = message.attachments?.find(
+              (attachment) => attachment.attachmentId === attachmentId,
+            );
+
+            resolvedMimeType ??= matchedAttachment?.mimeType ?? undefined;
+            resolvedFilename ??= matchedAttachment?.filename ?? undefined;
+          } catch (error) {
+            logger.warn("Failed to load attachment metadata from message", {
+              error,
+            });
+          }
+        }
+
+        resolvedMimeType ??= "application/octet-stream";
+        resolvedFilename ??= "unknown";
+
+        if (!isExtractableMimeType(resolvedMimeType)) {
+          return {
+            filename: resolvedFilename,
+            mimeType: resolvedMimeType,
+            contentAvailable: false,
+            message:
+              "This attachment type cannot be read as text. Only PDF, DOCX, plain text, CSV, and HTML are supported.",
+          };
+        }
+
+        const attachment = await emailProvider.getAttachment(
+          messageId,
+          attachmentId,
+        );
+
+        const buffer = Buffer.from(attachment.data, "base64");
+
+        const extracted = await extractAttachmentText(
+          buffer,
+          resolvedMimeType,
+          logger,
+        );
+
+        if (!extracted) {
+          return {
+            filename: resolvedFilename,
+            mimeType: resolvedMimeType,
+            size: attachment.size,
+            contentAvailable: false,
+            message: "Failed to extract text from this attachment.",
+          };
+        }
+
+        return {
+          filename: resolvedFilename,
+          mimeType: resolvedMimeType,
+          size: attachment.size,
+          contentAvailable: true,
+          content: extracted.text,
+          truncated: extracted.truncated,
+        };
+      } catch (error) {
+        logger.error("Failed to read attachment", { error });
+        return { error: "Failed to read attachment" };
+      }
+    },
+  });
+
+export type ReadAttachmentTool = InferUITool<
+  ReturnType<typeof readAttachmentTool>
+>;
+
+const threadIdsSchema = z
+  .array(z.string())
+  .min(1)
+  .max(100)
+  .transform((ids) => [...new Set(ids)]);
+
+const senderEmailsSchema = z
+  .array(z.string().trim().min(3))
+  .min(1)
+  .max(100)
+  .transform((emails) => [...new Set(emails)]);
+
+function getManageInboxLabelDescription(provider: string) {
+  return isMicrosoftProvider(provider)
+    ? "Optional exact Outlook category name to apply while archiving threads."
+    : "Optional exact Gmail label name to apply while archiving threads.";
+}
+
+function manageInboxInputSchema(provider: string) {
+  return z.object({
+    action: z
+      .enum(manageInboxActions)
+      .describe(
+        "archive_threads: archive by ID (default unless user says delete/trash). trash_threads: move to trash. label_threads: apply a label (requires labelName). mark_read_threads: mark read/unread. bulk_archive_senders: archive ALL emails from senders server-wide (never for trash/delete). unsubscribe_senders: unsubscribe and archive from senders (only for explicit unsubscribe requests).",
+      ),
+    threadIds: threadIdsSchema
+      .nullish()
+      .describe(
+        "Required for archive_threads, trash_threads, label_threads, and mark_read_threads. Use IDs from searchInbox results or thread IDs the user already provided.",
+      ),
+    label: z
+      .string()
+      .nullish()
+      .describe(getManageInboxLabelDescription(provider)),
+    labelName: z
+      .string()
+      .trim()
+      .min(1)
+      .nullish()
+      .describe(
+        isMicrosoftProvider(provider)
+          ? "Exact Outlook category name to apply to the selected threads."
+          : "Exact Gmail label name to apply to the selected threads.",
+      ),
+    read: z
+      .boolean()
+      .nullish()
+      .describe("For mark_read_threads: true for read, false for unread."),
+    fromEmails: senderEmailsSchema
+      .nullish()
+      .describe(
+        "Required for bulk_archive_senders and unsubscribe_senders. Sender email addresses to act on.",
+      ),
+  });
+}
+
+export const manageInboxTool = ({
+  email,
+  emailAccountId,
+  provider,
+  logger,
+}: {
+  email: string;
+  emailAccountId: string;
+  provider: string;
+  logger: Logger;
+}) => {
+  const inputSchema = manageInboxInputSchema(provider);
+
+  return tool({
+    description: "Run inbox actions on threads or senders.",
+    inputSchema,
     execute: async (input) => {
       trackToolCall({ tool: "manage_inbox", email, logger });
 
-      const parsedInputResult = manageInboxInputSchema.safeParse(input);
+      const parsedInputResult = inputSchema.safeParse(input);
       if (!parsedInputResult.success) {
         const errorMessage = getManageInboxValidationError(
           parsedInputResult.error,
@@ -384,21 +550,28 @@ export const manageInboxTool = ({
       }
 
       const parsedInput = parsedInputResult.data;
-      const isSenderAction =
-        parsedInput.action === "bulk_archive_senders" ||
-        parsedInput.action === "unsubscribe_senders";
+      const isSenderAction = requiresSenderEmails(parsedInput.action);
 
       if (isSenderAction && !parsedInput.fromEmails?.length) {
         return {
           error:
-            "fromEmails is required when action is bulk_archive_senders or unsubscribe_senders",
+            'No sender-level action was taken. "fromEmails" is required for bulk_archive_senders and unsubscribe_senders. If you only meant the emails already shown, use archive_threads with threadIds instead.',
         };
       }
 
-      if (!isSenderAction && !parsedInput.threadIds?.length) {
+      if (
+        requiresThreadIds(parsedInput.action) &&
+        !parsedInput.threadIds?.length
+      ) {
         return {
           error:
-            "threadIds is required when action is archive_threads or mark_read_threads",
+            "threadIds is required when action is archive_threads, label_threads, or mark_read_threads",
+        };
+      }
+
+      if (parsedInput.action === "label_threads" && !parsedInput.labelName) {
+        return {
+          error: "labelName is required when action is label_threads",
         };
       }
 
@@ -416,7 +589,7 @@ export const manageInboxTool = ({
           if (!normalizedFromEmails.length) {
             return {
               error:
-                "fromEmails is required when action is bulk_archive_senders or unsubscribe_senders",
+                'No sender-level action was taken. "fromEmails" is required for bulk_archive_senders and unsubscribe_senders. If you only meant the emails already shown, use archive_threads with threadIds instead.',
             };
           }
 
@@ -478,19 +651,62 @@ export const manageInboxTool = ({
         if (!threadIds) {
           return {
             error:
-              "threadIds is required when action is archive_threads or mark_read_threads",
+              "threadIds is required when action is archive_threads, label_threads, or mark_read_threads",
           };
+        }
+
+        const resolvedArchiveLabel =
+          parsedInput.action === "archive_threads"
+            ? await resolveLabelNameAndId({
+                emailProvider,
+                label: parsedInput.label,
+              })
+            : null;
+        const resolvedArchiveLabelId =
+          resolvedArchiveLabel?.labelId ?? undefined;
+        let resolvedThreadLabel: Awaited<
+          ReturnType<typeof resolveThreadLabel>
+        > | null = null;
+
+        if (parsedInput.action === "label_threads") {
+          try {
+            resolvedThreadLabel = await resolveThreadLabel({
+              emailProvider,
+              labelName: parsedInput.labelName!,
+            });
+          } catch (error) {
+            logger.warn("Failed to resolve label for thread action", {
+              error,
+              labelName: parsedInput.labelName,
+            });
+            return {
+              error:
+                error instanceof Error
+                  ? error.message
+                  : "Failed to resolve label",
+            };
+          }
         }
 
         const threadActionResults = await runThreadActionsInParallel({
           threadIds,
+          concurrency: THREAD_ACTION_CONCURRENCY,
           runAction: async (threadId) => {
             if (parsedInput.action === "archive_threads") {
               await emailProvider.archiveThreadWithLabel(
                 threadId,
                 email,
-                parsedInput.labelId ?? undefined,
+                resolvedArchiveLabelId,
               );
+            } else if (parsedInput.action === "trash_threads") {
+              await emailProvider.trashThread(threadId, email, "user");
+            } else if (parsedInput.action === "label_threads") {
+              await applyLabelToThread({
+                emailProvider,
+                threadId,
+                labelId: resolvedThreadLabel!.labelId,
+                labelName: resolvedThreadLabel!.labelName,
+              });
             } else {
               await emailProvider.markReadThread(
                 threadId,
@@ -513,6 +729,10 @@ export const manageInboxTool = ({
           successCount,
           failedCount: failedThreadIds.length,
           failedThreadIds,
+          ...(resolvedThreadLabel && {
+            labelId: resolvedThreadLabel.labelId,
+            labelName: resolvedThreadLabel.labelName,
+          }),
         };
       } catch (error) {
         logger.error("Failed to run inbox action", { error });
@@ -520,141 +740,9 @@ export const manageInboxTool = ({
       }
     },
   });
+};
 
 export type ManageInboxTool = InferUITool<ReturnType<typeof manageInboxTool>>;
-
-const updateInboxFeaturesInputSchema = z
-  .object({
-    meetingBriefsEnabled: z
-      .boolean()
-      .nullish()
-      .describe("Enable or disable meeting briefs."),
-    meetingBriefsMinutesBefore: z
-      .number()
-      .int()
-      .min(1)
-      .max(2880)
-      .nullish()
-      .describe(
-        "Minutes before a meeting to send a brief (1-2880). Applies when meeting briefs are enabled.",
-      ),
-    meetingBriefsSendEmail: z
-      .boolean()
-      .nullish()
-      .describe("Enable or disable email delivery for meeting briefs."),
-    filingEnabled: z
-      .boolean()
-      .nullish()
-      .describe("Enable or disable auto-file attachments."),
-    filingPrompt: z
-      .string()
-      .max(6000)
-      .nullish()
-      .nullable()
-      .describe(
-        "Custom filing instructions. Set null to clear existing instructions.",
-      ),
-  })
-  .refine(
-    (value) =>
-      value.meetingBriefsEnabled !== undefined ||
-      value.meetingBriefsMinutesBefore !== undefined ||
-      value.meetingBriefsSendEmail !== undefined ||
-      value.filingEnabled !== undefined ||
-      value.filingPrompt !== undefined,
-    { message: "At least one field must be provided." },
-  );
-
-export const updateInboxFeaturesTool = ({
-  email,
-  emailAccountId,
-  logger,
-}: {
-  email: string;
-  emailAccountId: string;
-  logger: Logger;
-}) =>
-  tool({
-    description:
-      "Update account-level inbox features, including meeting briefs and auto-file attachments.",
-    inputSchema: updateInboxFeaturesInputSchema,
-    execute: async ({
-      meetingBriefsEnabled,
-      meetingBriefsMinutesBefore,
-      meetingBriefsSendEmail,
-      filingEnabled,
-      filingPrompt,
-    }) => {
-      trackToolCall({ tool: "update_inbox_features", email, logger });
-      try {
-        const existing = await prisma.emailAccount.findUnique({
-          where: { id: emailAccountId },
-          select: {
-            meetingBriefingsEnabled: true,
-            meetingBriefingsMinutesBefore: true,
-            meetingBriefsSendEmail: true,
-            filingEnabled: true,
-            filingPrompt: true,
-          },
-        });
-
-        if (!existing) return { error: "Email account not found" };
-
-        await prisma.emailAccount.update({
-          where: { id: emailAccountId },
-          data: {
-            ...(meetingBriefsEnabled != null && {
-              meetingBriefingsEnabled: meetingBriefsEnabled,
-            }),
-            ...(meetingBriefsMinutesBefore != null && {
-              meetingBriefingsMinutesBefore: meetingBriefsMinutesBefore,
-            }),
-            ...(meetingBriefsSendEmail != null && {
-              meetingBriefsSendEmail,
-            }),
-            ...(filingEnabled != null && {
-              filingEnabled,
-            }),
-            ...(filingPrompt !== undefined && {
-              filingPrompt,
-            }),
-          },
-        });
-
-        return {
-          success: true,
-          previous: {
-            meetingBriefsEnabled: existing.meetingBriefingsEnabled,
-            meetingBriefsMinutesBefore: existing.meetingBriefingsMinutesBefore,
-            meetingBriefsSendEmail: existing.meetingBriefsSendEmail,
-            filingEnabled: existing.filingEnabled,
-            filingPrompt: existing.filingPrompt,
-          },
-          updated: {
-            meetingBriefsEnabled:
-              meetingBriefsEnabled ?? existing.meetingBriefingsEnabled,
-            meetingBriefsMinutesBefore:
-              meetingBriefsMinutesBefore ??
-              existing.meetingBriefingsMinutesBefore,
-            meetingBriefsSendEmail:
-              meetingBriefsSendEmail ?? existing.meetingBriefsSendEmail,
-            filingEnabled: filingEnabled ?? existing.filingEnabled,
-            filingPrompt:
-              filingPrompt !== undefined ? filingPrompt : existing.filingPrompt,
-          },
-        };
-      } catch (error) {
-        logger.error("Failed to update inbox features", { error });
-        return {
-          error: "Failed to update inbox features",
-        };
-      }
-    },
-  });
-
-export type UpdateInboxFeaturesTool = InferUITool<
-  ReturnType<typeof updateInboxFeaturesTool>
->;
 
 export const sendEmailTool = ({
   email,
@@ -669,7 +757,7 @@ export const sendEmailTool = ({
 }) =>
   tool({
     description:
-      "Prepare a new email to send. This does NOT send immediately. It returns a confirmation payload that must be approved by the user in the UI.",
+      "Prepare a new email to send. This does NOT send immediately — it returns a confirmation payload for the user to approve.",
     inputSchema: sendEmailToolInputSchema,
     execute: async (input) => {
       trackToolCall({ tool: "send_email", email, logger });
@@ -712,7 +800,7 @@ export const replyEmailTool = ({
 }) =>
   tool({
     description:
-      "Prepare a reply to an existing email by message ID. This does NOT send immediately. It returns a confirmation payload that must be approved by the user in the UI.",
+      "Prepare a reply to an existing email by message ID. This does NOT send immediately — it returns a confirmation payload for the user to approve. Do not recreate replies with sendEmail.",
     inputSchema: replyEmailToolInputSchema,
     execute: async (input) => {
       trackToolCall({ tool: "reply_email", email, logger });
@@ -755,7 +843,7 @@ export const forwardEmailTool = ({
 }) =>
   tool({
     description:
-      "Prepare a forward for an existing email by message ID. This does NOT send immediately. It returns a confirmation payload that must be approved by the user in the UI.",
+      "Prepare a forward for an existing email by message ID. This does NOT send immediately — it returns a confirmation payload for the user to approve. Do not recreate forwards with sendEmail.",
     inputSchema: forwardEmailToolInputSchema,
     execute: async (input) => {
       trackToolCall({ tool: "forward_email", email, logger });
@@ -996,15 +1084,16 @@ function createLabelLookupMap(labels: Array<{ id: string; name: string }>) {
 
 async function runThreadActionsInParallel({
   threadIds,
+  concurrency,
   runAction,
 }: {
   threadIds: string[];
+  concurrency: number;
   runAction: (threadId: string) => Promise<void>;
 }) {
-  const BATCH_SIZE = 10;
   const results = await runWithBoundedConcurrency({
     items: threadIds,
-    concurrency: BATCH_SIZE,
+    concurrency,
     run: async (threadId) => {
       await runAction(threadId);
     },
@@ -1014,6 +1103,60 @@ async function runThreadActionsInParallel({
     threadId,
     success: result.status === "fulfilled",
   }));
+}
+
+async function applyLabelToThread({
+  emailProvider,
+  threadId,
+  labelId,
+  labelName,
+}: {
+  emailProvider: EmailProvider;
+  threadId: string;
+  labelId: string;
+  labelName: string | null;
+}) {
+  const messages = await emailProvider.getThreadMessages(threadId);
+  const results = await runWithBoundedConcurrency({
+    items: messages,
+    concurrency: LABEL_MESSAGE_CONCURRENCY,
+    run: async (message) => {
+      await emailProvider.labelMessage({
+        messageId: message.id,
+        labelId,
+        labelName,
+      });
+    },
+  });
+
+  const failedCount = results.filter(
+    ({ result }) => result.status === "rejected",
+  ).length;
+
+  if (failedCount > 0) {
+    throw new Error(`Failed to label ${failedCount} messages in thread`);
+  }
+}
+
+async function resolveThreadLabel({
+  emailProvider,
+  labelName,
+}: {
+  emailProvider: EmailProvider;
+  labelName: string;
+}) {
+  const existingLabel = await emailProvider.getLabelByName(labelName);
+
+  if (!existingLabel) {
+    throw new Error(
+      `Label "${labelName}" does not exist. Use createOrGetLabel first if you want to create it.`,
+    );
+  }
+
+  return {
+    labelId: existingLabel.id,
+    labelName: existingLabel.name,
+  };
 }
 
 async function runSenderUnsubscribeActions({
@@ -1154,6 +1297,9 @@ function normalizeSenderEmails(fromEmails: string[]) {
   ];
 }
 
+const LABEL_MESSAGE_CONCURRENCY = 1;
+const THREAD_ACTION_CONCURRENCY = 3;
+
 function getValidationErrorMessage(toolName: string, error: z.ZodError) {
   const firstIssue = error.issues[0];
   if (!firstIssue) return `Invalid ${toolName} input`;
@@ -1170,4 +1316,69 @@ function getValidationErrorMessage(toolName: string, error: z.ZodError) {
   if (!field) return `Invalid ${toolName} input: ${firstIssue.message}`;
 
   return `Invalid ${toolName} input: ${field} ${firstIssue.message}`;
+}
+
+const MAX_ATTACHMENT_TEXT_LENGTH = 8000;
+
+const EXTRACTABLE_MIME_TYPES = new Set([
+  "application/pdf",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "text/plain",
+  "text/csv",
+  "text/html",
+]);
+
+function isExtractableMimeType(mimeType: string): boolean {
+  return EXTRACTABLE_MIME_TYPES.has(mimeType);
+}
+
+async function extractAttachmentText(
+  buffer: Buffer,
+  mimeType: string,
+  logger: Logger,
+): Promise<{ text: string; truncated: boolean } | null> {
+  if (
+    mimeType === "application/pdf" ||
+    mimeType ===
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+    mimeType === "text/plain"
+  ) {
+    const { extractTextFromDocument } = await import(
+      "@/utils/drive/document-extraction"
+    );
+    const result = await extractTextFromDocument(buffer, mimeType, {
+      maxLength: MAX_ATTACHMENT_TEXT_LENGTH,
+      logger,
+    });
+    if (!result) return null;
+    return { text: result.text, truncated: result.truncated };
+  }
+
+  if (mimeType === "text/csv") {
+    const text = buffer.toString("utf-8");
+    const truncated = text.length > MAX_ATTACHMENT_TEXT_LENGTH;
+    return {
+      text: truncated
+        ? `${text.slice(0, MAX_ATTACHMENT_TEXT_LENGTH)}... (truncated)`
+        : text,
+      truncated,
+    };
+  }
+
+  if (mimeType === "text/html") {
+    const { htmlToText } = await import("html-to-text");
+    const text = htmlToText(buffer.toString("utf-8"), {
+      wordwrap: false,
+      selectors: [{ selector: "img", format: "skip" }],
+    });
+    const truncated = text.length > MAX_ATTACHMENT_TEXT_LENGTH;
+    return {
+      text: truncated
+        ? `${text.slice(0, MAX_ATTACHMENT_TEXT_LENGTH)}... (truncated)`
+        : text,
+      truncated,
+    };
+  }
+
+  return { text: "", truncated: false };
 }

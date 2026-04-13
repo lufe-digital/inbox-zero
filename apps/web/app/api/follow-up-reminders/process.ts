@@ -27,7 +27,9 @@ import {
 } from "@/utils/reply-tracker/label-helpers";
 import { getRuleLabel } from "@/utils/rule/consts";
 import { internalDateToDate } from "@/utils/date";
+import { isSameEmailAddress } from "@/utils/email";
 import { isDuplicateError } from "@/utils/prisma-helpers";
+import { env } from "@/env";
 
 const FOLLOW_UP_ELIGIBILITY_WINDOW_MINUTES = 15;
 const FOLLOW_UP_THREAD_SCAN_LIMIT = 50;
@@ -185,7 +187,7 @@ export async function processAccountFollowUps({
 
   const [dbLabels, providerLabels] = await Promise.all([
     getLabelsFromDb(emailAccountId),
-    provider.getLabels(),
+    provider.getLabels({ includeHidden: true }),
   ]);
   const followUpLabel = await getOrCreateFollowUpLabel(
     provider,
@@ -195,7 +197,9 @@ export async function processAccountFollowUps({
   await processFollowUpsForType({
     systemType: SystemType.AWAITING_REPLY,
     thresholdDays: emailAccount.followUpAwaitingReplyDays,
-    generateDraft: emailAccount.followUpAutoDraftEnabled,
+    generateDraft:
+      emailAccount.followUpAutoDraftEnabled &&
+      !env.NEXT_PUBLIC_AUTO_DRAFT_DISABLED,
     emailAccount,
     provider,
     followUpLabelId: followUpLabel.id,
@@ -449,20 +453,28 @@ async function processFollowUpsForType({
 
       let draftCreated = false;
       if (generateDraft) {
-        try {
-          await generateFollowUpDraft({
-            emailAccount,
-            threadId: thread.id,
-            trackerId: tracker.id,
-            provider,
-            logger: threadLogger,
-          });
-          draftCreated = true;
-        } catch (draftError) {
-          threadLogger.error("Draft generation failed, label still applied", {
-            error: draftError,
-          });
-          captureException(draftError);
+        if (isMessageFromUser(lastMessage, emailAccount.email)) {
+          try {
+            await generateFollowUpDraft({
+              emailAccount,
+              threadId: thread.id,
+              messageId: lastMessage.id,
+              trackerId: tracker.id,
+              provider,
+              logger: threadLogger,
+            });
+            draftCreated = true;
+          } catch (draftError) {
+            threadLogger.error("Draft generation failed, label still applied", {
+              error: draftError,
+            });
+            captureException(draftError);
+          }
+        } else {
+          threadLogger.info(
+            "Skipping follow-up draft because latest message was not sent by the user",
+            { messageId: lastMessage.id },
+          );
         }
       }
 
@@ -614,4 +626,11 @@ function getFollowUpReminderEligibilityWhere() {
     ],
     ...getPremiumUserFilter(),
   };
+}
+
+function isMessageFromUser(
+  message: { headers: { from: string } },
+  userEmail: string,
+) {
+  return isSameEmailAddress(message.headers.from, userEmail);
 }

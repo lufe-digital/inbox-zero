@@ -1,13 +1,20 @@
-import { NextResponse } from "next/server";
 import { env } from "@/env";
+import { auth } from "@/utils/auth";
+import { hash } from "@/utils/hash";
 import prisma from "@/utils/prisma";
 import { OUTLOOK_LINKING_STATE_COOKIE_NAME } from "@/utils/outlook/constants";
 import { withError } from "@/utils/middleware";
 import { captureException, SafeError } from "@/utils/error";
 import { validateOAuthCallback } from "@/utils/oauth/callback-validation";
 import { handleAccountLinking } from "@/utils/oauth/account-linking";
+import { createAccountLinkingRedirect } from "@/utils/oauth/account-linking-redirect";
 import { mergeAccount } from "@/utils/user/merge-account";
 import { handleOAuthCallbackError } from "@/utils/oauth/error-handler";
+import { hasValidMatchingSignedOAuthState } from "@/utils/oauth/callback-validation";
+import {
+  hashOAuthAuditIdentifier,
+  logOAuthLinkingCallbackValidation,
+} from "@/utils/oauth/linking-audit";
 import {
   classifyMicrosoftOAuthCallbackError,
   extractAadstsCode,
@@ -15,6 +22,12 @@ import {
   getSafeMicrosoftOAuthErrorDescription,
   parseMicrosoftScopes,
 } from "@/utils/oauth/microsoft-oauth";
+import {
+  fetchMicrosoftGraph,
+  fetchMicrosoftUserProfile,
+  MicrosoftUserProfileError,
+  requestMicrosoftToken,
+} from "@/utils/microsoft/oauth";
 import {
   acquireOAuthCodeLock,
   getOAuthCodeResult,
@@ -26,7 +39,13 @@ import { SCOPES as OUTLOOK_SCOPES } from "@/utils/outlook/scopes";
 import type { Logger } from "@/utils/logger";
 
 export const GET = withError("outlook/linking/callback", async (request) => {
-  const logger = request.logger;
+  const actorUserId = (await auth(request.headers))?.user.id ?? null;
+  let logger = request.logger.with({
+    actorUserId,
+    auditType: "oauth_linking",
+    hasActorSession: !!actorUserId,
+    provider: "microsoft",
+  });
   const linkingRedirectUri = `${env.NEXT_PUBLIC_BASE_URL}/api/outlook/linking/callback`;
 
   if (!env.MICROSOFT_CLIENT_ID || !env.MICROSOFT_CLIENT_SECRET)
@@ -54,6 +73,8 @@ export const GET = withError("outlook/linking/callback", async (request) => {
       oauthError,
       errorDescription: oauthErrorDescription,
       logger,
+      redirectUri: linkingRedirectUri,
+      requestedScopes: OUTLOOK_SCOPES,
     });
   }
 
@@ -69,20 +90,31 @@ export const GET = withError("outlook/linking/callback", async (request) => {
     return validation.response;
   }
 
-  const { targetUserId, code } = validation;
+  const { targetUserId, code, stateNonce } = validation;
+  logger = logOAuthLinkingCallbackValidation({
+    actorUserId,
+    logger,
+    provider: "microsoft",
+    stateNonce,
+    targetUserId,
+  });
+
+  if (actorUserId && actorUserId !== targetUserId) {
+    return createAccountLinkingRedirect({
+      query: { error: "invalid_state" },
+      stateCookieName: OUTLOOK_LINKING_STATE_COOKIE_NAME,
+    });
+  }
 
   const cachedResult = await getOAuthCodeResult(code);
   if (cachedResult) {
     logger.info("OAuth code already processed, returning cached result", {
       targetUserId,
     });
-    const redirectUrl = new URL("/accounts", env.NEXT_PUBLIC_BASE_URL);
-    for (const [key, value] of Object.entries(cachedResult.params)) {
-      redirectUrl.searchParams.set(key, value);
-    }
-    const response = NextResponse.redirect(redirectUrl);
-    response.cookies.delete(OUTLOOK_LINKING_STATE_COOKIE_NAME);
-    return response;
+    return createAccountLinkingRedirect({
+      query: cachedResult.params,
+      stateCookieName: OUTLOOK_LINKING_STATE_COOKIE_NAME,
+    });
   }
 
   const acquiredLock = await acquireOAuthCodeLock(code);
@@ -90,30 +122,20 @@ export const GET = withError("outlook/linking/callback", async (request) => {
     logger.info("OAuth code is being processed by another request", {
       targetUserId,
     });
-    const redirectUrl = new URL("/accounts", env.NEXT_PUBLIC_BASE_URL);
-    const response = NextResponse.redirect(redirectUrl);
-    response.cookies.delete(OUTLOOK_LINKING_STATE_COOKIE_NAME);
-    return response;
+    return createAccountLinkingRedirect({
+      stateCookieName: OUTLOOK_LINKING_STATE_COOKIE_NAME,
+    });
   }
 
   try {
     // Exchange code for tokens
-    const tokenResponse = await fetch(
-      `https://login.microsoftonline.com/${env.MICROSOFT_TENANT_ID}/oauth2/v2.0/token`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
-        body: new URLSearchParams({
-          client_id: env.MICROSOFT_CLIENT_ID,
-          client_secret: env.MICROSOFT_CLIENT_SECRET,
-          code,
-          grant_type: "authorization_code",
-          redirect_uri: linkingRedirectUri,
-        }),
-      },
-    );
+    const tokenResponse = await requestMicrosoftToken({
+      client_id: env.MICROSOFT_CLIENT_ID,
+      client_secret: env.MICROSOFT_CLIENT_SECRET,
+      code,
+      grant_type: "authorization_code",
+      redirect_uri: linkingRedirectUri,
+    });
 
     const tokens = await tokenResponse.json();
 
@@ -133,27 +155,33 @@ export const GET = withError("outlook/linking/callback", async (request) => {
       throw new SafeError(errorDescription);
     }
 
-    // Get user profile using the access token
-    const profileResponse = await fetch("https://graph.microsoft.com/v1.0/me", {
-      headers: {
-        Authorization: `Bearer ${tokens.access_token}`,
-      },
-    });
+    let profile: Awaited<
+      ReturnType<typeof fetchMicrosoftUserProfile>
+    >["profile"];
+    let providerEmail: string;
 
-    if (!profileResponse.ok) {
-      logger.error("Failed to fetch Microsoft user profile", {
-        targetUserId,
-        status: profileResponse.status,
-      });
-      throw new SafeError("Failed to fetch user profile");
+    try {
+      const result = await fetchMicrosoftUserProfile(tokens.access_token);
+      profile = result.profile;
+      providerEmail = result.email;
+    } catch (error) {
+      if (error instanceof MicrosoftUserProfileError) {
+        if (error.status) {
+          logger.error("Failed to fetch Microsoft user profile", {
+            targetUserId,
+            status: error.status,
+          });
+        }
+        throw new SafeError(error.message);
+      }
+
+      throw error;
     }
 
-    const profile = await profileResponse.json();
     const providerAccountId = profile.id;
-    const providerEmail = profile.mail || profile.userPrincipalName;
 
-    if (!providerAccountId || !providerEmail) {
-      throw new SafeError("Profile missing required id or email");
+    if (!providerAccountId) {
+      throw new SafeError("Profile missing required id");
     }
 
     const existingAccount = await prisma.account.findUnique({
@@ -204,27 +232,15 @@ export const GET = withError("outlook/linking/callback", async (request) => {
         },
       );
 
-      let expiresAt: Date | null = null;
-      if (tokens.expires_at) {
-        expiresAt = new Date(tokens.expires_at * 1000);
-      } else if (tokens.expires_in) {
-        const expiresInSeconds =
-          typeof tokens.expires_in === "string"
-            ? Number.parseInt(tokens.expires_in, 10)
-            : tokens.expires_in;
-        expiresAt = new Date(Date.now() + expiresInSeconds * 1000);
-      }
+      const expiresAt = parseMicrosoftExpiresAt(tokens);
 
       let profileImage = null;
       try {
-        const photoResponse = await fetch(
-          "https://graph.microsoft.com/v1.0/me/photo/$value",
-          {
-            headers: {
-              Authorization: `Bearer ${tokens.access_token}`,
-            },
+        const photoResponse = await fetchMicrosoftGraph("/me/photo/$value", {
+          headers: {
+            Authorization: `Bearer ${tokens.access_token}`,
           },
-        );
+        });
 
         if (photoResponse.ok) {
           const photoBuffer = await photoResponse.arrayBuffer();
@@ -267,6 +283,12 @@ export const GET = withError("outlook/linking/callback", async (request) => {
           targetUserId,
           accountId: newAccount.id,
         });
+        logger.info("OAuth linking callback completed", {
+          accountId: newAccount.id,
+          outcome: "account_created_and_linked",
+          providerEmailHash: hash(providerEmail),
+          providerSubjectHash: hashOAuthAuditIdentifier(providerAccountId),
+        });
       } catch (createError: unknown) {
         if (isDuplicateError(createError)) {
           const accountNow = await prisma.account.findUnique({
@@ -290,6 +312,12 @@ export const GET = withError("outlook/linking/callback", async (request) => {
             );
 
             await updateMicrosoftAccountTokens(accountNow.id, tokens);
+            logger.info("OAuth linking callback completed", {
+              accountId: accountNow.id,
+              outcome: "tokens_updated",
+              providerEmailHash: hash(providerEmail),
+              providerSubjectHash: hashOAuthAuditIdentifier(providerAccountId),
+            });
           } else {
             throw createError;
           }
@@ -299,13 +327,10 @@ export const GET = withError("outlook/linking/callback", async (request) => {
       }
 
       await setOAuthCodeResult(code, { success: "account_created_and_linked" });
-
-      const successUrl = new URL("/accounts", env.NEXT_PUBLIC_BASE_URL);
-      successUrl.searchParams.set("success", "account_created_and_linked");
-      const successResponse = NextResponse.redirect(successUrl);
-      successResponse.cookies.delete(OUTLOOK_LINKING_STATE_COOKIE_NAME);
-
-      return successResponse;
+      return createAccountLinkingRedirect({
+        query: { success: "account_created_and_linked" },
+        stateCookieName: OUTLOOK_LINKING_STATE_COOKIE_NAME,
+      });
     }
 
     if (linkingResult.type === "update_tokens") {
@@ -325,15 +350,18 @@ export const GET = withError("outlook/linking/callback", async (request) => {
         targetUserId,
         accountId: linkingResult.existingAccountId,
       });
+      logger.info("OAuth linking callback completed", {
+        accountId: linkingResult.existingAccountId,
+        outcome: "tokens_updated",
+        providerEmailHash: hash(providerEmail),
+        providerSubjectHash: hashOAuthAuditIdentifier(providerAccountId),
+      });
 
       await setOAuthCodeResult(code, { success: "tokens_updated" });
-
-      const successUrl = new URL("/accounts", env.NEXT_PUBLIC_BASE_URL);
-      successUrl.searchParams.set("success", "tokens_updated");
-      const successResponse = NextResponse.redirect(successUrl);
-      successResponse.cookies.delete(OUTLOOK_LINKING_STATE_COOKIE_NAME);
-
-      return successResponse;
+      return createAccountLinkingRedirect({
+        query: { success: "tokens_updated" },
+        stateCookieName: OUTLOOK_LINKING_STATE_COOKIE_NAME,
+      });
     }
 
     logger.info("Merging Microsoft account (user confirmed).", {
@@ -361,22 +389,22 @@ export const GET = withError("outlook/linking/callback", async (request) => {
       sourceUserId: linkingResult.sourceUserId,
       mergeType,
     });
+    logger.info("OAuth linking callback completed", {
+      outcome: successMessage,
+      providerEmailHash: hash(providerEmail),
+      providerSubjectHash: hashOAuthAuditIdentifier(providerAccountId),
+      sourceUserId: linkingResult.sourceUserId,
+    });
 
     await setOAuthCodeResult(code, { success: successMessage });
-
-    const successUrl = new URL("/accounts", env.NEXT_PUBLIC_BASE_URL);
-    successUrl.searchParams.set("success", successMessage);
-    const successResponse = NextResponse.redirect(successUrl);
-    successResponse.cookies.delete(OUTLOOK_LINKING_STATE_COOKIE_NAME);
-
-    return successResponse;
+    return createAccountLinkingRedirect({
+      query: { success: successMessage },
+      stateCookieName: OUTLOOK_LINKING_STATE_COOKIE_NAME,
+    });
   } catch (error) {
     await clearOAuthCode(code);
-
-    const errorUrl = new URL("/accounts", env.NEXT_PUBLIC_BASE_URL);
     return handleOAuthCallbackError({
       error,
-      redirectUrl: errorUrl,
       stateCookieName: OUTLOOK_LINKING_STATE_COOKIE_NAME,
       logger,
       provider: "microsoft",
@@ -393,6 +421,13 @@ interface MicrosoftTokens {
   token_type?: string | null;
 }
 
+const MICROSOFT_LINKING_SCOPES_TO_VALIDATE = OUTLOOK_SCOPES.filter(
+  (scope) =>
+    !["openid", "profile", "email", "User.Read", "offline_access"].includes(
+      scope,
+    ),
+);
+
 function assertMicrosoftLinkingConsent(params: {
   targetUserId: string;
   tokenScope: string | null | undefined;
@@ -402,7 +437,10 @@ function assertMicrosoftLinkingConsent(params: {
 }) {
   const grantedScopes = parseMicrosoftScopes(params.tokenScope);
   const missingScopes = params.tokenScope
-    ? getMissingMicrosoftScopes(params.tokenScope, OUTLOOK_SCOPES)
+    ? getMissingMicrosoftScopes(
+        params.tokenScope,
+        MICROSOFT_LINKING_SCOPES_TO_VALIDATE,
+      )
     : [];
 
   params.logger.info("Microsoft token exchange succeeded", {
@@ -479,8 +517,9 @@ function handleMicrosoftOAuthAuthorizeError(params: {
   oauthError: string;
   errorDescription: string | null;
   logger: Logger;
+  redirectUri: string;
+  requestedScopes: readonly string[];
 }) {
-  const redirectUrl = new URL("/accounts", env.NEXT_PUBLIC_BASE_URL);
   const mappedError = classifyMicrosoftOAuthCallbackError({
     oauthError: params.oauthError,
     errorDescription: params.errorDescription,
@@ -489,24 +528,33 @@ function handleMicrosoftOAuthAuthorizeError(params: {
   params.logger.warn("Microsoft authorize callback returned an OAuth error", {
     oauthError: params.oauthError,
     aadstsCode: extractAadstsCode(params.errorDescription),
+    errorDescription: params.errorDescription,
+    redirectUri: params.redirectUri,
+    requestedScopes: params.requestedScopes,
+    safeErrorDescription: getSafeMicrosoftOAuthErrorDescription(
+      params.errorDescription,
+    ),
   });
 
   if (mappedError) {
-    redirectUrl.searchParams.set("error", mappedError.errorCode);
-    redirectUrl.searchParams.set("error_description", mappedError.userMessage);
-  } else {
-    redirectUrl.searchParams.set("error", "link_failed");
-    const safeErrorDescription = getSafeMicrosoftOAuthErrorDescription(
-      params.errorDescription,
-    );
-    if (safeErrorDescription) {
-      redirectUrl.searchParams.set("error_description", safeErrorDescription);
-    }
+    return createAccountLinkingRedirect({
+      query: {
+        error: mappedError.errorCode,
+        error_description: mappedError.userMessage,
+      },
+      stateCookieName: OUTLOOK_LINKING_STATE_COOKIE_NAME,
+    });
   }
 
-  const response = NextResponse.redirect(redirectUrl);
-  response.cookies.delete(OUTLOOK_LINKING_STATE_COOKIE_NAME);
-  return response;
+  return createAccountLinkingRedirect({
+    query: {
+      error: "link_failed",
+      error_description: getSafeMicrosoftOAuthErrorDescription(
+        params.errorDescription,
+      ),
+    },
+    stateCookieName: OUTLOOK_LINKING_STATE_COOKIE_NAME,
+  });
 }
 
 function validateMicrosoftOAuthErrorState(params: {
@@ -515,9 +563,11 @@ function validateMicrosoftOAuthErrorState(params: {
   logger: Logger;
 }) {
   if (
-    params.storedState &&
-    params.receivedState &&
-    params.storedState === params.receivedState
+    hasValidMatchingSignedOAuthState({
+      receivedState: params.receivedState,
+      storedState: params.storedState,
+      logger: params.logger,
+    })
   ) {
     return null;
   }
@@ -526,10 +576,8 @@ function validateMicrosoftOAuthErrorState(params: {
     receivedState: params.receivedState,
     hasStoredState: !!params.storedState,
   });
-
-  const redirectUrl = new URL("/accounts", env.NEXT_PUBLIC_BASE_URL);
-  redirectUrl.searchParams.set("error", "invalid_state");
-  const response = NextResponse.redirect(redirectUrl);
-  response.cookies.delete(OUTLOOK_LINKING_STATE_COOKIE_NAME);
-  return response;
+  return createAccountLinkingRedirect({
+    query: { error: "invalid_state" },
+    stateCookieName: OUTLOOK_LINKING_STATE_COOKIE_NAME,
+  });
 }

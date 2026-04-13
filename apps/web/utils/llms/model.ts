@@ -17,8 +17,7 @@ import type { UserAIFields } from "@/utils/llms/types";
 import { createScopedLogger } from "@/utils/logger";
 import { SafeError } from "../error";
 
-// Thinking budgets for Google-family models (set low to minimize cost)
-const GOOGLE_THINKING_BUDGET = 128;
+const DEFAULT_GOOGLE_THINKING_BUDGET = 128;
 
 const logger = createScopedLogger("llms/model");
 
@@ -106,7 +105,7 @@ function selectModel(
 ): ResolvedModel {
   switch (aiProvider) {
     case Provider.OPEN_AI: {
-      const modelName = aiModel || "gpt-5.1";
+      const modelName = aiModel || "gpt-5.4-mini";
       // When Zero Data Retention is enabled, set store: false to avoid
       // "Items are not persisted for Zero Data Retention organizations" errors
       // See: https://github.com/vercel/ai/issues/10060
@@ -127,7 +126,7 @@ function selectModel(
       };
     }
     case Provider.AZURE: {
-      const modelName = aiModel || "gpt-5-mini";
+      const modelName = aiModel || "gpt-5.4-mini";
       const baseOptions = providerOptions ?? {};
       const resourceName = env.AZURE_RESOURCE_NAME;
       if (!resourceName) {
@@ -152,30 +151,28 @@ function selectModel(
     }
     case Provider.GOOGLE: {
       const mod = aiModel || "gemini-2.0-flash";
+      const googleProviderOptions = getGoogleProviderOptions(mod);
       return {
         provider: Provider.GOOGLE,
         modelName: mod,
         model: createGoogleGenerativeAI({
           apiKey: resolveApiKey(aiApiKey, env.GOOGLE_API_KEY),
         })(mod),
-        providerOptions: {
-          google: {
-            thinkingConfig: getGoogleThinkingConfig(mod),
-          } satisfies GoogleGenerativeAIProviderOptions,
-        },
+        providerOptions: googleProviderOptions
+          ? { google: googleProviderOptions }
+          : undefined,
       };
     }
     case Provider.VERTEX: {
       const modelName = aiModel || "gemini-3-flash";
+      const googleProviderOptions = getGoogleProviderOptions(modelName);
       return {
         provider: Provider.VERTEX,
         modelName,
         model: createVertex(getVertexConfig())(modelName),
-        providerOptions: {
-          vertex: {
-            thinkingConfig: getGoogleThinkingConfig(modelName),
-          } satisfies GoogleGenerativeAIProviderOptions,
-        },
+        providerOptions: googleProviderOptions
+          ? { vertex: googleProviderOptions }
+          : undefined,
       };
     }
     case Provider.GROQ: {
@@ -189,7 +186,7 @@ function selectModel(
       };
     }
     case Provider.OPENROUTER: {
-      let modelName = aiModel || "anthropic/claude-sonnet-4.5";
+      let modelName = aiModel || "anthropic/claude-sonnet-4.6";
       if (online) modelName += ":online";
 
       const openrouter = createOpenRouter({
@@ -199,7 +196,11 @@ function selectModel(
           "X-Title": "Inbox Zero",
         },
       });
-      const chatModel = openrouter.chat(modelName);
+      const chatModel = openrouter.chat(modelName, {
+        usage: {
+          include: true,
+        },
+      });
 
       return {
         provider: Provider.OPENROUTER,
@@ -209,9 +210,15 @@ function selectModel(
       };
     }
     case Provider.AI_GATEWAY: {
-      const modelName = aiModel || "google/gemini-3-flash";
+      const modelName = aiModel || "anthropic/claude-sonnet-4.6";
       const aiGatewayApiKey = resolveApiKey(aiApiKey, env.AI_GATEWAY_API_KEY);
-      const gateway = createGateway({ apiKey: aiGatewayApiKey });
+      const gateway = createGateway({
+        apiKey: aiGatewayApiKey,
+        headers: {
+          "http-referer": "https://www.getinboxzero.com",
+          "x-title": "Inbox Zero",
+        },
+      });
       return {
         provider: Provider.AI_GATEWAY,
         modelName,
@@ -254,8 +261,7 @@ function selectModel(
     }
 
     case Provider.BEDROCK: {
-      const modelName =
-        aiModel || "global.anthropic.claude-sonnet-4-5-20250929-v1:0";
+      const modelName = aiModel || "global.anthropic.claude-sonnet-4-6";
       return {
         provider: Provider.BEDROCK,
         modelName,
@@ -272,7 +278,7 @@ function selectModel(
       };
     }
     case Provider.ANTHROPIC: {
-      const modelName = aiModel || "claude-sonnet-4-5-20250929";
+      const modelName = aiModel || "claude-sonnet-4-6";
       return {
         provider: Provider.ANTHROPIC,
         modelName,
@@ -705,18 +711,36 @@ function isXaiGrokModel(modelName?: string | null): boolean {
   return modelName?.toLowerCase().startsWith("x-ai/grok-") ?? false;
 }
 
+function getGoogleProviderOptions(
+  modelName: string,
+): GoogleGenerativeAIProviderOptions | undefined {
+  const thinkingConfig = getGoogleThinkingConfig(modelName);
+  if (!thinkingConfig) return;
+
+  return { thinkingConfig };
+}
+
 function getGoogleThinkingConfig(
   modelName: string,
-): NonNullable<GoogleGenerativeAIProviderOptions["thinkingConfig"]> {
+): GoogleGenerativeAIProviderOptions["thinkingConfig"] | undefined {
   if (isGemini3Model(modelName)) {
     return { thinkingLevel: "minimal" };
   }
 
-  return { thinkingBudget: GOOGLE_THINKING_BUDGET };
+  const thinkingBudget = getGoogleThinkingBudget();
+  if (thinkingBudget === undefined) return;
+
+  return { thinkingBudget };
+}
+
+function getGoogleThinkingBudget(): number | undefined {
+  if (env.GOOGLE_THINKING_BUDGET === 0) return;
+
+  return env.GOOGLE_THINKING_BUDGET ?? DEFAULT_GOOGLE_THINKING_BUDGET;
 }
 
 function isGemini3Model(modelName: string): boolean {
-  return modelName.toLowerCase().startsWith("gemini-3");
+  return normalizeGoogleModelName(modelName).startsWith("gemini-3");
 }
 
 function getAiGatewayProviderOptions(
@@ -725,12 +749,9 @@ function getAiGatewayProviderOptions(
   const normalizedModelName = modelName.toLowerCase();
 
   if (normalizedModelName.startsWith("google/")) {
+    const googleProviderOptions = getGoogleProviderOptions(modelName);
     return {
-      google: {
-        thinkingConfig: {
-          thinkingBudget: GOOGLE_THINKING_BUDGET,
-        },
-      },
+      ...(googleProviderOptions ? { google: googleProviderOptions } : {}),
     };
   }
 
@@ -749,6 +770,10 @@ function getAiGatewayProviderOptions(
 
   // Note: Anthropic thinking is disabled by default (not including the config)
   return {};
+}
+
+function normalizeGoogleModelName(modelName: string): string {
+  return modelName.toLowerCase().replace(/^google\//, "");
 }
 
 function parseFallbackConfig(

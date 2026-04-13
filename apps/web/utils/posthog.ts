@@ -1,4 +1,5 @@
 import { PostHog } from "posthog-node";
+import type { Properties } from "posthog-js";
 import { env } from "@/env";
 import { createScopedLogger } from "@/utils/logger";
 import { hash } from "@/utils/hash";
@@ -22,6 +23,15 @@ export function getPosthogLlmClient() {
   }
 
   return posthogLlmClient;
+}
+
+export function isPosthogLlmEvalApproved(email: string) {
+  if (env.NODE_ENV !== "development") return false;
+
+  const approvedEmails = getPosthogLlmEvalApprovedEmails();
+  if (!approvedEmails.length) return false;
+
+  return approvedEmails.includes(email.trim().toLowerCase());
 }
 
 async function getPosthogUserId(options: { email: string }) {
@@ -167,12 +177,18 @@ export async function trackStripeCustomerCreated(
   );
 }
 
-export async function trackStripeCheckoutCreated(email: string) {
-  return posthogCaptureEvent(email, "Stripe checkout created");
+export async function trackStripeCheckoutCreated(
+  email: string,
+  properties?: Properties,
+) {
+  return posthogCaptureEvent(email, "Stripe checkout created", properties);
 }
 
-export async function trackStripeCheckoutCompleted(email: string) {
-  return posthogCaptureEvent(email, "Stripe checkout completed");
+export async function trackStripeCheckoutCompleted(
+  email: string,
+  properties?: Properties,
+) {
+  return posthogCaptureEvent(email, "Stripe checkout completed", properties);
 }
 
 export async function trackError({
@@ -220,6 +236,20 @@ export async function trackSubscriptionTrialStarted(
   attributes: any,
 ) {
   return posthogCaptureEvent(email, "Premium subscription trial started", {
+    ...attributes,
+    $set: {
+      premium: true,
+      premiumTier: "subscription",
+      premiumStatus: "on_trial",
+    },
+  });
+}
+
+export async function trackBillingTrialStarted(
+  email: string,
+  attributes: Properties,
+) {
+  return posthogCaptureEvent(email, "billing_trial_started", {
     ...attributes,
     $set: {
       premium: true,
@@ -314,4 +344,12 @@ export async function trackStripeEvent(email: string, data: any) {
 
 export async function trackUserDeleted(userId: string) {
   return posthogCaptureEvent("anonymous", "User deleted", { userId }, false);
+}
+
+function getPosthogLlmEvalApprovedEmails() {
+  return (
+    env.POSTHOG_LLM_EVALS_APPROVED_EMAILS?.split(",")
+      .map((email) => email.trim().toLowerCase())
+      .filter(Boolean) ?? []
+  );
 }

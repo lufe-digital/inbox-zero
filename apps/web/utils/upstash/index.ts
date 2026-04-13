@@ -6,11 +6,21 @@ import {
   getInternalApiUrl,
 } from "@/utils/internal-api";
 import { createScopedLogger } from "@/utils/logger";
+import { isSafeExternalHttpUrl } from "@/utils/network/safe-http-url";
 
 const logger = createScopedLogger("upstash");
 
 function getQstashClient() {
   if (!env.QSTASH_TOKEN) return null;
+  if (!isSafeExternalHttpUrl(getQstashCallbackBaseUrl())) {
+    logger.warn(
+      "Qstash callback URL is not externally reachable; using fallback",
+      {
+        qstashCallbackBaseUrl: getQstashCallbackBaseUrl(),
+      },
+    );
+    return null;
+  }
   return new Client({ token: env.QSTASH_TOKEN });
 }
 
@@ -100,6 +110,22 @@ export async function publishToQstashQueue<T>({
     }
   }
 
+  return publishToInternalApiInBackground<T>({
+    path,
+    body,
+    headers,
+  });
+}
+
+export async function publishToInternalApiInBackground<T>({
+  path,
+  body,
+  headers,
+}: {
+  path: string;
+  body: T;
+  headers?: HeadersInit;
+}) {
   const fallbackUrl = `${getInternalApiUrl()}${path}`;
   return fallbackPublishToQstash<T>(fallbackUrl, body, headers);
 }
@@ -157,5 +183,16 @@ function normalizeBaseUrl(url: string) {
 }
 
 function getQstashCallbackBaseUrl() {
+  const candidateUrls = [
+    env.INTERNAL_API_URL,
+    env.WEBHOOK_URL,
+    env.NEXT_PUBLIC_BASE_URL,
+  ].filter((value): value is string => Boolean(value));
+
+  const safeExternalUrl = candidateUrls.find((value) =>
+    isSafeExternalHttpUrl(value),
+  );
+  if (safeExternalUrl) return normalizeBaseUrl(safeExternalUrl);
+
   return normalizeBaseUrl(getInternalApiUrl());
 }

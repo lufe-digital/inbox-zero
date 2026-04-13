@@ -3,6 +3,7 @@
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { Suspense, useEffect } from "react";
+import { getRequiresReconsentDescription } from "@/app/(landing)/login/messages";
 import { Button } from "@/components/ui/button";
 import { BasicLayout } from "@/components/layouts/BasicLayout";
 import { ErrorPage } from "@/components/ErrorPage";
@@ -20,6 +21,11 @@ const errorMessages: Record<string, { title: string; description: string }> = {
     description:
       "Your account is not authorized to access this application. This may be because your email is not part of the allowed organization. Please contact your administrator or try signing in with a different account.",
   },
+  signup_not_allowed: {
+    title: "Sign-up Restricted",
+    description:
+      "This deployment only allows sign-up from specific email addresses or domains. Please contact your administrator or try signing in with a different account.",
+  },
   email_already_linked: {
     title: "Email Already Linked",
     description: `This email address is already linked to another ${BRAND_NAME} account. Please sign in with the original account, or use a different email address.`,
@@ -36,8 +42,7 @@ const errorMessages: Record<string, { title: string; description: string }> = {
   },
   requiresreconsent: {
     title: "Permissions need to be refreshed",
-    description:
-      `Please sign in again and approve every requested permission. If your Microsoft 365 organization requires admin approval, ask your admin to approve ${BRAND_NAME} first.`,
+    description: getRequiresReconsentDescription(),
   },
 };
 

@@ -1,5 +1,5 @@
 import { SafeError } from "@/utils/error";
-import { hasAiAccess, isPremium } from "@/utils/premium";
+import { hasAiAccess, isPremiumRecord } from "@/utils/premium";
 import prisma from "@/utils/prisma";
 
 export async function validateUserAndAiAccess({
@@ -24,6 +24,9 @@ export async function validateUserAndAiAccess({
           aiApiKey: true,
           premium: {
             select: {
+              appleExpiresAt: true,
+              appleRevokedAt: true,
+              appleSubscriptionStatus: true,
               tier: true,
               lemonSqueezyRenewsAt: true,
               stripeSubscriptionStatus: true,
@@ -36,15 +39,12 @@ export async function validateUserAndAiAccess({
   });
   if (!emailAccount) throw new SafeError("User not found");
 
-  const isUserPremium = isPremium(
-    emailAccount.user.premium?.lemonSqueezyRenewsAt || null,
-    emailAccount.user.premium?.stripeSubscriptionStatus || null,
-  );
+  const isUserPremium = isPremiumRecord(emailAccount.user.premium);
   if (!isUserPremium) throw new SafeError("Please upgrade for AI access");
 
   const userHasAiAccess = hasAiAccess(
     emailAccount.user.premium?.tier || null,
-    emailAccount.user.aiApiKey,
+    !!emailAccount.user.aiApiKey,
   );
   if (!userHasAiAccess) throw new SafeError("Please upgrade for AI access");
 

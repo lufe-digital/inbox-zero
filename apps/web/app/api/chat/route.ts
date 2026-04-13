@@ -1,5 +1,9 @@
-import { convertToModelMessages, type UIMessage } from "ai";
-import { z } from "zod";
+import {
+  convertToModelMessages,
+  createUIMessageStream,
+  createUIMessageStreamResponse,
+  type UIMessage,
+} from "ai";
 import { withEmailAccount } from "@/utils/middleware";
 import { getEmailAccountWithAi } from "@/utils/user/get";
 import { NextResponse } from "next/server";
@@ -9,8 +13,6 @@ import prisma from "@/utils/prisma";
 import type { Prisma } from "@/generated/prisma/client";
 import { convertToUIMessages } from "@/components/assistant-chat/helpers";
 import { captureException } from "@/utils/error";
-import { recordChatEntry } from "@/utils/replay/recorder";
-import { messageContextSchema } from "@/app/api/chat/validation";
 import {
   shouldCompact,
   compactMessages,
@@ -20,44 +22,18 @@ import {
 import { getInboxStatsForChatContext } from "@/utils/ai/assistant/get-inbox-stats-for-chat-context";
 import { formatUtcDate } from "@/utils/date";
 import { mapUiMessagesToChatMessageRows } from "@/app/api/chat/chat-message-persistence";
+import {
+  type AssistantInput,
+  assistantInputSchema,
+} from "@/utils/actions/assistant-chat.validation";
+import { buildInlineEmailActionSystemMessage } from "@/utils/ai/assistant/inline-email-actions";
+import {
+  mergeSeenRulesRevision,
+  saveLastSeenRulesRevision,
+} from "@/utils/ai/assistant/chat-seen-rules-revision";
+import { getToolFailureWarning } from "@/utils/ai/assistant/chat-response-guard";
 
 export const maxDuration = 120;
-
-const textPartSchema = z.object({
-  type: z.literal("text"),
-  text: z.string().min(1).max(3000),
-});
-
-const filePartSchema = z.object({
-  type: z.literal("file"),
-  url: z
-    .string()
-    .max(6_000_000)
-    .refine((url) => /^data:image\/(jpeg|png|webp|gif);base64,/.test(url), {
-      message: "URL must be a base64 data URL with an allowed image MIME type",
-    }),
-  filename: z.string().optional(),
-  mediaType: z.enum(["image/jpeg", "image/png", "image/webp", "image/gif"]),
-});
-
-const messagePartSchema = z.discriminatedUnion("type", [
-  textPartSchema,
-  filePartSchema,
-]);
-
-const assistantInputSchema = z.object({
-  id: z.string(),
-  message: z.object({
-    id: z.string(),
-    role: z.enum(["user"]),
-    parts: z
-      .array(messagePartSchema)
-      .refine((parts) => parts.filter((p) => p.type === "file").length <= 5, {
-        message: "Maximum 5 file attachments per message",
-      }),
-  }),
-  context: messageContextSchema.optional(),
-});
 
 export const POST = withEmailAccount("chat", async (request) => {
   const emailAccountId = request.auth.emailAccountId;
@@ -99,7 +75,12 @@ export const POST = withEmailAccount("chat", async (request) => {
     );
   }
 
-  const { message, context } = data;
+  const chatHasHistory =
+    chat.messages.length > 0 || chat.compactions.length > 0;
+  const { message, context, inlineActions } = data;
+
+  const hiddenInlineActionMessage =
+    buildHiddenInlineActionMessage(inlineActions);
 
   await saveChatMessage({
     chat: { connect: { id: chat.id } },
@@ -116,12 +97,23 @@ export const POST = withEmailAccount("chat", async (request) => {
       )
     : chat.messages;
 
-  const uiMessages = [
+  const conversationUiMessages = [
     ...convertToUIMessages({ ...chat, messages: messagesForModel }),
     message,
   ];
 
-  let modelMessages = await convertToModelMessages(uiMessages);
+  const uiMessages = [
+    ...conversationUiMessages,
+    ...(hiddenInlineActionMessage ? [hiddenInlineActionMessage] : []),
+  ];
+
+  const conversationModelMessages = await convertToModelMessages(
+    conversationUiMessages,
+  );
+
+  let modelMessages = hiddenInlineActionMessage
+    ? await convertToModelMessages(uiMessages)
+    : conversationModelMessages;
 
   if (latestCompaction) {
     modelMessages = [
@@ -135,8 +127,6 @@ export const POST = withEmailAccount("chat", async (request) => {
 
   if (shouldCompact(modelMessages)) {
     try {
-      const preCompactionMessages = modelMessages;
-
       const { compactedMessages, summary, compactedCount } =
         await compactMessages({
           messages: modelMessages,
@@ -173,7 +163,7 @@ export const POST = withEmailAccount("chat", async (request) => {
             }),
           ]),
           extractMemories({
-            messages: preCompactionMessages,
+            messages: conversationModelMessages,
             user,
           }).catch((err) => {
             request.logger.error("Failed to extract memories", {
@@ -221,28 +211,68 @@ export const POST = withEmailAccount("chat", async (request) => {
   }
 
   try {
-    const [inboxStats, recordingSession] = await Promise.all([
-      inboxStatsPromise,
-      recordChatEntry(user.email, emailAccountId, data.message),
-    ]);
+    const inboxStats = await inboxStatsPromise;
+    let seenRulesRevision: number | null = null;
 
     const result = await aiProcessAssistantChat({
       messages: modelMessages,
+      conversationMessagesForMemory: conversationModelMessages,
       emailAccountId,
       user,
       context,
       chatId: chat.id,
+      chatLastSeenRulesRevision: chat.lastSeenRulesRevision,
+      chatHasHistory,
       memories,
       inboxStats,
-      recordingSession,
+      onRulesStateExposed: (rulesRevision) => {
+        seenRulesRevision = mergeSeenRulesRevision(
+          seenRulesRevision,
+          rulesRevision,
+        );
+      },
       logger: request.logger,
     });
 
-    return result.toUIMessageStreamResponse({
+    const stream = createUIMessageStream({
+      execute: async ({ writer }) => {
+        let responseMessage: UIMessage | null = null;
+
+        for await (const chunk of result.toUIMessageStream({
+          sendFinish: false,
+          onFinish: ({ responseMessage: finishedResponseMessage }) => {
+            responseMessage = finishedResponseMessage;
+          },
+        })) {
+          writer.write(chunk);
+        }
+
+        const warning = getToolFailureWarning(responseMessage);
+        if (!warning) return;
+
+        const warningPartId = crypto.randomUUID();
+        writer.write({ type: "text-start", id: warningPartId });
+        writer.write({
+          type: "text-delta",
+          id: warningPartId,
+          delta: `\n\n${warning}`,
+        });
+        writer.write({ type: "text-end", id: warningPartId });
+      },
       onFinish: async ({ messages }) => {
         await saveChatMessages(messages, chat.id, request.logger);
+
+        if (seenRulesRevision != null) {
+          await saveLastSeenRulesRevision({
+            chatId: chat.id,
+            rulesRevision: seenRulesRevision,
+            logger: request.logger,
+          });
+        }
       },
     });
+
+    return createUIMessageStreamResponse({ stream });
   } catch (error) {
     request.logger.error("Error in assistant chat", { error });
     return NextResponse.json(
@@ -306,4 +336,17 @@ async function saveChatMessages(
     captureException(error, { extra: { chatId } });
     throw error;
   }
+}
+
+function buildHiddenInlineActionMessage(
+  inlineActions?: AssistantInput["inlineActions"],
+) {
+  const text = buildInlineEmailActionSystemMessage(inlineActions);
+  if (!text) return null;
+
+  return {
+    id: crypto.randomUUID(),
+    role: "system" as const,
+    parts: [{ type: "text" as const, text }],
+  } satisfies UIMessage;
 }

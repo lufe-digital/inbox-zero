@@ -1,13 +1,14 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useRouter } from "next/navigation";
 import { CheckIcon, SparklesIcon } from "lucide-react";
 import Link from "next/link";
+import { usePostHog } from "posthog-js/react";
 import { env } from "@/env";
 import { LoadingContent } from "@/components/LoadingContent";
-import { usePremium } from "@/components/PremiumAlert";
+import { usePremium } from "@/hooks/usePremium";
 import { Button } from "@/components/ui/button";
 import {
   PricingFrequencyToggle,
@@ -15,9 +16,14 @@ import {
   DiscountBadge,
   type Frequency,
 } from "@/app/(app)/premium/PricingFrequencyToggle";
-import { getUserTier } from "@/utils/premium";
-import { type Tier, tiers } from "@/app/(app)/premium/config";
-import { AlertWithButton } from "@/components/Alert";
+import { getUserTier, hasActiveAppleSubscription } from "@/utils/premium";
+import {
+  getPremiumTierName,
+  shouldShowLegacyStripePricingNotice,
+  type Tier,
+  tiers,
+} from "@/app/(app)/premium/config";
+import { AlertBasic, AlertWithButton } from "@/components/Alert";
 import { TooltipExplanation } from "@/components/TooltipExplanation";
 import { toastError } from "@/components/Toast";
 import {
@@ -38,9 +44,27 @@ export type PricingProps = {
 };
 
 export default function Pricing(props: PricingProps) {
-  const { premium, isLoading, error, data } = usePremium();
+  const posthog = usePostHog();
+  const { premium, isPremium, isLoading, error, data } = usePremium();
+  const hasTrackedPricingView = useRef(false);
 
   const isLoggedIn = !!data?.id;
+  const pricingSource = props.showSkipUpgrade
+    ? "welcome_upgrade"
+    : "app_premium";
+  const displayedTiers = props.displayTiers || tiers;
+  const hasActiveAppleManagedSubscription = hasActiveAppleSubscription(
+    premium?.appleExpiresAt || null,
+    premium?.appleRevokedAt || null,
+    premium?.appleSubscriptionStatus || null,
+  );
+  const hasExistingSubscription = Boolean(
+    isPremium ||
+      premium?.stripeSubscriptionId ||
+      premium?.lemonSqueezyCustomerId ||
+      hasActiveAppleManagedSubscription,
+  );
+  const isLegacyStripePlan = shouldShowLegacyStripePricingNotice(premium);
 
   const [frequency, setFrequency] = useState(frequencies[1]);
 
@@ -64,6 +88,27 @@ export default function Pricing(props: PricingProps) {
 
   const router = useRouter();
 
+  useEffect(() => {
+    if (isLoading || hasTrackedPricingView.current) return;
+
+    hasTrackedPricingView.current = true;
+    posthog.capture("pricing_page_viewed", {
+      source: pricingSource,
+      isLoggedIn,
+      hasExistingSubscription,
+      showSkipUpgrade: Boolean(props.showSkipUpgrade),
+      displayedTiers: displayedTiers.map((tier) => tier.name),
+    });
+  }, [
+    displayedTiers,
+    hasExistingSubscription,
+    isLoading,
+    isLoggedIn,
+    posthog,
+    pricingSource,
+    props.showSkipUpgrade,
+  ]);
+
   return (
     <LoadingContent loading={isLoading} error={error}>
       <div
@@ -75,11 +120,9 @@ export default function Pricing(props: PricingProps) {
       >
         {header}
 
-        {!!(
-          premium?.stripeSubscriptionId || premium?.lemonSqueezyCustomerId
-        ) && (
+        {hasExistingSubscription && (
           <div className="mb-8 mt-8 text-center">
-            <ManageSubscription premium={premium} />
+            <ManageSubscription premium={premium ?? null} />
 
             {userPremiumTier && (
               <>
@@ -112,6 +155,26 @@ export default function Pricing(props: PricingProps) {
                 </div>
               </>
             )}
+
+            {hasActiveAppleManagedSubscription && (
+              <div className="mx-auto mt-4 max-w-2xl text-left">
+                <AlertBasic
+                  variant="blue"
+                  title="Managed in the App Store"
+                  description="This subscription is billed by Apple. To change or cancel it, use your iPhone or iPad subscription settings."
+                />
+              </div>
+            )}
+
+            {isLegacyStripePlan && (
+              <div className="mx-auto mt-4 max-w-2xl text-left">
+                <AlertBasic
+                  variant="blue"
+                  title="Grandfathered pricing"
+                  description={`You're on a legacy ${getPremiumTierName(premium?.tier)} Stripe plan. The prices below are the current rates for new subscriptions and may be higher than your actual billing.`}
+                />
+              </div>
+            )}
           </div>
         )}
 
@@ -126,13 +189,13 @@ export default function Pricing(props: PricingProps) {
 
         <div
           className={cn(
-            "isolate mx-auto mt-10 grid max-w-7xl grid-cols-1 gap-y-8 gap-4 lg:mx-0 lg:max-w-none",
-            (props.displayTiers || tiers).length === 2
-              ? "lg:grid-cols-2"
-              : "lg:grid-cols-3",
+            "isolate mx-auto mt-10 grid grid-cols-1 gap-y-8 gap-4",
+            displayedTiers.length === 2
+              ? "max-w-3xl lg:grid-cols-2"
+              : "max-w-7xl lg:mx-0 lg:max-w-none lg:grid-cols-3",
           )}
         >
-          {(props.displayTiers || tiers).map((tier) => {
+          {displayedTiers.map((tier) => {
             return (
               <PriceTier
                 key={tier.name}
@@ -141,9 +204,13 @@ export default function Pricing(props: PricingProps) {
                 frequency={frequency}
                 stripeSubscriptionId={premium?.stripeSubscriptionId}
                 stripeSubscriptionStatus={premium?.stripeSubscriptionStatus}
+                hasActiveAppleManagedSubscription={
+                  hasActiveAppleManagedSubscription
+                }
                 isLoggedIn={isLoggedIn}
                 router={router}
                 userId={data?.id}
+                pricingSource={pricingSource}
               />
             );
           })}
@@ -159,22 +226,31 @@ function PriceTier({
   frequency,
   stripeSubscriptionId,
   stripeSubscriptionStatus,
+  hasActiveAppleManagedSubscription,
   isLoggedIn,
   router,
   userId,
+  pricingSource,
 }: {
   tier: Tier;
   userPremiumTier: PremiumTier | null;
   frequency: Frequency;
   stripeSubscriptionId: string | null | undefined;
   stripeSubscriptionStatus: string | null | undefined;
+  hasActiveAppleManagedSubscription: boolean;
   isLoggedIn: boolean;
   router: ReturnType<typeof useRouter>;
   userId: string | null | undefined;
+  pricingSource: "welcome_upgrade" | "app_premium";
 }) {
+  const posthog = usePostHog();
   const [loading, setLoading] = useState(false);
 
   const isCurrentPlan = tier.tiers[frequency.value] === userPremiumTier;
+  const hasActiveStripeSubscription =
+    !!stripeSubscriptionId &&
+    !!stripeSubscriptionStatus &&
+    ["active", "trialing"].includes(stripeSubscriptionStatus);
 
   function getCTAText() {
     if (isCurrentPlan) return "Current plan";
@@ -254,6 +330,20 @@ function PriceTier({
         type="button"
         disabled={loading}
         onClick={async () => {
+          const upgradeToTier = tier.tiers[frequency.value];
+
+          posthog.capture("pricing_cta_clicked", {
+            source: pricingSource,
+            tier: tier.name,
+            billingTier: upgradeToTier ?? null,
+            frequency: frequency.value,
+            cta: getCTAText(),
+            isCurrentPlan,
+            isLoggedIn,
+            hasExternalCta: Boolean(tier.ctaLink),
+            hasActiveStripeSubscription,
+          });
+
           // Handle enterprise tier differently - redirect to sales page
           if (tier.ctaLink) {
             window.location.href = tier.ctaLink;
@@ -273,13 +363,12 @@ function PriceTier({
               return;
             }
 
-            const upgradeToTier = tier.tiers[frequency.value];
-
-            // Only use billing portal if subscription is active or trialing
-            const hasActiveStripeSubscription =
-              stripeSubscriptionId &&
-              stripeSubscriptionStatus &&
-              ["active", "trialing"].includes(stripeSubscriptionStatus);
+            if (hasActiveAppleManagedSubscription) {
+              toast.info(
+                "This subscription is managed through the App Store. To change or cancel it, use your iPhone or iPad subscription settings.",
+              );
+              return;
+            }
 
             let result:
               | Awaited<ReturnType<typeof getBillingPortalUrlAction>>

@@ -3,14 +3,15 @@ import type { Metadata } from "next";
 import { redirect } from "next/navigation";
 import Link from "next/link";
 import { LoginForm } from "@/app/(landing)/login/LoginForm";
+import { getRequiresReconsentDescription } from "@/app/(landing)/login/messages";
 import { auth } from "@/utils/auth";
-import { isLocalAuthBypassEnabled } from "@/utils/auth/local-bypass-config";
+import { isGoogleOauthEmulationEnabled } from "@/utils/google/oauth";
 import { AlertBasic } from "@/components/Alert";
 import { Button } from "@/components/ui/button";
 import { WELCOME_PATH } from "@/utils/config";
 import { CrispChatLoggedOutVisible } from "@/components/CrispChat";
 import { MutedText } from "@/components/Typography";
-import { isInternalPath } from "@/utils/path";
+import { normalizeInternalPath } from "@/utils/path";
 import {
   BRAND_NAME,
   SUPPORT_EMAIL,
@@ -29,12 +30,10 @@ export default async function AuthenticationPage(props: {
 }) {
   const searchParams = await props.searchParams;
   const session = await auth();
+  const nextPath = normalizeInternalPath(searchParams?.next);
+
   if (session?.user && !searchParams?.error) {
-    if (searchParams?.next && isInternalPath(searchParams.next)) {
-      redirect(searchParams.next);
-    } else {
-      redirect(WELCOME_PATH);
-    }
+    redirect(nextPath ?? WELCOME_PATH);
   }
 
   return (
@@ -48,7 +47,9 @@ export default async function AuthenticationPage(props: {
         </div>
         <div className="mt-4">
           <Suspense>
-            <LoginForm showLocalBypass={isLocalAuthBypassEnabled()} />
+            <LoginForm
+              useGoogleOauthEmulator={isGoogleOauthEmulationEnabled()}
+            />
           </Suspense>
         </div>
 
@@ -94,7 +95,9 @@ function ErrorAlert({ error }: { error: string }) {
       <AlertBasic
         variant="destructive"
         title="Permissions need to be refreshed"
-        description={`Please sign in again and approve every requested permission. If your Microsoft 365 organization requires admin approval, ask your admin to approve ${BRAND_NAME} first. If this error persists please contact support at ${SUPPORT_EMAIL}`}
+        description={getRequiresReconsentDescription({
+          includeSupportText: true,
+        })}
       />
     );
   }

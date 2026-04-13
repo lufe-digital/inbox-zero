@@ -1,3 +1,4 @@
+import { after } from "next/server";
 import { ActionType } from "@/generated/prisma/enums";
 import type { ParsedMessage } from "@/utils/types";
 import prisma from "@/utils/prisma";
@@ -5,6 +6,12 @@ import { withPrismaRetry } from "@/utils/prisma-retry";
 import { calculateSimilarity } from "@/utils/similarity-score";
 import type { EmailProvider } from "@/utils/email/types";
 import type { Logger } from "@/utils/logger";
+import {
+  isMeaningfulDraftEdit,
+  saveDraftSendLogReplyMemory,
+  syncReplyMemoriesFromDraftSendLogs,
+} from "@/utils/ai/reply/reply-memory";
+import { emailToContentForAI } from "@/utils/ai/content-sanitizer";
 import { logReplyTrackerError } from "./error-logging";
 
 /**
@@ -78,7 +85,7 @@ export async function trackSentDraftStatus({
     });
 
     // Create DraftSendLog to record the comparison, but mark wasDraftSent as false
-    await withPrismaRetry(
+    const [draftSendLog] = await withPrismaRetry(
       () =>
         prisma.$transaction([
           prisma.draftSendLog.create({
@@ -100,6 +107,16 @@ export async function trackSentDraftStatus({
       "Created draft send log and marked action as not sent (draft still exists)",
       { executedActionId },
     );
+    queueReplyMemoryLearning({
+      emailAccountId,
+      executedActionId,
+      draftSendLogId: draftSendLog.id,
+      draftText: executedAction.content,
+      similarityScore,
+      message,
+      provider,
+      logger,
+    });
     return;
   }
 
@@ -112,7 +129,7 @@ export async function trackSentDraftStatus({
     },
   );
 
-  await withPrismaRetry(
+  const [draftSendLog] = await withPrismaRetry(
     () =>
       prisma.$transaction([
         prisma.draftSendLog.create({
@@ -135,6 +152,17 @@ export async function trackSentDraftStatus({
     "Successfully created draft send log and updated action status via transaction",
     { executedActionId },
   );
+
+  queueReplyMemoryLearning({
+    emailAccountId,
+    executedActionId,
+    draftSendLogId: draftSendLog.id,
+    draftText: executedAction.content,
+    similarityScore,
+    message,
+    provider,
+    logger,
+  });
 }
 
 /**
@@ -291,9 +319,9 @@ export async function cleanupThreadAIDrafts({
       }
     }
 
-    // Also clean up follow-up drafts for this thread
-    // No excludeMessageId filter needed: follow-up drafts are created asynchronously
-    // by a cron job, not in the same request that processes incoming messages
+    // Also clean up follow-up drafts for this thread (safety net).
+    // clearFollowUpLabel already handles this synchronously, so this will
+    // typically find nothing. Kept as a fallback for non-standard code paths.
     const followUpTrackers = await prisma.threadTracker.findMany({
       where: {
         emailAccountId,
@@ -338,4 +366,55 @@ export async function cleanupThreadAIDrafts({
   } catch (error) {
     logger.error("Error during thread draft cleanup", { error });
   }
+}
+
+function queueReplyMemoryLearning({
+  emailAccountId,
+  executedActionId,
+  draftSendLogId,
+  draftText,
+  similarityScore,
+  message,
+  provider,
+  logger,
+}: {
+  emailAccountId: string;
+  executedActionId: string;
+  draftSendLogId: string;
+  draftText?: string | null;
+  similarityScore: number;
+  message: ParsedMessage;
+  provider: EmailProvider;
+  logger: Logger;
+}) {
+  if (!draftText) return;
+
+  const sentText = emailToContentForAI(message, {
+    maxLength: 4000,
+    extractReply: true,
+    removeForwarded: false,
+  });
+
+  if (!isMeaningfulDraftEdit({ draftText, sentText, similarityScore })) {
+    return;
+  }
+
+  after(async () => {
+    try {
+      await saveDraftSendLogReplyMemory({
+        draftSendLogId,
+        sentText,
+      });
+      await syncReplyMemoriesFromDraftSendLogs({
+        emailAccountId,
+        provider,
+        logger,
+      });
+    } catch (error) {
+      logger.error("Failed to learn reply memories from draft edit", {
+        error,
+        executedActionId,
+      });
+    }
+  });
 }

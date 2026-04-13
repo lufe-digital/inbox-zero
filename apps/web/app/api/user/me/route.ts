@@ -22,14 +22,18 @@ async function getUser({
       aiModel: true,
       aiApiKey: true,
       webhookSecret: true,
-      referralCode: true,
       announcementDismissedAt: true,
       dismissedHints: true,
       premium: {
         select: {
+          appleExpiresAt: true,
+          appleRevokedAt: true,
+          appleSubscriptionStatus: true,
           lemonSqueezyCustomerId: true,
           lemonSqueezySubscriptionId: true,
           lemonSqueezyRenewsAt: true,
+          stripeCustomerId: true,
+          stripePriceId: true,
           stripeSubscriptionId: true,
           stripeSubscriptionStatus: true,
           unsubscribeCredits: true,
@@ -70,17 +74,35 @@ async function getUser({
     })),
   );
 
+  const { aiApiKey, webhookSecret, emailAccounts } = user;
+
   return {
-    ...user,
+    id: user.id,
+    createdAt: user.createdAt,
+    aiProvider: user.aiProvider,
+    aiModel: user.aiModel,
+    announcementDismissedAt: user.announcementDismissedAt,
+    dismissedHints: user.dismissedHints,
+    premium: user.premium,
+    emailAccounts: emailAccounts.map(({ members: _members, ...account }) => ({
+      ...account,
+    })),
+    hasAiApiKey: !!aiApiKey,
+    hasWebhookSecret: !!webhookSecret,
     members,
   };
 }
 
-// Intentionally not using withAuth because we want to return null if the user is not authenticated
+// Not using withAuth — unauthenticated requests return 401 with isKnownError
+// so the client can distinguish "not logged in" from real errors without Sentry noise
 export const GET = withError("user/me", async (request) => {
-  const session = await auth();
+  const session = await auth(request.headers);
   const userId = session?.user.id;
-  if (!userId) return NextResponse.json(null);
+  if (!userId)
+    return NextResponse.json(
+      { error: "Not authenticated", isKnownError: true },
+      { status: 401 },
+    );
 
   const includeImage =
     request.nextUrl.searchParams.get("includeImage") === "true";

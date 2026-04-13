@@ -28,14 +28,13 @@ import {
   createRuleBody,
 } from "@/utils/actions/rule.validation";
 import { Toggle } from "@/components/Toggle";
-import { LoadingContent } from "@/components/LoadingContent";
 import { TooltipExplanation } from "@/components/TooltipExplanation";
 import { useLabels } from "@/hooks/useLabels";
+import { useMessagingChannels } from "@/hooks/useMessagingChannels";
 import { AlertError } from "@/components/Alert";
 import { LearnedPatternsDialog } from "@/app/(app)/[emailAccountId]/assistant/group/LearnedPatterns";
 import { useAccount } from "@/providers/EmailAccountProvider";
 import { prefixPath } from "@/utils/path";
-import { useRule } from "@/hooks/useRule";
 import { isMicrosoftProvider } from "@/utils/email/provider-types";
 import { getEmailTerminology } from "@/utils/terminology";
 import {
@@ -52,6 +51,15 @@ import { isConversationStatusType } from "@/utils/reply-tracker/conversation-sta
 import { RuleSectionCard } from "@/app/(app)/[emailAccountId]/assistant/RuleSectionCard";
 import { ConditionSteps } from "@/app/(app)/[emailAccountId]/assistant/ConditionSteps";
 import { ActionSteps } from "@/app/(app)/[emailAccountId]/assistant/ActionSteps";
+import { RuleLoader } from "@/app/(app)/[emailAccountId]/assistant/RuleLoader";
+import { handleRuleAttachmentSourceSave } from "@/utils/attachments/rule";
+import type { AttachmentSourceInput } from "@/utils/attachments/source-schema";
+import { getConnectedRuleNotificationChannels } from "@/utils/messaging/routes";
+import {
+  denormalizeDraftReplyActions,
+  normalizeDraftReplyActions,
+} from "@/app/(app)/[emailAccountId]/assistant/draftReplyActions";
+import { isDraftReplyActionType } from "@/utils/actions/draft-reply";
 
 export function Rule({
   ruleId,
@@ -60,18 +68,12 @@ export function Rule({
   ruleId: string;
   alwaysEditMode?: boolean;
 }) {
-  const { data, isLoading, error, mutate } = useRule(ruleId);
-
   return (
-    <LoadingContent loading={isLoading} error={error}>
-      {data && (
-        <RuleForm
-          rule={data.rule}
-          alwaysEditMode={alwaysEditMode}
-          mutate={mutate}
-        />
+    <RuleLoader ruleId={ruleId}>
+      {({ rule, mutate }) => (
+        <RuleForm rule={rule} alwaysEditMode={alwaysEditMode} mutate={mutate} />
       )}
-    </LoadingContent>
+    </RuleLoader>
   );
 }
 
@@ -83,7 +85,16 @@ export function RuleForm({
   mutate,
   onCancel,
 }: {
-  rule: CreateRuleBody & { id?: string };
+  rule: CreateRuleBody & {
+    id?: string;
+    attachmentSources?: Array<{
+      driveConnectionId: string;
+      name: string;
+      sourceId: string;
+      sourcePath: string | null;
+      type: AttachmentSourceInput["type"];
+    }>;
+  };
   alwaysEditMode?: boolean;
   onSuccess?: () => void;
   isDialog?: boolean;
@@ -102,18 +113,20 @@ export function RuleForm({
             (action) => action.type === ActionType.DIGEST,
           ),
           actions: [
-            ...rule.actions
-              .filter((action) => action.type !== ActionType.DIGEST)
-              .map((action) => ({
-                ...action,
-                delayInMinutes: action.delayInMinutes,
-                content: {
-                  ...action.content,
-                  setManually: !!action.content?.value,
-                },
-                folderName: action.folderName,
-                folderId: action.folderId,
-              })),
+            ...normalizeDraftReplyActions(
+              rule.actions
+                .filter((action) => action.type !== ActionType.DIGEST)
+                .map((action) => ({
+                  ...action,
+                  delayInMinutes: action.delayInMinutes,
+                  content: {
+                    ...action.content,
+                    setManually: !!action.content?.value,
+                  },
+                  folderName: action.folderName,
+                  folderId: action.folderId,
+                })),
+            ),
           ],
         }
       : undefined,
@@ -143,27 +156,46 @@ export function RuleForm({
     fields: actionFields,
     append,
     remove,
+    replace,
   } = useFieldArray({ control, name: "actions" });
 
   const { userLabels, isLoading, mutate: mutateLabels } = useLabels();
+  const { data: messagingChannelsData } = useMessagingChannels(emailAccountId);
   const { folders, isLoading: foldersLoading } = useFolders(provider);
   const router = useRouter();
 
   const posthog = usePostHog();
+  const [attachmentSources, setAttachmentSources] = useState<
+    AttachmentSourceInput[]
+  >(
+    rule.attachmentSources?.map((source) => ({
+      driveConnectionId: source.driveConnectionId,
+      name: source.name,
+      sourceId: source.sourceId,
+      sourcePath: source.sourcePath,
+      type: source.type,
+    })) || [],
+  );
 
   const onSubmit: SubmitHandler<CreateRuleBody> = useCallback(
     async (data) => {
       // set content to empty string if it's not set manually
       for (const action of data.actions) {
-        if (action.type === ActionType.DRAFT_EMAIL) {
+        if (isDraftReplyActionType(action.type)) {
           if (!action.content?.setManually) {
             action.content = { value: "", ai: false };
           }
         }
       }
 
+      const normalizedActions = denormalizeDraftReplyActions(data.actions);
+
+      const hasDraftAction = normalizedActions.some((action) =>
+        isDraftReplyActionType(action.type),
+      );
+
       // Add DIGEST action if digest is enabled
-      const actionsToSubmit = [...data.actions];
+      const actionsToSubmit = [...normalizedActions];
       if (data.digest) {
         actionsToSubmit.push({ type: ActionType.DIGEST });
       }
@@ -200,7 +232,16 @@ export function RuleForm({
           });
           if (mutate) mutate();
         } else {
-          toastSuccess({ description: "Saved!" });
+          await handleRuleAttachmentSourceSave({
+            emailAccountId,
+            ruleId: res.data.rule.id,
+            attachmentSources,
+            shouldSave: hasDraftAction,
+            successMessage: "Saved!",
+            partialErrorMessage:
+              "Rule saved, but draft attachment sources could not be updated.",
+          });
+
           // Revalidate to get the real data from server
           if (mutate) mutate();
           posthog.capture("User updated AI rule", {
@@ -229,7 +270,16 @@ export function RuleForm({
             description: "There was an error creating the rule.",
           });
         } else {
-          toastSuccess({ description: "Created!" });
+          await handleRuleAttachmentSourceSave({
+            emailAccountId,
+            ruleId: res.data.rule.id,
+            attachmentSources,
+            shouldSave: hasDraftAction,
+            successMessage: "Created!",
+            partialErrorMessage:
+              "Rule created, but draft attachment sources could not be saved.",
+          });
+
           posthog.capture("User created AI rule", {
             conditions: data.conditions.map((condition) => condition.type),
             actions: actionsToSubmit.map((action) => action.type),
@@ -247,7 +297,16 @@ export function RuleForm({
         }
       }
     },
-    [router, posthog, emailAccountId, isDialog, onSuccess, mutate, rule],
+    [
+      attachmentSources,
+      router,
+      posthog,
+      emailAccountId,
+      isDialog,
+      onSuccess,
+      mutate,
+      rule,
+    ],
   );
 
   const conditions = watch("conditions");
@@ -263,7 +322,8 @@ export function RuleForm({
       const actionError =
         formState.errors?.actions?.[index]?.url?.root?.message ||
         formState.errors?.actions?.[index]?.labelId?.root?.message ||
-        formState.errors?.actions?.[index]?.to?.root?.message;
+        formState.errors?.actions?.[index]?.to?.root?.message ||
+        formState.errors?.actions?.[index]?.messagingChannelId?.message;
       if (actionError) actionErrors.push(actionError);
     });
     return actionErrors;
@@ -279,6 +339,13 @@ export function RuleForm({
   }, [formState]);
 
   const typeOptions = useMemo(() => {
+    const connectedMessagingChannels = getConnectedRuleNotificationChannels(
+      messagingChannelsData?.channels,
+    );
+    const messagingIsAvailable =
+      connectedMessagingChannels.length > 0 ||
+      (messagingChannelsData?.availableProviders.length ?? 0) > 0;
+
     const options: {
       label: string;
       value: ActionType;
@@ -298,11 +365,15 @@ export function RuleForm({
             },
           ]
         : []),
-      {
-        label: "Draft reply",
-        value: ActionType.DRAFT_EMAIL,
-        icon: getActionIcon(ActionType.DRAFT_EMAIL),
-      },
+      ...(env.NEXT_PUBLIC_AUTO_DRAFT_DISABLED
+        ? []
+        : [
+            {
+              label: "Draft reply",
+              value: ActionType.DRAFT_EMAIL,
+              icon: getActionIcon(ActionType.DRAFT_EMAIL),
+            },
+          ]),
       {
         label: "Archive",
         value: ActionType.ARCHIVE,
@@ -337,11 +408,24 @@ export function RuleForm({
         value: ActionType.MARK_SPAM,
         icon: getActionIcon(ActionType.MARK_SPAM),
       },
-      {
-        label: "Call webhook",
-        value: ActionType.CALL_WEBHOOK,
-        icon: getActionIcon(ActionType.CALL_WEBHOOK),
-      },
+      ...(env.NEXT_PUBLIC_WEBHOOK_ACTION_ENABLED !== false
+        ? [
+            {
+              label: "Call webhook",
+              value: ActionType.CALL_WEBHOOK,
+              icon: getActionIcon(ActionType.CALL_WEBHOOK),
+            },
+          ]
+        : []),
+      ...(messagingIsAvailable
+        ? [
+            {
+              label: "Notify via chat app",
+              value: ActionType.NOTIFY_MESSAGING_CHANNEL,
+              icon: getActionIcon(ActionType.NOTIFY_MESSAGING_CHANNEL),
+            },
+          ]
+        : []),
       // NOTIFY_SENDER is only available for cold email rules
       ...(rule.systemType === SystemType.COLD_EMAIL &&
       env.NEXT_PUBLIC_IS_RESEND_CONFIGURED
@@ -356,7 +440,13 @@ export function RuleForm({
     ];
 
     return options;
-  }, [provider, terminology.label.action, rule.systemType]);
+  }, [
+    messagingChannelsData?.channels,
+    messagingChannelsData?.availableProviders,
+    provider,
+    terminology.label.action,
+    rule.systemType,
+  ]);
 
   const [isNameEditMode, setIsNameEditMode] = useState(alwaysEditMode);
   const [isDeleting, setIsDeleting] = useState(false);
@@ -460,6 +550,7 @@ export function RuleForm({
             setValue={setValue}
             append={append}
             remove={remove}
+            replaceActions={replace}
             control={control}
             errors={errors}
             userLabels={userLabels}
@@ -469,6 +560,12 @@ export function RuleForm({
             typeOptions={typeOptions}
             folders={folders}
             foldersLoading={foldersLoading}
+            messagingChannels={messagingChannelsData?.channels ?? []}
+            availableMessagingProviders={
+              messagingChannelsData?.availableProviders ?? []
+            }
+            attachmentSources={attachmentSources}
+            onAttachmentSourcesChange={setAttachmentSources}
           />
         </RuleSectionCard>
 
@@ -527,7 +624,7 @@ export function RuleForm({
                   </div>
                 )}
 
-                {rule.id && (
+                {rule.id && !rule.systemType && (
                   <Button
                     size="sm"
                     variant="outline"
@@ -577,6 +674,12 @@ export function RuleForm({
                   >
                     Delete rule
                   </Button>
+                )}
+
+                {rule.id && rule.systemType && (
+                  <p className="text-sm text-muted-foreground">
+                    Default rules can be disabled from the rules list.
+                  </p>
                 )}
               </div>
             </DialogContent>

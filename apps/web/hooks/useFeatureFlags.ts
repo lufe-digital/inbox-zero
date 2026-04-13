@@ -2,6 +2,7 @@ import {
   useFeatureFlagEnabled,
   useFeatureFlagVariantKey,
 } from "posthog-js/react";
+import type { OnboardingFlowVariant } from "@/app/(app)/[emailAccountId]/onboarding/onboardingFlow";
 import { env } from "@/env";
 
 export function useCleanerEnabled() {
@@ -64,6 +65,23 @@ export type TestimonialsVariant = "control" | "senja-widget";
 export function useTestimonialsVariant() {
   return (
     (useFeatureFlagVariantKey("testimonials") as TestimonialsVariant) ||
+    "control"
+  );
+}
+
+export type WelcomePricingVariant = "control" | "two-tiers";
+
+export function useWelcomePricingVariant() {
+  return (
+    (useFeatureFlagVariantKey(
+      "welcome-pricing-tiers",
+    ) as WelcomePricingVariant) || "control"
+  );
+}
+
+export function useOnboardingFlowVariant() {
+  return (
+    (useFeatureFlagVariantKey("onboarding-flow") as OnboardingFlowVariant) ||
     "control"
   );
 }

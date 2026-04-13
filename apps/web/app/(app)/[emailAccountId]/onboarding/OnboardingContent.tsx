@@ -1,7 +1,8 @@
 "use client";
 
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import { useRouter } from "next/navigation";
+import { useAction } from "next-safe-action/hooks";
 import { StepWho } from "@/app/(app)/[emailAccountId]/onboarding/StepWho";
 import { StepWelcome } from "@/app/(app)/[emailAccountId]/onboarding/StepWelcome";
 import { StepEmailsSorted } from "@/app/(app)/[emailAccountId]/onboarding/StepEmailsSorted";
@@ -24,20 +25,31 @@ import { prefixPath } from "@/utils/path";
 import { useAccount } from "@/providers/EmailAccountProvider";
 import { useSignUpEvent } from "@/hooks/useSignupEvent";
 import { isDefined } from "@/utils/types";
+import { env } from "@/env";
 import { StepCompanySize } from "@/app/(app)/[emailAccountId]/onboarding/StepCompanySize";
 import { StepInviteTeam } from "@/app/(app)/[emailAccountId]/onboarding/StepInviteTeam";
-import { usePremium } from "@/components/PremiumAlert";
+import { toastError } from "@/components/Toast";
+import { usePremium } from "@/hooks/usePremium";
 import { useOrganizationMembership } from "@/hooks/useOrganizationMembership";
 import {
+  getOnboardingStepHref,
+  getOnboardingStepIndex,
+  getVisibleOnboardingStepKeys,
+  isOptionalOnboardingStep,
+  ONBOARDING_FLOW_VARIANTS,
   STEP_KEYS,
-  STEP_ORDER,
-} from "@/app/(app)/[emailAccountId]/onboarding/steps";
+  type OnboardingFlowVariant,
+  type StepKey,
+} from "@/app/(app)/[emailAccountId]/onboarding/onboardingFlow";
+import { useOnboardingFlowVariant } from "@/hooks/useFeatureFlags";
+import { captureException, getActionErrorMessage } from "@/utils/error";
 
 interface OnboardingContentProps {
-  step: number;
+  step?: string;
+  variant?: OnboardingFlowVariant;
 }
 
-export function OnboardingContent({ step }: OnboardingContentProps) {
+export function OnboardingContent({ step, variant }: OnboardingContentProps) {
   const { emailAccountId, provider, isLoading } = useAccount();
   const { isPremium } = usePremium();
   const { data: membership, isLoading: isMembershipLoading } =
@@ -45,14 +57,19 @@ export function OnboardingContent({ step }: OnboardingContentProps) {
 
   useSignUpEvent();
 
-  const canInviteTeam =
+  const canInviteTeam = Boolean(
     (membership?.isOwner && membership?.organizationId) ||
-    (!membership?.organizationId && !membership?.hasPendingInvitationToOrg);
+      (!membership?.organizationId && !membership?.hasPendingInvitationToOrg),
+  );
+  const flaggedFlowVariant = useOnboardingFlowVariant();
+  const flowVariant = variant ?? flaggedFlowVariant;
 
   const stepMap: Record<string, (() => React.ReactNode) | undefined> = {
     [STEP_KEYS.WELCOME]: () => <StepWelcome onNext={onNext} />,
     [STEP_KEYS.EMAILS_SORTED]: () => <StepEmailsSorted onNext={onNext} />,
-    [STEP_KEYS.DRAFT_REPLIES]: () => <StepDraftReplies onNext={onNext} />,
+    [STEP_KEYS.DRAFT_REPLIES]: env.NEXT_PUBLIC_AUTO_DRAFT_DISABLED
+      ? undefined
+      : () => <StepDraftReplies onNext={onNext} />,
     [STEP_KEYS.BULK_UNSUBSCRIBE]: () => <StepBulkUnsubscribe onNext={onNext} />,
     [STEP_KEYS.FEATURES]: () => <StepFeatures onNext={onNext} />,
     [STEP_KEYS.WHO]: () => (
@@ -70,13 +87,15 @@ export function OnboardingContent({ step }: OnboardingContentProps) {
         onNext={onNext}
       />
     ),
-    [STEP_KEYS.DRAFT]: () => (
-      <StepDraft
-        provider={provider}
-        emailAccountId={emailAccountId}
-        onNext={onNext}
-      />
-    ),
+    [STEP_KEYS.DRAFT]: env.NEXT_PUBLIC_AUTO_DRAFT_DISABLED
+      ? undefined
+      : () => (
+          <StepDraft
+            provider={provider}
+            emailAccountId={emailAccountId}
+            onNext={onNext}
+          />
+        ),
     [STEP_KEYS.CUSTOM_RULES]: () => (
       <StepCustomRules provider={provider} onNext={onNext} />
     ),
@@ -87,41 +106,201 @@ export function OnboardingContent({ step }: OnboardingContentProps) {
             organizationId={membership?.organizationId ?? undefined}
             userName={membership?.userName}
             onNext={onNext}
+            onSkip={onSkipInviteTeam}
           />
         )
       : undefined,
-    [STEP_KEYS.INBOX_PROCESSED]: () => <StepInboxProcessed onNext={onNext} />,
+    [STEP_KEYS.INBOX_PROCESSED]: () => (
+      <StepInboxProcessed flowVariant={flowVariant} onNext={onNext} />
+    ),
   };
 
-  const steps = STEP_ORDER.map((key) => stepMap[key]).filter(isDefined);
+  const visibleStepKeys = getVisibleOnboardingStepKeys({
+    flowVariant:
+      flowVariant === ONBOARDING_FLOW_VARIANTS.FAST_5
+        ? ONBOARDING_FLOW_VARIANTS.FAST_5
+        : ONBOARDING_FLOW_VARIANTS.CONTROL,
+    canInviteTeam,
+    autoDraftDisabled: Boolean(env.NEXT_PUBLIC_AUTO_DRAFT_DISABLED),
+  }).filter((key) => isDefined(stepMap[key]));
+  const steps = visibleStepKeys.map((key) => stepMap[key]).filter(isDefined);
 
   const { data, mutate } = usePersona();
-  const clampedStep = Math.min(Math.max(step, 1), steps.length);
+  const currentStepIndex = getOnboardingStepIndex(step, visibleStepKeys);
+  const clampedStep = currentStepIndex + 1;
+  const totalSteps = visibleStepKeys.length;
+  const currentStepKey = visibleStepKeys[currentStepIndex];
+  const nextStepKey = visibleStepKeys[currentStepIndex + 1];
+  const analyticsProps = useMemo(() => ({ flowVariant }), [flowVariant]);
 
   const router = useRouter();
   const analytics = useOnboardingAnalytics("onboarding");
+  const hasTrackedStart = useRef(false);
+  const { executeAsync: completeOnboarding } = useAction(
+    completedOnboardingAction,
+  );
+
+  const getOnboardingStepPath = useCallback(
+    (stepKey: string) => {
+      return getOnboardingStepHref(emailAccountId, stepKey as StepKey, {
+        variant: flowVariant,
+      });
+    },
+    [emailAccountId, flowVariant],
+  );
 
   useEffect(() => {
-    analytics.onStart();
-  }, [analytics]);
+    // Wait for membership data before firing — totalSteps can be wrong while loading
+    if (isMembershipLoading || !currentStepKey) return;
+
+    if (clampedStep === 1 && !hasTrackedStart.current) {
+      hasTrackedStart.current = true;
+      analytics.onStart({
+        step: clampedStep,
+        stepKey: currentStepKey,
+        totalSteps,
+        ...analyticsProps,
+      });
+    }
+
+    analytics.onStepViewed({
+      step: clampedStep,
+      stepKey: currentStepKey,
+      totalSteps,
+      isOptional: isOptionalOnboardingStep(currentStepKey),
+      ...analyticsProps,
+    });
+  }, [
+    analytics,
+    analyticsProps,
+    clampedStep,
+    currentStepKey,
+    isMembershipLoading,
+    totalSteps,
+  ]);
 
   const onNext = useCallback(async () => {
-    analytics.onNext(clampedStep);
+    if (!currentStepKey) return;
+
+    analytics.onNext({
+      step: clampedStep,
+      stepKey: currentStepKey,
+      totalSteps,
+      nextStep: clampedStep < steps.length ? clampedStep + 1 : undefined,
+      nextStepKey,
+      isOptional: isOptionalOnboardingStep(currentStepKey),
+      ...analyticsProps,
+    });
+
     if (clampedStep < steps.length) {
-      router.push(
-        prefixPath(emailAccountId, `/onboarding?step=${clampedStep + 1}`),
-      );
+      if (!nextStepKey) return;
+
+      router.push(getOnboardingStepPath(nextStepKey));
     } else {
-      analytics.onComplete();
+      analytics.onComplete({
+        step: clampedStep,
+        stepKey: currentStepKey,
+        totalSteps,
+        destination: isPremium ? "setup" : "welcome-upgrade",
+        ...analyticsProps,
+      });
       markOnboardingAsCompleted(ASSISTANT_ONBOARDING_COOKIE);
-      await completedOnboardingAction();
+      let result: Awaited<ReturnType<typeof completeOnboarding>>;
+      try {
+        result = await completeOnboarding();
+      } catch (error) {
+        captureException(error, {
+          extra: {
+            context: "onboarding",
+            step: "complete",
+            destination: isPremium ? "setup" : "welcome-upgrade",
+            flowVariant,
+          },
+        });
+        toastError({
+          description: getActionErrorMessage(
+            {},
+            {
+              prefix: "There was an error finishing onboarding",
+            },
+          ),
+        });
+        return;
+      }
+      if (result?.serverError || result?.validationErrors) {
+        captureException(new Error("Failed to complete onboarding"), {
+          extra: {
+            context: "onboarding",
+            step: "complete",
+            serverError: result?.serverError,
+            validationErrors: result?.validationErrors,
+            destination: isPremium ? "setup" : "welcome-upgrade",
+            flowVariant,
+          },
+        });
+        toastError({
+          description: getActionErrorMessage(
+            {
+              serverError: result?.serverError,
+              validationErrors: result?.validationErrors,
+            },
+            {
+              prefix: "There was an error finishing onboarding",
+            },
+          ),
+        });
+        return;
+      }
       if (isPremium) {
         router.push(prefixPath(emailAccountId, "/setup"));
       } else {
         router.push("/welcome-upgrade");
       }
     }
-  }, [router, emailAccountId, analytics, clampedStep, steps.length, isPremium]);
+  }, [
+    router,
+    emailAccountId,
+    analytics,
+    clampedStep,
+    currentStepKey,
+    totalSteps,
+    nextStepKey,
+    steps.length,
+    isPremium,
+    completeOnboarding,
+    analyticsProps,
+    flowVariant,
+    getOnboardingStepPath,
+  ]);
+
+  const onSkipInviteTeam = useCallback(() => {
+    if (!currentStepKey) return;
+
+    analytics.onSkip({
+      step: clampedStep,
+      stepKey: currentStepKey,
+      totalSteps,
+      nextStep: clampedStep < steps.length ? clampedStep + 1 : undefined,
+      nextStepKey,
+      isOptional: true,
+      ...analyticsProps,
+    });
+
+    // Navigate directly — do not call onNext() which would also fire completion analytics.
+    if (!nextStepKey) return;
+
+    router.push(getOnboardingStepPath(nextStepKey));
+  }, [
+    analytics,
+    analyticsProps,
+    router,
+    clampedStep,
+    currentStepKey,
+    totalSteps,
+    nextStepKey,
+    steps.length,
+    getOnboardingStepPath,
+  ]);
 
   // Trigger persona analysis on mount (first step only)
   useEffect(() => {
@@ -138,7 +317,7 @@ export function OnboardingContent({ step }: OnboardingContentProps) {
     }
   }, [clampedStep, emailAccountId, data?.personaAnalysis, mutate]);
 
-  const renderStep = steps[clampedStep - 1] || steps[0];
+  const renderStep = steps[currentStepIndex] || steps[0];
 
   // Show loading if provider is needed but not loaded yet
   if (isLoading && !provider) {

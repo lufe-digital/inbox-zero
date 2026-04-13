@@ -12,13 +12,16 @@ import {
   AddToKnowledgeBase,
   BasicToolInfo,
   CreatedRuleToolCard,
+  PendingSaveMemoryToolCard,
+  PendingCreateRuleToolCard,
   ForwardEmailResult,
+  getManageInboxActionLabel,
   ManageInboxResult,
   ReadEmailResult,
   ReplyEmailResult,
   SearchInboxResult,
   SendEmailResult,
-  UpdateAbout,
+  UpdatePersonalInstructions,
   UpdatedLearnedPatterns,
   UpdatedRuleActions,
   UpdatedRuleConditions,
@@ -26,9 +29,11 @@ import {
 import type { ChatMessage } from "@/components/assistant-chat/types";
 import type { ThreadLookup } from "@/components/assistant-chat/tools";
 import { formatToolLabel } from "@/components/assistant-chat/tool-label";
+import { requiresThreadIds } from "@/utils/ai/assistant/manage-inbox-actions";
 
 interface MessagePartProps {
   disableConfirm: boolean;
+  hideInlineEmailCards: boolean;
   isStreaming: boolean;
   messageId: string;
   part: ChatMessage["parts"][0];
@@ -55,6 +60,7 @@ export function MessagePart({
   part,
   isStreaming,
   disableConfirm,
+  hideInlineEmailCards,
   messageId,
   partIndex,
   threadLookup,
@@ -73,8 +79,12 @@ export function MessagePart({
   }
 
   if (part.type === "text") {
-    if (!part.text) return null;
-    return <Response key={key}>{part.text}</Response>;
+    const text =
+      hideInlineEmailCards && part.text
+        ? stripInlineEmailSections(part.text)
+        : part.text;
+    if (!text) return null;
+    return <Response key={key}>{text}</Response>;
   }
 
   if (part.type === "file") {
@@ -134,7 +144,6 @@ export function MessagePart({
       part,
       loadingText: "Updating settings...",
       renderSuccess: ({ toolCallId, output }) => {
-        const dryRun = getOutputField<boolean>(output, "dryRun");
         const appliedChanges = getOutputField<Array<unknown>>(
           output,
           "appliedChanges",
@@ -145,7 +154,7 @@ export function MessagePart({
         return (
           <BasicToolInfo
             key={toolCallId}
-            text={`${dryRun ? "Prepared settings changes" : "Updated settings"}${
+            text={`Updated settings${
               appliedChangesCount !== null
                 ? ` (${appliedChangesCount} change${
                     appliedChangesCount === 1 ? "" : "s"
@@ -205,19 +214,15 @@ export function MessagePart({
         );
       }
 
-      let actionText = "Updating emails...";
-      if (part.input.action === "archive_threads") {
-        actionText = part.input.labelId
-          ? "Archiving and labeling emails..."
-          : "Archiving emails...";
-      } else if (part.input.action === "mark_read_threads") {
-        actionText =
-          part.input.read === false
-            ? "Marking emails as unread..."
-            : "Marking emails as read...";
-      } else if (part.input.action === "unsubscribe_senders") {
-        actionText = "Unsubscribing senders...";
-      }
+      const actionText = getManageInboxActionLabel({
+        action: part.input.action,
+        read: part.input.read ?? true,
+        labelApplied:
+          part.input.action === "archive_threads"
+            ? Boolean(part.input.label)
+            : Boolean(part.input.label || part.input.labelName),
+        inProgress: true,
+      });
 
       return <BasicToolInfo key={toolCallId} text={actionText} />;
     }
@@ -232,8 +237,7 @@ export function MessagePart({
           input={part.input}
           output={output}
           threadIds={
-            part.input.action === "archive_threads" ||
-            part.input.action === "mark_read_threads"
+            requiresThreadIds(part.input.action)
               ? (part.input.threadIds ?? undefined)
               : undefined
           }
@@ -241,16 +245,6 @@ export function MessagePart({
         />
       );
     }
-  }
-
-  if (part.type === "tool-updateInboxFeatures") {
-    return renderToolStatus({
-      part,
-      loadingText: "Updating inbox features...",
-      renderSuccess: ({ toolCallId }) => (
-        <BasicToolInfo key={toolCallId} text="Updated inbox features" />
-      ),
-    });
   }
 
   if (part.type === "tool-sendEmail") {
@@ -317,6 +311,26 @@ export function MessagePart({
       const { output } = part;
       if (isOutputWithError(output)) {
         return <ErrorToolCard key={toolCallId} error={String(output.error)} />;
+      }
+      const requiresRuleConfirmation =
+        getOutputField<boolean>(output, "requiresConfirmation") === true &&
+        getOutputField<string>(output, "actionType") === "create_rule";
+      const confirmationState =
+        getOutputField<string>(output, "confirmationState") || "";
+      if (
+        requiresRuleConfirmation &&
+        (confirmationState === "pending" || confirmationState === "processing")
+      ) {
+        return (
+          <PendingCreateRuleToolCard
+            key={toolCallId}
+            args={part.input}
+            output={output}
+            chatMessageId={messageId}
+            toolCallId={toolCallId}
+            disableConfirm={disableConfirm}
+          />
+        );
       }
       const ruleId = getOutputField<string>(output, "ruleId");
       return (
@@ -423,18 +437,26 @@ export function MessagePart({
     }
   }
 
-  if (part.type === "tool-updateAbout") {
-    const { toolCallId, state } = part;
-    if (state === "input-available") {
-      return <BasicToolInfo key={toolCallId} text="Updating about..." />;
-    }
-    if (state === "output-available") {
-      const { output } = part;
-      if (isOutputWithError(output)) {
-        return <ErrorToolCard key={toolCallId} error={String(output.error)} />;
-      }
-      return <UpdateAbout key={toolCallId} args={part.input} />;
-    }
+  if (part.type === "tool-updatePersonalInstructions") {
+    return renderToolStatus({
+      part,
+      loadingText: "Updating personal instructions...",
+      renderSuccess: ({ toolCallId, output }) => {
+        const updated = getOutputField<string>(output, "updated");
+        return (
+          <UpdatePersonalInstructions
+            key={toolCallId}
+            args={{
+              personalInstructions:
+                updated ??
+                part.input?.personalInstructions ??
+                "Personal instructions updated.",
+              mode: part.input?.mode ?? "append",
+            }}
+          />
+        );
+      },
+    });
   }
 
   if (part.type === "tool-addToKnowledgeBase") {
@@ -454,13 +476,36 @@ export function MessagePart({
   }
 
   if (part.type === "tool-saveMemory") {
-    return renderToolStatus({
-      part,
-      loadingText: "Saving memory...",
-      renderSuccess: ({ toolCallId }) => (
-        <BasicToolInfo key={toolCallId} text="Memory saved" />
-      ),
-    });
+    const { toolCallId, state } = part;
+
+    if (state === "input-available") {
+      return <BasicToolInfo key={toolCallId} text="Saving memory..." />;
+    }
+
+    if (state === "output-available") {
+      const { output } = part;
+      if (isOutputWithError(output)) {
+        return <ErrorToolCard key={toolCallId} error={String(output.error)} />;
+      }
+
+      const requiresConfirmation =
+        getOutputField<boolean>(output, "requiresConfirmation") === true &&
+        getOutputField<string>(output, "actionType") === "save_memory";
+
+      if (requiresConfirmation) {
+        return (
+          <PendingSaveMemoryToolCard
+            key={toolCallId}
+            output={output}
+            chatMessageId={messageId}
+            toolCallId={toolCallId}
+            disableConfirm={disableConfirm}
+          />
+        );
+      }
+
+      return <BasicToolInfo key={toolCallId} text="Memory saved" />;
+    }
   }
 
   if (part.type === "tool-searchMemories") {
@@ -501,6 +546,18 @@ export function MessagePart({
   }
 
   return null;
+}
+
+const INLINE_EMAIL_SECTION_RE =
+  /\n{0,2}##[^\n]*\n\s*<emails>[\s\S]*?<\/emails>/g;
+const INLINE_EMAIL_BLOCK_RE = /\n{0,2}<emails>[\s\S]*?<\/emails>/g;
+
+function stripInlineEmailSections(text: string) {
+  return text
+    .replace(INLINE_EMAIL_SECTION_RE, "")
+    .replace(INLINE_EMAIL_BLOCK_RE, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 function getInProgressManageInboxOutput(input: {
