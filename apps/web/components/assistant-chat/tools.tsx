@@ -12,7 +12,14 @@ import type {
   UpdateRuleConditionsOutput,
   UpdateRuleConditionsTool,
 } from "@/utils/ai/assistant/tools/rules/update-rule-conditions-tool";
-import type { ManageInboxTool } from "@/utils/ai/assistant/chat-inbox-tools";
+import type {
+  UpdateRuleOutput,
+  UpdateRuleTool,
+} from "@/utils/ai/assistant/tools/rules/update-rule-tool";
+import type {
+  UpdateRuleStateOutput,
+  UpdateRuleStateTool,
+} from "@/utils/ai/assistant/tools/rules/update-rule-state-tool";
 import { cn } from "@/utils";
 import { isDefined } from "@/utils/types";
 import {
@@ -62,6 +69,7 @@ import { getActionColor } from "@/components/PlanBadge";
 import type { ActionType } from "@/generated/prisma/enums";
 import { formatShortDate } from "@/utils/date";
 import { trimToNonEmptyString } from "@/utils/string";
+import { decodeHtmlEntities } from "@/utils/gmail/decode";
 import { getEmailSearchUrl, getEmailUrlForOptionalMessage } from "@/utils/url";
 import {
   isManageInboxAction,
@@ -72,14 +80,30 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
+import {
+  RuleSummaryCard,
+  RuleSummaryCardHeader,
+  RuleSummaryLabel,
+  RuleSummaryRow,
+} from "@/components/assistant-chat/rule-summary-card";
+import { getPendingEmailSubjectPrefix } from "@/components/assistant-chat/helpers";
 
 export type ThreadLookup = EmailLookup;
+
+type ManageInboxResultInput = {
+  action?: string;
+  categoryName?: string | null;
+  fromEmails?: string[] | null;
+  label?: string | null;
+  labelName?: string | null;
+  read?: boolean | null;
+  threadIds?: string[] | null;
+};
 
 function getOutputField<T>(output: unknown, field: string): T | undefined {
   if (typeof output === "object" && output !== null && field in output) {
     return (output as Record<string, unknown>)[field] as T;
   }
-  return undefined;
 }
 
 export function BasicToolInfo({ text }: { text: string }) {
@@ -165,6 +189,7 @@ function CollapsibleToolCard({
 }
 
 export function SearchInboxResult({ output }: { output: unknown }) {
+  const error = getOutputField<string | null>(output, "error");
   const queryUsed = getOutputField<string | null>(output, "queryUsed");
   const messages = getOutputField<
     Array<{
@@ -186,6 +211,12 @@ export function SearchInboxResult({ output }: { output: unknown }) {
           value={<span className="font-mono text-xs">{queryUsed}</span>}
         />
       )}
+      {error && (
+        <div className="space-y-1 text-sm text-muted-foreground">
+          <p>Search results were unavailable for that request.</p>
+          <p className="text-xs">{error}</p>
+        </div>
+      )}
       {messages && messages.length > 0 && <ToolEmailRows emails={messages} />}
     </SubtleToolCollapsible>
   );
@@ -198,7 +229,7 @@ export function ManageInboxResult({
   threadLookup,
   isInProgress = false,
 }: {
-  input?: ManageInboxTool["input"];
+  input?: ManageInboxResultInput;
   output: unknown;
   threadIds?: string[];
   threadLookup: ThreadLookup;
@@ -237,7 +268,7 @@ export function ManageInboxResult({
     ? threadIds
         .map((threadId) => {
           const thread = threadLookup.get(threadId);
-          if (!thread) return undefined;
+          if (!thread) return;
           return { threadId, ...thread };
         })
         .filter(isDefined)
@@ -275,7 +306,7 @@ export function ManageInboxResult({
       )}
 
       {resolvedThreads && resolvedThreads.length > 0 && (
-        <div className="-mx-4">
+        <div className="-mx-4 -my-3.5">
           <ToolEmailRows emails={resolvedThreads} />
         </div>
       )}
@@ -307,6 +338,67 @@ export function ManageInboxResult({
           </div>
         </ToolSection>
       )}
+    </CollapsibleToolCard>
+  );
+}
+
+export function ManageSenderCategoryResult({ output }: { output: unknown }) {
+  const { provider, userEmail } = useAccount();
+  const category = getOutputField<{ id: string | null; name: string }>(
+    output,
+    "category",
+  );
+  const sendersCount = getOutputField<number>(output, "sendersCount") ?? 0;
+  const senders = getOutputField<string[]>(output, "senders") ?? [];
+  const categoryName = category?.name?.trim() || "Category";
+
+  if (senders.length === 0) {
+    return (
+      <BasicToolInfo text={`No senders to archive in "${categoryName}"`} />
+    );
+  }
+
+  const hiddenCount = Math.max(sendersCount - senders.length, 0);
+
+  return (
+    <CollapsibleToolCard
+      title={`Archived "${categoryName}" category`}
+      badge={
+        <Badge color="green" className="text-[10px]">
+          {sendersCount} sender{sendersCount === 1 ? "" : "s"}
+        </Badge>
+      }
+    >
+      <ToolSection label="Senders">
+        <div className="max-h-96 space-y-2 overflow-y-auto pr-1">
+          {senders.map((sender) => (
+            <ToolPanel
+              key={sender}
+              className="flex items-center justify-between gap-3"
+            >
+              <span className="min-w-0 truncate text-sm text-foreground">
+                {sender}
+              </span>
+              <a
+                href={getEmailSearchUrl(sender, userEmail, provider)}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="shrink-0 text-muted-foreground hover:text-foreground"
+                aria-label={`View ${sender} in ${
+                  provider === "microsoft" ? "Outlook" : "Gmail"
+                }`}
+              >
+                <ExternalLinkIcon className="size-3.5" />
+              </a>
+            </ToolPanel>
+          ))}
+        </div>
+        {hiddenCount > 0 && (
+          <div className="text-xs text-muted-foreground">
+            + {hiddenCount} more sender{hiddenCount === 1 ? "" : "s"} not shown
+          </div>
+        )}
+      </ToolSection>
     </CollapsibleToolCard>
   );
 }
@@ -455,7 +547,7 @@ function EmailActionResult({
   disableConfirm: boolean;
 }) {
   const { emailAccountId, provider, userEmail } = useAccount();
-  const { chatId } = useChat();
+  const { chatId, persistedMessageIds } = useChat();
   const [isConfirming, setIsConfirming] = useState(false);
   const [confirmationResultOverride, setConfirmationResultOverride] =
     useState<EmailConfirmationResult | null>(null);
@@ -481,6 +573,7 @@ function EmailActionResult({
     confirmationResultOverride || parsedConfirmationResult;
   const isProcessing = confirmationState === "processing";
   const isChatBusy = disableConfirm;
+  const isPersistedMessage = persistedMessageIds.has(chatMessageId);
   const isConfirmed =
     confirmationState === "confirmed" ||
     Boolean(confirmationResult) ||
@@ -503,7 +596,7 @@ function EmailActionResult({
   const recipient =
     to || (actionType === "reply_email" ? referenceFrom : undefined);
   const referenceSubject = getPendingString(reference, "subject");
-  const displaySubject = subject || referenceSubject;
+  const displaySubject = decodeHtmlEntities(subject || referenceSubject);
   const body = getActionBodyText({ actionType, pendingAction });
   const [editedBody, setEditedBody] = useState(body || "");
 
@@ -543,20 +636,12 @@ function EmailActionResult({
       const hasEdits = editedBody && editedBody !== body;
       const input = {
         chatId,
-        chatMessageId,
         toolCallId,
         actionType,
         ...(hasEdits ? { contentOverride: editedBody } : {}),
       };
 
-      let result = await confirmAssistantEmailAction(emailAccountId, input);
-
-      // Message may not be persisted yet if clicked right after
-      // streaming finished. Retry once after a short wait.
-      if (result?.serverError === "Chat message not found") {
-        await new Promise((r) => setTimeout(r, 2000));
-        result = await confirmAssistantEmailAction(emailAccountId, input);
-      }
+      const result = await confirmAssistantEmailAction(emailAccountId, input);
 
       if (result?.serverError) {
         toastError({ description: result.serverError });
@@ -617,7 +702,7 @@ function EmailActionResult({
           <div className="flex items-center gap-2 border-b px-4 py-2.5">
             <FieldLabel>Subject</FieldLabel>
             <span className="truncate text-sm font-medium text-foreground">
-              {actionType !== "send_email" ? "Re: " : ""}
+              {getPendingEmailSubjectPrefix(actionType)}
               {displaySubject}
             </span>
           </div>
@@ -717,6 +802,8 @@ function EmailActionResult({
                   <Loader2 className="size-4 animate-spin" />
                   Sending...
                 </>
+              ) : !isPersistedMessage ? (
+                "Saving..."
               ) : (
                 <>
                   <SendIcon className="hidden size-3.5 sm:inline" />
@@ -743,29 +830,23 @@ export function CreatedRuleToolCard({
   const conditionText = buildConditionText(args.condition);
 
   return (
-    <Card>
-      <RuleToolCardHeader
-        title={args.name}
-        actions={
-          <>
-            {ruleId && <RuleActions ruleId={ruleId} />}
-            {preview && <RuleActionsPreview />}
-          </>
-        }
-      />
+    <RuleSummaryCard
+      title={args.name}
+      actions={
+        <>
+          {ruleId && <RuleActions ruleId={ruleId} />}
+          {preview && <RuleActionsPreview />}
+        </>
+      }
+    >
+      <RuleSummaryRow label="When">
+        <p>{conditionText}</p>
+      </RuleSummaryRow>
 
-      <CardContent className="space-y-3 px-4 py-3.5">
-        <div className="flex gap-4 text-sm">
-          <FieldLabel className="pt-0.5">When</FieldLabel>
-          <p>{conditionText}</p>
-        </div>
-
-        <div className="flex gap-4 text-sm">
-          <FieldLabel className="pt-0.5">Then</FieldLabel>
-          <ActionBadgeList actions={args.actions} />
-        </div>
-      </CardContent>
-    </Card>
+      <RuleSummaryRow label="Then">
+        <ActionBadgeList actions={args.actions} />
+      </RuleSummaryRow>
+    </RuleSummaryCard>
   );
 }
 
@@ -1185,6 +1266,80 @@ export function UpdatedRuleActions({
   );
 }
 
+export function UpdatedRule({
+  args,
+  output,
+  preview,
+}: {
+  args: UpdateRuleTool["input"];
+  output: UpdateRuleOutput;
+  preview?: boolean;
+}) {
+  const ruleId = output.ruleId;
+  const title = output.updatedName || args.updates.name || args.ruleName;
+  const conditionText = args.updates.condition
+    ? buildConditionText(args.updates.condition)
+    : null;
+  const actions = args.updates.actions;
+
+  return (
+    <Card>
+      <RuleToolCardHeader
+        title={title}
+        actions={
+          preview ? (
+            <RuleActionsPreview />
+          ) : ruleId ? (
+            <RuleActions ruleId={ruleId} />
+          ) : null
+        }
+      />
+
+      <CardContent className="space-y-3 px-4 py-3.5">
+        {args.updates.name && (
+          <div className="flex gap-4 text-sm">
+            <FieldLabel className="pt-0.5">Name</FieldLabel>
+            <p>{args.updates.name}</p>
+          </div>
+        )}
+
+        {conditionText && (
+          <div className="flex gap-4 text-sm">
+            <FieldLabel className="pt-0.5">When</FieldLabel>
+            <p>{conditionText}</p>
+          </div>
+        )}
+
+        {args.updates.enabled !== undefined && (
+          <div className="flex gap-4 text-sm">
+            <FieldLabel className="pt-0.5">Status</FieldLabel>
+            <p>{args.updates.enabled ? "Enabled" : "Disabled"}</p>
+          </div>
+        )}
+
+        {actions && (
+          <div className="flex gap-4 text-sm">
+            <FieldLabel className="pt-0.5">Then</FieldLabel>
+            <ActionBadgeList actions={actions} />
+          </div>
+        )}
+
+        {output.originalName &&
+          output.updatedName &&
+          output.originalName !== output.updatedName && (
+            <ViewChangesCollapsible>
+              <CollapsibleDiffContent
+                title="Name:"
+                originalText={output.originalName}
+                updatedText={output.updatedName}
+              />
+            </ViewChangesCollapsible>
+          )}
+      </CardContent>
+    </Card>
+  );
+}
+
 export function UpdatedLearnedPatterns({
   args,
   ruleId,
@@ -1231,6 +1386,193 @@ export function UpdatedLearnedPatterns({
           );
         })}
       </CardContent>
+    </Card>
+  );
+}
+
+export function UpdatedRuleState({
+  args,
+  output,
+  preview,
+}: {
+  args: UpdateRuleStateTool["input"];
+  output: UpdateRuleStateOutput;
+  preview?: boolean;
+}) {
+  const ruleId = output.ruleId;
+  const ruleName = output.ruleName || args.ruleName;
+  const enabled = output.enabled ?? args.operation === "enable";
+  const label = enabled ? "Enabled" : "Disabled";
+
+  return (
+    <Card>
+      <RuleToolCardHeader
+        title={ruleName}
+        actions={
+          preview ? (
+            <RuleActionsPreview enabled={enabled} />
+          ) : ruleId ? (
+            <RuleActions ruleId={ruleId} initialEnabled={enabled} />
+          ) : null
+        }
+      />
+      <CardContent className="space-y-3 px-4 py-3.5">
+        <div className="flex items-center gap-2 text-sm">
+          <FieldLabel>Status</FieldLabel>
+          <Badge color={enabled ? "green" : "gray"}>{label}</Badge>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+export function PendingDeleteRuleToolCard({
+  args,
+  output,
+  disableConfirm,
+}: {
+  args: UpdateRuleStateTool["input"];
+  output: UpdateRuleStateOutput;
+  disableConfirm: boolean;
+}) {
+  const { emailAccountId } = useAccount();
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [deleted, setDeleted] = useState(
+    output.confirmationState === "confirmed",
+  );
+  const ruleId = output.ruleId;
+  const ruleName = output.ruleName || args.ruleName;
+  const wasEnabled = output.wasEnabled ?? true;
+
+  const handleDelete = async () => {
+    if (!ruleId) {
+      toastError({ description: "Could not delete this rule." });
+      return;
+    }
+
+    setIsDeleting(true);
+    try {
+      const result = await deleteRuleAction(emailAccountId, { id: ruleId });
+      if (result?.serverError) {
+        toastError({ description: result.serverError });
+        return;
+      }
+
+      setDeleted(true);
+      toastSuccess({ description: "The rule has been deleted." });
+    } catch {
+      toastError({ description: "Failed to delete rule." });
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-start gap-3 space-y-0 border-b px-4 py-3.5">
+        <TrashIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+        <div className="min-w-0 flex-1">
+          <h3 className="truncate text-base font-semibold">{ruleName}</h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {deleted ? "Deleted rule" : "Pending deletion"}
+          </p>
+        </div>
+        {deleted && (
+          <Badge color="green" className="shrink-0">
+            Deleted
+          </Badge>
+        )}
+        {!deleted && ruleId && (
+          <RuleEditToggleActions ruleId={ruleId} initialEnabled={wasEnabled} />
+        )}
+      </CardHeader>
+
+      {!deleted && (
+        <CardContent className="space-y-3 px-4 py-3.5">
+          <Alert
+            variant="default"
+            className="border-amber-500/40 bg-amber-500/5"
+          >
+            <AlertTriangleIcon className="size-4 text-amber-600" />
+            <AlertTitle>Confirm rule deletion</AlertTitle>
+            <AlertDescription className="text-sm text-muted-foreground">
+              This will permanently delete the rule and its actions.
+            </AlertDescription>
+          </Alert>
+
+          <div className="flex justify-end">
+            <Button
+              variant="destructive"
+              size="sm"
+              onClick={handleDelete}
+              disabled={disableConfirm || isDeleting || !ruleId}
+              className="gap-2"
+            >
+              {isDeleting ? (
+                <>
+                  <Loader2 className="size-4 animate-spin" />
+                  Deleting...
+                </>
+              ) : (
+                "Delete rule"
+              )}
+            </Button>
+          </div>
+        </CardContent>
+      )}
+    </Card>
+  );
+}
+
+export function PendingDeleteRulePreviewCard({
+  args,
+  output,
+}: {
+  args: UpdateRuleStateTool["input"];
+  output: UpdateRuleStateOutput;
+}) {
+  const deleted = output.confirmationState === "confirmed";
+  const ruleName = output.ruleName || args.ruleName;
+  const wasEnabled = output.wasEnabled ?? true;
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-start gap-3 space-y-0 border-b px-4 py-3.5">
+        <TrashIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+        <div className="min-w-0 flex-1">
+          <h3 className="truncate text-base font-semibold">{ruleName}</h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {deleted ? "Deleted rule" : "Pending deletion"}
+          </p>
+        </div>
+        {deleted && (
+          <Badge color="green" className="shrink-0">
+            Deleted
+          </Badge>
+        )}
+        {!deleted && <RuleEditToggleActionsPreview enabled={wasEnabled} />}
+      </CardHeader>
+
+      {!deleted && (
+        <CardContent className="space-y-3 px-4 py-3.5">
+          <Alert
+            variant="default"
+            className="border-amber-500/40 bg-amber-500/5"
+          >
+            <AlertTriangleIcon className="size-4 text-amber-600" />
+            <AlertTitle>Confirm rule deletion</AlertTitle>
+            <AlertDescription className="text-sm text-muted-foreground">
+              This will permanently delete the rule and its actions.
+            </AlertDescription>
+          </Alert>
+
+          <div className="flex justify-end">
+            <Button variant="destructive" size="sm" disabled>
+              Delete rule
+            </Button>
+          </div>
+        </CardContent>
+      )}
     </Card>
   );
 }
@@ -1282,76 +1624,96 @@ export function AddToKnowledgeBase({
   );
 }
 
-function RuleActions({ ruleId }: { ruleId: string }) {
+function RuleActions({
+  ruleId,
+  initialEnabled = true,
+}: {
+  ruleId: string;
+  initialEnabled?: boolean;
+}) {
+  const { emailAccountId } = useAccount();
+
+  return (
+    <div className="flex items-center gap-1.5">
+      <RuleEditToggleActions ruleId={ruleId} initialEnabled={initialEnabled} />
+      <Tooltip content="Delete rule">
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-8 w-8 p-0 text-muted-foreground"
+          onClick={async () => {
+            const yes = confirm("Are you sure you want to delete this rule?");
+            if (yes) {
+              try {
+                const result = await deleteRuleAction(emailAccountId, {
+                  id: ruleId,
+                });
+                if (result?.serverError) {
+                  toastError({ description: result.serverError });
+                } else {
+                  toastSuccess({
+                    description: "The rule has been deleted.",
+                  });
+                }
+              } catch {
+                toastError({ description: "Failed to delete rule." });
+              }
+            }
+          }}
+        >
+          <TrashIcon className="size-4" />
+        </Button>
+      </Tooltip>
+    </div>
+  );
+}
+
+function RuleEditToggleActions({
+  ruleId,
+  initialEnabled = true,
+}: {
+  ruleId: string;
+  initialEnabled?: boolean;
+}) {
   const { emailAccountId } = useAccount();
   const ruleDialog = useDialogState<{ ruleId: string }>();
-  const [enabled, setEnabled] = useState(true);
+  const [enabled, setEnabled] = useState(initialEnabled);
   const { executeAsync: toggleRule } = useAction(
     toggleRuleAction.bind(null, emailAccountId),
   );
 
   return (
     <>
-      <div className="flex items-center gap-1.5">
-        <Tooltip content="Edit rule">
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-8 w-8 p-0 text-muted-foreground"
-            onClick={() => ruleDialog.onOpen({ ruleId })}
-          >
-            <PencilIcon className="size-4" />
-          </Button>
-        </Tooltip>
-        <Tooltip content="Delete rule">
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-8 w-8 p-0 text-muted-foreground"
-            onClick={async () => {
-              const yes = confirm("Are you sure you want to delete this rule?");
-              if (yes) {
-                try {
-                  const result = await deleteRuleAction(emailAccountId, {
-                    id: ruleId,
-                  });
-                  if (result?.serverError) {
-                    toastError({ description: result.serverError });
-                  } else {
-                    toastSuccess({
-                      description: "The rule has been deleted.",
-                    });
-                  }
-                } catch {
-                  toastError({ description: "Failed to delete rule." });
-                }
-              }
-            }}
-          >
-            <TrashIcon className="size-4" />
-          </Button>
-        </Tooltip>
-        <Switch
-          checked={enabled}
-          onCheckedChange={async (checked) => {
-            setEnabled(checked);
-            try {
-              const result = await toggleRule({ ruleId, enabled: checked });
-              if (result?.serverError) {
-                setEnabled(!checked);
-                toastError({
-                  description: `Failed to ${checked ? "enable" : "disable"} rule.`,
-                });
-              }
-            } catch {
+      <Tooltip content="Edit rule">
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-8 w-8 p-0 text-muted-foreground"
+          onClick={() => ruleDialog.onOpen({ ruleId })}
+        >
+          <PencilIcon className="size-4" />
+        </Button>
+      </Tooltip>
+      <Switch
+        checked={enabled}
+        onCheckedChange={async (checked) => {
+          setEnabled(checked);
+          try {
+            const result = await toggleRule({ ruleId, enabled: checked });
+            if (result?.serverError) {
               setEnabled(!checked);
               toastError({
                 description: `Failed to ${checked ? "enable" : "disable"} rule.`,
               });
             }
-          }}
-        />
-      </div>
+          } catch {
+            setEnabled(!checked);
+            toastError({
+              description: `Failed to ${checked ? "enable" : "disable"} rule.`,
+            });
+          }
+        }}
+      />
 
       <RuleDialog
         ruleId={ruleDialog.data?.ruleId}
@@ -1363,18 +1725,10 @@ function RuleActions({ ruleId }: { ruleId: string }) {
   );
 }
 
-function RuleActionsPreview() {
+function RuleActionsPreview({ enabled = true }: { enabled?: boolean }) {
   return (
     <div className="flex items-center gap-1.5">
-      <Tooltip content="Edit rule">
-        <Button
-          variant="ghost"
-          size="sm"
-          className="h-8 w-8 p-0 text-muted-foreground"
-        >
-          <PencilIcon className="size-4" />
-        </Button>
-      </Tooltip>
+      <RuleEditToggleActionsPreview enabled={enabled} />
       <Tooltip content="Delete rule">
         <Button
           variant="ghost"
@@ -1384,8 +1738,28 @@ function RuleActionsPreview() {
           <TrashIcon className="size-4" />
         </Button>
       </Tooltip>
-      <Switch checked={true} />
     </div>
+  );
+}
+
+function RuleEditToggleActionsPreview({
+  enabled = true,
+}: {
+  enabled?: boolean;
+}) {
+  return (
+    <>
+      <Tooltip content="Edit rule">
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-8 w-8 p-0 text-muted-foreground"
+        >
+          <PencilIcon className="size-4" />
+        </Button>
+      </Tooltip>
+      <Switch checked={enabled} />
+    </>
   );
 }
 
@@ -1415,10 +1789,6 @@ function LearnedPatternsActions({ ruleId }: { ruleId: string }) {
   );
 }
 
-function ToolCard({ children }: { children: React.ReactNode }) {
-  return <Card className="space-y-3 p-4">{children}</Card>;
-}
-
 function RuleToolCardHeader({
   title,
   actions,
@@ -1426,12 +1796,7 @@ function RuleToolCardHeader({
   title: string;
   actions: React.ReactNode;
 }) {
-  return (
-    <CardHeader className="flex flex-row items-center justify-between space-y-0 border-b px-4 py-3.5">
-      <h3 className="text-base font-semibold">{title}</h3>
-      {actions}
-    </CardHeader>
-  );
+  return <RuleSummaryCardHeader title={title} actions={actions} />;
 }
 
 function ExpandedToolCard({
@@ -1515,6 +1880,7 @@ function CollapsibleDiffContent({
 function parseManageInboxAction(
   action: string | undefined,
 ): ManageInboxAction | undefined {
+  if (action === "remove_category_threads") return "remove_label_threads";
   return isManageInboxAction(action) ? action : undefined;
 }
 
@@ -1548,6 +1914,9 @@ export function getManageInboxActionLabel({
   }
   if (action === "label_threads") {
     return inProgress ? "Labeling emails" : "Labeled emails";
+  }
+  if (action === "remove_label_threads") {
+    return inProgress ? "Removing labels" : "Removed labels";
   }
   if (action === "mark_read_threads") {
     if (inProgress) {
@@ -1664,7 +2033,7 @@ function getPendingString(
   source: Record<string, unknown> | undefined,
   key: string,
 ) {
-  if (!source) return undefined;
+  if (!source) return;
   return trimToNonEmptyString(source[key]);
 }
 
@@ -1689,15 +2058,15 @@ function getActionBodyText({
   actionType: PendingEmailActionType;
   pendingAction?: Record<string, unknown>;
 }) {
-  if (!pendingAction) return undefined;
+  if (!pendingAction) return;
 
   if (actionType === "send_email") {
     const messageHtml = getPendingString(pendingAction, "messageHtml");
-    if (!messageHtml) return undefined;
+    if (!messageHtml) return;
     return htmlToText(messageHtml);
   }
 
-  return getPendingString(pendingAction, "content");
+  return decodeHtmlEntities(getPendingString(pendingAction, "content"));
 }
 
 function getEmailActionLabel(actionType: PendingEmailActionType) {
@@ -1737,14 +2106,15 @@ function getExternalMessageUrl({
   });
 }
 
-function htmlToText(html: string) {
-  return html
+export function htmlToText(html: string) {
+  const strippedText = html
     .replace(/<br\s*\/?>/gi, "\n")
     .replace(/<\/p>/gi, "\n")
     .replace(/<[^>]*>/g, " ")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/[<>]/g, "")
+    .replace(/[<>]/g, "");
+
+  return decodeHtmlEntities(strippedText)
+    .replace(/\u00a0/g, " ")
     .replace(/ {2,}/g, " ")
     .replace(/\s+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
@@ -1863,11 +2233,7 @@ function ToolEmailRows({ emails }: { emails: ToolEmailRow[] }) {
     <EmailLookupProvider value={lookup}>
       <div className="overflow-hidden">
         {uniqueEmails.map((email) => (
-          <InlineEmailCard
-            key={email.threadId}
-            threadid={email.threadId}
-            action="none"
-          />
+          <InlineEmailCard key={email.threadId} threadid={email.threadId} />
         ))}
       </div>
     </EmailLookupProvider>
@@ -1921,14 +2287,5 @@ function FieldLabel({
   children: React.ReactNode;
   className?: string;
 }) {
-  return (
-    <span
-      className={cn(
-        "shrink-0 text-[11px] font-medium uppercase tracking-wide text-muted-foreground",
-        className,
-      )}
-    >
-      {children}
-    </span>
-  );
+  return <RuleSummaryLabel className={className}>{children}</RuleSummaryLabel>;
 }

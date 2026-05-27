@@ -35,6 +35,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { toastSuccess, toastError, toastInfo } from "@/components/Toast";
+import { useTeamsEnabled } from "@/hooks/useFeatureFlags";
 import { useMessagingChannels } from "@/hooks/useMessagingChannels";
 import {
   createMessagingLinkCodeAction,
@@ -44,6 +45,7 @@ import {
 import { fetchWithAccount } from "@/utils/fetch";
 import { captureException } from "@/utils/error";
 import { getActionErrorMessage } from "@/utils/error";
+import { redirectToSafeUrl } from "@/utils/redirect";
 import type { GetSlackAuthUrlResponse } from "@/app/api/slack/auth-url/route";
 import {
   type MessagingProvider,
@@ -94,10 +96,12 @@ export function ConnectedAppsSection({
   const hasTelegram = connectedChannels.some(
     (channel) => channel.provider === "TELEGRAM",
   );
+  const teamsEnabled = useTeamsEnabled();
   const slackAvailable =
     channelsData?.availableProviders?.includes("SLACK") ?? false;
   const teamsAvailable =
-    channelsData?.availableProviders?.includes("TEAMS") ?? false;
+    (channelsData?.availableProviders?.includes("TEAMS") ?? false) &&
+    !!teamsEnabled;
   const telegramAvailable =
     channelsData?.availableProviders?.includes("TELEGRAM") ?? false;
 
@@ -117,7 +121,7 @@ export function ConnectedAppsSection({
             title: "Email not found in Slack",
             description: "Redirecting to Slack authorization...",
           });
-          window.location.href = authUrl;
+          redirectToSafeUrl(authUrl, { allowExternal: true });
         } else {
           toastError({ description: msg ?? "Failed to link Slack" });
         }
@@ -174,7 +178,7 @@ export function ConnectedAppsSection({
       }
 
       if (data.url) {
-        window.location.href = data.url;
+        redirectToSafeUrl(data.url, { allowExternal: true });
       } else {
         throw new Error("No auth URL returned");
       }
@@ -224,7 +228,9 @@ export function ConnectedAppsSection({
                     type="button"
                     className="text-xs text-muted-foreground underline underline-offset-4"
                     onClick={() => {
-                      if (authUrl) window.location.href = authUrl;
+                      if (authUrl) {
+                        redirectToSafeUrl(authUrl, { allowExternal: true });
+                      }
                     }}
                   >
                     Install manually

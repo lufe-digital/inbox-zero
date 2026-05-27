@@ -9,8 +9,6 @@ import { SystemType } from "@/generated/prisma/enums";
 
 // Run with: pnpm test-ai ai-regression/determine-thread-status
 
-vi.mock("server-only", () => ({}));
-
 const TIMEOUT = 15_000;
 
 // Skip tests unless explicitly running AI tests
@@ -636,6 +634,39 @@ In your specific case I'd recommend adding custom rules to get the most out of i
       console.debug("Result:", result);
       // User sent an informational email - should be ACTIONED, not FYI
       // FYI is only for emails the user RECEIVES
+      expect(result.status).toBe(SystemType.ACTIONED);
+      expect(result.rationale).toBeDefined();
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "identifies ACTIONED when user confirms they will handle the request",
+    async () => {
+      const emailAccount = getEmailAccount();
+      const messages = [
+        getEmail({
+          from: "customer@example.com",
+          to: emailAccount.email,
+          subject: "Please stop the renewal charge",
+          content: "Please stop trying to charge for renewal.",
+        }),
+        getEmail({
+          from: emailAccount.email,
+          to: "customer@example.com",
+          subject: "Re: Please stop the renewal charge",
+          content:
+            "Really sorry about that. I'll make sure the renewal is cancelled.",
+        }),
+      ];
+
+      const result = await aiDetermineThreadStatus({
+        emailAccount,
+        threadMessages: messages,
+        userSentLastEmail: true,
+      });
+
+      console.debug("Result:", result);
       expect(result.status).toBe(SystemType.ACTIONED);
       expect(result.rationale).toBeDefined();
     },

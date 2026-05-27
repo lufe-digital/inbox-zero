@@ -1,5 +1,3 @@
-import { subHours } from "date-fns/subHours";
-import { addMinutes } from "date-fns/addMinutes";
 import prisma from "@/utils/prisma";
 import { getPremiumUserFilter } from "@/utils/premium";
 import { createEmailProvider } from "@/utils/email/provider";
@@ -8,6 +6,12 @@ import {
   getOrCreateFollowUpLabel,
 } from "@/utils/follow-up/labels";
 import { generateFollowUpDraft } from "@/utils/follow-up/generate-draft";
+import {
+  getFollowUpNotificationChannels,
+  sendFollowUpNotification,
+  type FollowUpNotificationChannel,
+} from "@/utils/follow-up/send-follow-up-notification";
+import { parseFollowUpNotificationDeliveries } from "@/utils/follow-up/notification-deliveries";
 import { ThreadTrackerType, SystemType } from "@/generated/prisma/enums";
 import type { EmailProvider, EmailLabel } from "@/utils/email/types";
 import type { Logger } from "@/utils/logger";
@@ -26,9 +30,22 @@ import {
   type LabelIds,
 } from "@/utils/reply-tracker/label-helpers";
 import { getRuleLabel } from "@/utils/rule/consts";
-import { internalDateToDate } from "@/utils/date";
-import { isSameEmailAddress } from "@/utils/email";
+import {
+  getElapsedBusinessDaysForDisplay,
+  hasElapsedBusinessDays,
+  internalDateToDate,
+} from "@/utils/date";
+import {
+  extractEmailAddress,
+  extractNameFromEmail,
+  isSameEmailAddress,
+} from "@/utils/email";
+import {
+  isGoogleProvider,
+  isMicrosoftProvider,
+} from "@/utils/email/provider-types";
 import { isDuplicateError } from "@/utils/prisma-helpers";
+import { getEmailUrlForOptionalMessage } from "@/utils/url";
 import { env } from "@/env";
 
 const FOLLOW_UP_ELIGIBILITY_WINDOW_MINUTES = 15;
@@ -40,6 +57,7 @@ const followUpReminderAccountSelect = {
   about: true,
   userId: true,
   multiRuleSelectionEnabled: true,
+  sensitiveDataPolicy: true,
   timezone: true,
   calendarBookingLink: true,
   followUpAwaitingReplyDays: true,
@@ -179,16 +197,25 @@ export async function processAccountFollowUps({
     return;
   }
 
+  const providerName = emailAccount.account.provider;
   const provider = await createEmailProvider({
     emailAccountId,
-    provider: emailAccount.account.provider,
+    provider: providerName,
     logger,
   });
 
-  const [dbLabels, providerLabels] = await Promise.all([
+  const [dbLabels, providerLabels, notificationChannels] = await Promise.all([
     getLabelsFromDb(emailAccountId),
     provider.getLabels({ includeHidden: true }),
+    getFollowUpNotificationChannels(emailAccountId),
   ]);
+
+  logger.info("Loaded follow-up reminder prerequisites", {
+    providerName,
+    providerLabelCount: providerLabels.length,
+    notificationChannelCount: notificationChannels.length,
+  });
+
   const followUpLabel = await getOrCreateFollowUpLabel(
     provider,
     providerLabels,
@@ -202,9 +229,11 @@ export async function processAccountFollowUps({
       !env.NEXT_PUBLIC_AUTO_DRAFT_DISABLED,
     emailAccount,
     provider,
+    providerName,
     followUpLabelId: followUpLabel.id,
     dbLabels,
     providerLabels,
+    notificationChannels,
     now,
     logger,
   });
@@ -215,9 +244,11 @@ export async function processAccountFollowUps({
     generateDraft: false,
     emailAccount,
     provider,
+    providerName,
     followUpLabelId: followUpLabel.id,
     dbLabels,
     providerLabels,
+    notificationChannels,
     now,
     logger,
   });
@@ -248,14 +279,14 @@ function getRetryAtFromRateLimitError(
   }
 
   const rateLimitProvider = toRateLimitProvider(provider);
-  if (!rateLimitProvider) return undefined;
+  if (!rateLimitProvider) return;
 
   const delayMs = getProviderRateLimitDelayMs({
     error,
     provider: rateLimitProvider,
     attemptNumber: 1,
   });
-  if (!delayMs) return undefined;
+  if (!delayMs) return;
   return new Date(Date.now() + delayMs);
 }
 
@@ -265,9 +296,11 @@ async function processFollowUpsForType({
   generateDraft,
   emailAccount,
   provider,
+  providerName,
   followUpLabelId,
   dbLabels,
   providerLabels,
+  notificationChannels,
   now,
   logger,
 }: {
@@ -276,9 +309,11 @@ async function processFollowUpsForType({
   generateDraft: boolean;
   emailAccount: EmailAccountWithAI;
   provider: EmailProvider;
+  providerName: string;
   followUpLabelId: string;
   dbLabels: LabelIds;
   providerLabels: EmailLabel[];
+  notificationChannels: FollowUpNotificationChannel[];
   now: Date;
   logger: Logger;
 }) {
@@ -312,11 +347,6 @@ async function processFollowUpsForType({
     count: threads.length,
   });
 
-  const threshold = subHours(now, thresholdDays * 24);
-  const thresholdWithWindow = getThresholdWithWindow(
-    threshold,
-    FOLLOW_UP_ELIGIBILITY_WINDOW_MINUTES,
-  );
   const trackerType =
     systemType === SystemType.AWAITING_REPLY
       ? ThreadTrackerType.AWAITING
@@ -326,6 +356,16 @@ async function processFollowUpsForType({
   const processedLedger = await getProcessedFollowUpLedger({
     emailAccountId: emailAccount.id,
     threadIds,
+  });
+  const processedLedgerStats =
+    summarizeProcessedFollowUpLedger(processedLedger);
+
+  logger.info("Loaded processed follow-up ledger", {
+    systemType,
+    candidateThreadCount: threadIds.length,
+    ledgerThreadCount: processedLedgerStats.threadCount,
+    ledgerMessageIdCount: processedLedgerStats.messageIdCount,
+    ledgerSentAtCount: processedLedgerStats.sentAtCount,
   });
 
   let processedCount = 0;
@@ -349,22 +389,50 @@ async function processFollowUpsForType({
       }
 
       const messageDate = internalDateToDate(lastMessage.internalDate);
-      if (messageDate >= thresholdWithWindow) {
+      if (
+        !hasElapsedBusinessDays({
+          start: messageDate,
+          end: now,
+          days: thresholdDays,
+          windowMinutes: FOLLOW_UP_ELIGIBILITY_WINDOW_MINUTES,
+          timezone: emailAccount.timezone,
+        })
+      ) {
         skippedTooRecentCount++;
         continue;
       }
 
-      if (
-        hasFollowUpBeenProcessed({
-          processedLedger,
-          threadId: thread.id,
-          messageId: lastMessage.id,
-        })
-      ) {
+      const ledgerEntry = processedLedger.get(thread.id);
+      const processedReason = getFollowUpProcessedReason({
+        processedLedger,
+        threadId: thread.id,
+        messageId: lastMessage.id,
+        sentAt: messageDate,
+      });
+
+      if (processedReason) {
         skippedAlreadyProcessedCount++;
         skippedAlreadyProcessedThreadIds.add(thread.id);
+        threadLogger.info("Skipping already-processed follow-up candidate", {
+          systemType,
+          messageId: lastMessage.id,
+          sentAt: messageDate.toISOString(),
+          processedReason,
+          ledgerMessageIdCount: ledgerEntry?.messageIds.size ?? 0,
+          ledgerSentAtCount: ledgerEntry?.sentAtTimes.size ?? 0,
+        });
         continue;
       }
+
+      threadLogger.info("Follow-up candidate missing from processed ledger", {
+        systemType,
+        messageId: lastMessage.id,
+        sentAt: messageDate.toISOString(),
+        trackerType,
+        ledgerThreadKnown: Boolean(ledgerEntry),
+        ledgerMessageIdCount: ledgerEntry?.messageIds.size ?? 0,
+        ledgerSentAtCount: ledgerEntry?.sentAtTimes.size ?? 0,
+      });
 
       await applyFollowUpLabel({
         provider,
@@ -384,7 +452,8 @@ async function processFollowUpsForType({
         orderBy: { createdAt: "desc" },
       });
 
-      let tracker: { id: string };
+      let tracker: { id: string; followUpNotifications: unknown };
+      let trackerWritePath: string;
       if (existingTracker) {
         try {
           tracker = await prisma.threadTracker.update({
@@ -395,6 +464,7 @@ async function processFollowUpsForType({
               followUpAppliedAt: now,
             },
           });
+          trackerWritePath = "updated-existing";
         } catch (error) {
           if (isDuplicateError(error)) {
             tracker = await prisma.threadTracker.update({
@@ -412,6 +482,7 @@ async function processFollowUpsForType({
                 followUpAppliedAt: now,
               },
             });
+            trackerWritePath = "updated-duplicate";
           } else {
             throw error;
           }
@@ -428,6 +499,7 @@ async function processFollowUpsForType({
               followUpAppliedAt: now,
             },
           });
+          trackerWritePath = "created";
         } catch (error) {
           if (isDuplicateError(error)) {
             tracker = await prisma.threadTracker.update({
@@ -445,11 +517,20 @@ async function processFollowUpsForType({
                 followUpAppliedAt: now,
               },
             });
+            trackerWritePath = "created-duplicate-updated";
           } else {
             throw error;
           }
         }
       }
+
+      threadLogger.info("Stored follow-up tracker state", {
+        trackerId: tracker.id,
+        messageId: lastMessage.id,
+        sentAt: messageDate.toISOString(),
+        trackerType,
+        trackerWritePath,
+      });
 
       let draftCreated = false;
       if (generateDraft) {
@@ -478,9 +559,71 @@ async function processFollowUpsForType({
         }
       }
 
-      threadLogger.info("Processed follow-up", {
-        draftCreated,
-      });
+      if (notificationChannels.length > 0) {
+        // Fire-and-forget: we try once per (threadId, messageId) and rely on
+        // the ledger to skip next run. Retrying would burn provider rate
+        // limits (Gmail re-labeling, Slack API) if a channel is misconfigured.
+        try {
+          const { name: counterpartyName, email: counterpartyEmail } =
+            resolveFollowUpCounterparty({
+              trackerType,
+              fromHeader: lastMessage.headers.from,
+              toHeader: lastMessage.headers.to,
+            });
+          const notificationDeliveries = await sendFollowUpNotification({
+            channels: notificationChannels,
+            subject: lastMessage.subject || "(no subject)",
+            counterpartyName,
+            counterpartyEmail,
+            trackerType,
+            daysSinceSent: getElapsedBusinessDaysForDisplay({
+              start: messageDate,
+              end: now,
+              timezone: emailAccount.timezone,
+            }),
+            snippet: lastMessage.snippet || undefined,
+            threadLink:
+              getEmailUrlForOptionalMessage({
+                messageId: lastMessage.id,
+                threadId: thread.id,
+                emailAddress: emailAccount.email,
+                provider: providerName,
+              }) ?? undefined,
+            threadLinkLabel: getThreadLinkLabel(providerName),
+            trackerId: tracker.id,
+            logger: threadLogger,
+          });
+          if (notificationDeliveries.length > 0) {
+            await prisma.threadTracker.update({
+              where: { id: tracker.id },
+              data: {
+                followUpNotifications: [
+                  ...parseFollowUpNotificationDeliveries(
+                    tracker.followUpNotifications,
+                  ),
+                  ...notificationDeliveries,
+                ],
+              },
+            });
+          }
+          threadLogger.info(
+            "Follow-up notification delivery attempt finished",
+            {
+              trackerId: tracker.id,
+              configuredChannelCount: notificationChannels.length,
+              deliveryCount: notificationDeliveries.length,
+            },
+          );
+        } catch (notifyError) {
+          threadLogger.error(
+            "Follow-up notification failed, label still applied",
+            { error: notifyError },
+          );
+          captureException(notifyError);
+        }
+      }
+
+      threadLogger.info("Processed follow-up", { draftCreated });
       processedCount++;
     } catch (error) {
       errorCount++;
@@ -519,9 +662,10 @@ async function processFollowUpsForType({
   });
 }
 
-function getThresholdWithWindow(threshold: Date, windowMinutes: number): Date {
-  return addMinutes(threshold, windowMinutes);
-}
+type ProcessedFollowUpLedger = Map<
+  string,
+  { messageIds: Set<string>; sentAtTimes: Set<number> }
+>;
 
 async function getProcessedFollowUpLedger({
   emailAccountId,
@@ -529,7 +673,7 @@ async function getProcessedFollowUpLedger({
 }: {
   emailAccountId: string;
   threadIds: string[];
-}): Promise<Map<string, Set<string>>> {
+}): Promise<ProcessedFollowUpLedger> {
   if (threadIds.length === 0) return new Map();
 
   const existingTrackers = await prisma.threadTracker.findMany({
@@ -541,31 +685,65 @@ async function getProcessedFollowUpLedger({
         { followUpDraftId: { not: null } },
       ],
     },
-    select: { threadId: true, messageId: true },
+    select: { threadId: true, messageId: true, sentAt: true },
   });
 
-  const processedLedger = new Map<string, Set<string>>();
+  const processedLedger: ProcessedFollowUpLedger = new Map();
 
   for (const tracker of existingTrackers) {
-    const messageIds =
-      processedLedger.get(tracker.threadId) ?? new Set<string>();
-    messageIds.add(tracker.messageId);
-    processedLedger.set(tracker.threadId, messageIds);
+    const processed = processedLedger.get(tracker.threadId) ?? {
+      messageIds: new Set<string>(),
+      sentAtTimes: new Set<number>(),
+    };
+    processed.messageIds.add(tracker.messageId);
+    if (tracker.sentAt) {
+      processed.sentAtTimes.add(tracker.sentAt.getTime());
+    }
+    processedLedger.set(tracker.threadId, processed);
   }
 
   return processedLedger;
 }
 
-function hasFollowUpBeenProcessed({
+function summarizeProcessedFollowUpLedger(ledger: ProcessedFollowUpLedger) {
+  let messageIdCount = 0;
+  let sentAtCount = 0;
+
+  for (const processed of ledger.values()) {
+    messageIdCount += processed.messageIds.size;
+    sentAtCount += processed.sentAtTimes.size;
+  }
+
+  return {
+    threadCount: ledger.size,
+    messageIdCount,
+    sentAtCount,
+  };
+}
+
+type FollowUpProcessedReason = "message-id" | "sent-at";
+
+// sentAt is checked because Outlook can return a different provider message ID
+// for the same sent message across runs, including after Mark done. The ledger
+// only includes rows that already have follow-up history, so ordinary Reply Zero
+// trackers still receive their first follow-up.
+function getFollowUpProcessedReason({
   processedLedger,
   threadId,
   messageId,
+  sentAt,
 }: {
-  processedLedger: Map<string, Set<string>>;
+  processedLedger: ProcessedFollowUpLedger;
   threadId: string;
   messageId: string;
-}): boolean {
-  return processedLedger.get(threadId)?.has(messageId) ?? false;
+  sentAt: Date;
+}): FollowUpProcessedReason | null {
+  const processed = processedLedger.get(threadId);
+  if (!processed) return null;
+
+  if (processed.messageIds.has(messageId)) return "message-id";
+  if (processed.sentAtTimes.has(sentAt.getTime())) return "sent-at";
+  return null;
 }
 
 async function processLoadedFollowUpReminderAccount({
@@ -633,4 +811,28 @@ function isMessageFromUser(
   userEmail: string,
 ) {
   return isSameEmailAddress(message.headers.from, userEmail);
+}
+
+function resolveFollowUpCounterparty({
+  trackerType,
+  fromHeader,
+  toHeader,
+}: {
+  trackerType: ThreadTrackerType;
+  fromHeader: string;
+  toHeader: string;
+}): { name: string; email: string } {
+  // AWAITING: user emailed someone — return the recipient.
+  // NEEDS_REPLY: someone emailed the user — return the sender.
+  const header =
+    trackerType === ThreadTrackerType.AWAITING ? toHeader : fromHeader;
+  const email = extractEmailAddress(header || "") || header || "";
+  const name = extractNameFromEmail(header || "") || email || "someone";
+  return { name, email };
+}
+
+function getThreadLinkLabel(provider: string) {
+  if (isGoogleProvider(provider)) return "Open in Gmail";
+  if (isMicrosoftProvider(provider)) return "Open in Outlook";
+  return "Open email";
 }

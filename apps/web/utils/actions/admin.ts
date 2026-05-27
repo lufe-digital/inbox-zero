@@ -8,6 +8,7 @@ import { adminActionClient } from "@/utils/actions/safe-action";
 import { SafeError } from "@/utils/error";
 import { syncStripeDataToDb } from "@/ee/billing/stripe/sync-stripe";
 import { getStripe } from "@/ee/billing/stripe";
+import { premiumEntitlementSelect } from "@/utils/premium";
 import { createEmailProvider } from "@/utils/email/provider";
 import { processProviderHistory } from "@/utils/webhook/process-history";
 import { hash } from "@/utils/hash";
@@ -16,12 +17,21 @@ import {
   convertGmailUrlBody,
   getLabelsBody,
   watchEmailsBody,
+  syncStripeForUserBody,
   getUserInfoBody,
+  loadResponseTimeDataBody,
   disableAllRulesBody,
   cleanupDraftsBody,
 } from "@/utils/actions/admin.validation";
 import { ensureEmailAccountsWatched } from "@/utils/email/watch-manager";
-import { cleanupAIDraftsForAccount } from "@/utils/ai/draft-cleanup";
+import {
+  cleanupAIDraftsForAccount,
+  getConfiguredDraftCleanupDays,
+} from "@/utils/ai/draft-cleanup";
+import {
+  getAdminResponseTimeProviderDelayMs,
+  getResponseTimeStats,
+} from "@/app/api/user/stats/response-time/controller";
 
 export const adminProcessHistoryAction = adminActionClient
   .metadata({ name: "adminProcessHistory" })
@@ -37,10 +47,12 @@ export const adminProcessHistoryAction = adminActionClient
       parsedInput: { emailAddress, historyId, startHistoryId },
       ctx: { logger },
     }) => {
+      const normalizedEmailAddress = emailAddress.toLowerCase();
       const emailAccount = await prisma.emailAccount.findUnique({
-        where: { email: emailAddress.toLowerCase() },
+        where: { email: normalizedEmailAddress },
         select: {
           id: true,
+          email: true,
           account: {
             select: {
               provider: true,
@@ -60,17 +72,33 @@ export const adminProcessHistoryAction = adminActionClient
         throw new SafeError("No provider found for email account");
       }
 
+      logger.info("Starting admin process history", {
+        emailAccountId: emailAccount.id,
+        provider,
+        historyId,
+        startHistoryId,
+      });
+
       await processProviderHistory({
         provider,
-        emailAddress,
+        emailAddress: normalizedEmailAddress,
         historyId,
         startHistoryId,
         subscriptionId: emailAccount.watchEmailsSubscriptionId || undefined,
-        resourceData: {
-          id: historyId?.toString() || "0",
-          conversationId: startHistoryId?.toString(),
-        },
+        resourceData: historyId
+          ? {
+              id: historyId.toString(),
+              conversationId: startHistoryId?.toString(),
+            }
+          : undefined,
         logger,
+      });
+
+      logger.info("Finished admin process history", {
+        emailAccountId: emailAccount.id,
+        provider,
+        historyId,
+        startHistoryId,
       });
     },
   );
@@ -112,6 +140,56 @@ export const adminSyncStripeForAllUsersAction = adminActionClient
         logger,
       });
     }
+  });
+
+export const adminSyncStripeForUserAction = adminActionClient
+  .metadata({ name: "adminSyncStripeForUser" })
+  .inputSchema(syncStripeForUserBody)
+  .action(async ({ parsedInput: { email }, ctx: { logger } }) => {
+    const normalizedEmail = email.toLowerCase();
+
+    const user = await findUserByUserOrAccountEmail(normalizedEmail);
+
+    if (!user?.premium) {
+      throw new SafeError("Premium record not found");
+    }
+
+    if (!user.premium.stripeCustomerId) {
+      throw new SafeError("Stripe customer ID not found");
+    }
+
+    logger.info("Starting admin Stripe sync for user", {
+      userId: user.id,
+      premiumId: user.premium.id,
+      stripeCustomerId: user.premium.stripeCustomerId,
+    });
+
+    await syncStripeDataToDb({
+      customerId: user.premium.stripeCustomerId,
+      logger,
+    });
+
+    const premium = await prisma.premium.findUnique({
+      where: { id: user.premium.id },
+      select: {
+        stripeSubscriptionStatus: true,
+        stripeRenewsAt: true,
+        tier: true,
+      },
+    });
+
+    logger.info("Finished admin Stripe sync for user", {
+      userId: user.id,
+      premiumId: user.premium.id,
+      stripeCustomerId: user.premium.stripeCustomerId,
+      stripeSubscriptionStatus: premium?.stripeSubscriptionStatus,
+    });
+
+    return {
+      stripeSubscriptionStatus: premium?.stripeSubscriptionStatus ?? null,
+      stripeRenewsAt: premium?.stripeRenewsAt ?? null,
+      tier: premium?.tier ?? null,
+    };
   });
 
 export const adminSyncAllStripeCustomersToDbAction = adminActionClient
@@ -364,6 +442,9 @@ export const adminGetUserInfoAction = adminActionClient
     const lastExecutedMap = new Map(
       lastExecutedRules.map((r) => [r.emailAccountId, r._max.createdAt]),
     );
+    const hasActiveAdminGrant =
+      user.premium?.adminGrantExpiresAt &&
+      user.premium.adminGrantExpiresAt > new Date();
 
     return {
       id: user.id,
@@ -376,11 +457,14 @@ export const adminGetUserInfoAction = adminActionClient
             renewsAt:
               user.premium.stripeRenewsAt ||
               user.premium.lemonSqueezyRenewsAt ||
+              user.premium.adminGrantExpiresAt ||
               null,
             subscriptionStatus:
               user.premium.stripeSubscriptionStatus ||
               user.premium.lemonSubscriptionStatus ||
-              null,
+              (hasActiveAdminGrant ? "admin_grant" : null),
+            adminGrantTier: user.premium.adminGrantTier,
+            adminGrantExpiresAt: user.premium.adminGrantExpiresAt,
           }
         : null,
       emailAccounts: user.emailAccounts.map((ea) => ({
@@ -394,6 +478,61 @@ export const adminGetUserInfoAction = adminActionClient
       })),
     };
   });
+
+export const adminLoadResponseTimeDataAction = adminActionClient
+  .metadata({ name: "adminLoadResponseTimeData" })
+  .inputSchema(loadResponseTimeDataBody)
+  .action(
+    async ({ parsedInput: { email, maxSentMessages }, ctx: { logger } }) => {
+      const emailAccount = await prisma.emailAccount.findUnique({
+        where: { email: email.toLowerCase() },
+        select: {
+          id: true,
+          account: {
+            select: {
+              provider: true,
+            },
+          },
+        },
+      });
+
+      if (!emailAccount) {
+        throw new SafeError("Email account not found");
+      }
+
+      const emailProvider = await createEmailProvider({
+        emailAccountId: emailAccount.id,
+        provider: emailAccount.account.provider,
+        logger,
+      });
+
+      logger.info("Starting admin response time data load", {
+        emailAccountId: emailAccount.id,
+        maxSentMessages,
+      });
+
+      const result = await getResponseTimeStats({
+        emailAccountId: emailAccount.id,
+        emailProvider,
+        logger,
+        maxSentMessages,
+        providerRequestDelayMs: getAdminResponseTimeProviderDelayMs(),
+      });
+
+      logger.info("Finished admin response time data load", {
+        emailAccountId: emailAccount.id,
+        emailsAnalyzed: result.emailsAnalyzed,
+        maxSentMessages,
+      });
+
+      return {
+        emailsAnalyzed: result.emailsAnalyzed,
+        maxEmailsCap: result.maxEmailsCap,
+        averageResponseTime: result.summary.averageResponseTime,
+        medianResponseTime: result.summary.medianResponseTime,
+      };
+    },
+  );
 
 export const adminDisableAllRulesAction = adminActionClient
   .metadata({ name: "adminDisableAllRules" })
@@ -466,10 +605,12 @@ export const adminCleanupDraftsAction = adminActionClient
     let totalErrors = 0;
 
     for (const emailAccount of emailAccounts) {
+      const cleanupDays = await getConfiguredDraftCleanupDays(emailAccount.id);
       const result = await cleanupAIDraftsForAccount({
         emailAccountId: emailAccount.id,
         provider: emailAccount.account.provider,
         logger,
+        cleanupDays,
       });
 
       totalDeleted += result.deleted;
@@ -495,10 +636,8 @@ async function findUserWithDetails(email?: string, userId?: string) {
       lastLogin: true,
       premium: {
         select: {
-          tier: true,
-          lemonSqueezyRenewsAt: true,
+          ...premiumEntitlementSelect,
           stripeRenewsAt: true,
-          stripeSubscriptionStatus: true,
           lemonSubscriptionStatus: true,
         },
       },
@@ -528,4 +667,40 @@ async function findUserWithDetails(email?: string, userId?: string) {
       },
     },
   });
+}
+
+async function findUserByUserOrAccountEmail(email: string) {
+  const user = await prisma.user.findUnique({
+    where: { email },
+    select: {
+      id: true,
+      premium: {
+        select: {
+          id: true,
+          stripeCustomerId: true,
+        },
+      },
+    },
+  });
+
+  if (user) return user;
+
+  const emailAccount = await prisma.emailAccount.findUnique({
+    where: { email },
+    select: {
+      user: {
+        select: {
+          id: true,
+          premium: {
+            select: {
+              id: true,
+              stripeCustomerId: true,
+            },
+          },
+        },
+      },
+    },
+  });
+
+  return emailAccount?.user ?? null;
 }

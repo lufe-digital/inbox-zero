@@ -19,18 +19,33 @@ import type { getEmailAccount } from "@/__tests__/helpers";
 // pnpm test-ai eval/assistant-chat-progressive-disclosure
 // Multi-model: EVAL_MODELS=all pnpm test-ai eval/assistant-chat-progressive-disclosure
 
-vi.mock("server-only", () => ({}));
-
 const shouldRunEval = shouldRunEvalTests();
 const TIMEOUT = 60_000;
 const evalReporter = createEvalReporter();
 const logger = createScopedLogger("eval-assistant-chat-progressive-disclosure");
+
+const { mockCreateEmailProvider, mockPosthogCaptureEvent, mockRedis } =
+  vi.hoisted(() => ({
+    mockCreateEmailProvider: vi.fn(),
+    mockPosthogCaptureEvent: vi.fn(),
+    mockRedis: {
+      set: vi.fn(),
+      rpush: vi.fn(),
+      hincrby: vi.fn(),
+      expire: vi.fn(),
+      keys: vi.fn().mockResolvedValue([]),
+      get: vi.fn().mockResolvedValue(null),
+      llen: vi.fn().mockResolvedValue(0),
+      lrange: vi.fn().mockResolvedValue([]),
+    },
+  }));
 
 type EvalScenario = {
   title: string;
   reportName: string;
   prompt: string;
   expectedTool: string;
+  disallowedTools?: string[];
   timeout?: number;
 };
 
@@ -44,14 +59,26 @@ const scenarios: EvalScenario[] = [
   {
     title: "calls addToKnowledgeBase for knowledge base requests",
     reportName: "save to knowledge base calls addToKnowledgeBase",
-    prompt: "Save this to my knowledge base: always reply with bullet points",
+    prompt:
+      "Save this to my knowledge base: The refund window is 30 days after purchase.",
     expectedTool: "addToKnowledgeBase",
+    disallowedTools: ["saveMemory", "updatePersonalInstructions"],
   },
   {
-    title: "calls saveMemory for remember requests",
-    reportName: "remember preference calls saveMemory",
-    prompt: "Remember that I prefer morning summaries",
+    title: "calls updatePersonalInstructions for global behavior requests",
+    reportName: "global behavior preference calls updatePersonalInstructions",
+    prompt:
+      "Update my personal instructions: when drafting replies, keep the tone formal.",
+    expectedTool: "updatePersonalInstructions",
+    disallowedTools: ["saveMemory", "addToKnowledgeBase"],
+    timeout: 120_000,
+  },
+  {
+    title: "calls saveMemory for chat recall facts",
+    reportName: "chat recall fact calls saveMemory",
+    prompt: "Remember that the project codename is Atlas.",
     expectedTool: "saveMemory",
+    disallowedTools: ["updatePersonalInstructions", "addToKnowledgeBase"],
     timeout: 120_000,
   },
   {
@@ -80,20 +107,6 @@ const scenarios: EvalScenario[] = [
   },
 ];
 
-const { mockPosthogCaptureEvent, mockRedis } = vi.hoisted(() => ({
-  mockPosthogCaptureEvent: vi.fn(),
-  mockRedis: {
-    set: vi.fn(),
-    rpush: vi.fn(),
-    hincrby: vi.fn(),
-    expire: vi.fn(),
-    keys: vi.fn().mockResolvedValue([]),
-    get: vi.fn().mockResolvedValue(null),
-    llen: vi.fn().mockResolvedValue(0),
-    lrange: vi.fn().mockResolvedValue([]),
-  },
-}));
-
 vi.mock("@/utils/posthog", () => ({
   posthogCaptureEvent: mockPosthogCaptureEvent,
   getPosthogLlmClient: () => null,
@@ -111,7 +124,7 @@ vi.mock("@/utils/user/get", () => ({
   getUserPremium: vi.fn(),
 }));
 vi.mock("@/utils/email/provider", () => ({
-  createEmailProvider: vi.fn(),
+  createEmailProvider: mockCreateEmailProvider,
 }));
 
 vi.mock("@/env", () => ({
@@ -203,6 +216,47 @@ describe.runIf(shouldRunEval)(
       prisma.chatMemory.findFirst.mockResolvedValue(null);
       prisma.chatMemory.create.mockResolvedValue({});
       prisma.knowledge.upsert.mockResolvedValue({});
+      mockCreateEmailProvider.mockResolvedValue({
+        searchMessages: vi.fn().mockResolvedValue({
+          messages: [
+            {
+              id: "msg-newsletter-1",
+              threadId: "thread-newsletter-1",
+              headers: {
+                from: "newsletters@example.com",
+                to: "user@test.com",
+                subject: "Weekly roundup",
+                date: new Date().toISOString(),
+              },
+              snippet: "This week's updates.",
+              textPlain: "This week's updates.",
+              textHtml: "<p>This week's updates.</p>",
+              attachments: [],
+              inline: [],
+              labelIds: ["INBOX"],
+              subject: "Weekly roundup",
+              date: new Date().toISOString(),
+            },
+          ],
+          nextPageToken: undefined,
+        }),
+        getMessagesWithPagination: vi.fn().mockResolvedValue({
+          messages: [],
+          nextPageToken: undefined,
+        }),
+        getLabels: vi.fn().mockResolvedValue([
+          { id: "INBOX", name: "INBOX" },
+          { id: "UNREAD", name: "UNREAD" },
+        ]),
+        getThreadMessages: vi
+          .fn()
+          .mockImplementation(async (threadId: string) => [
+            { id: `${threadId}-message-1`, threadId },
+          ]),
+        archiveThreadWithLabel: vi.fn().mockResolvedValue(undefined),
+        markReadThread: vi.fn().mockResolvedValue(undefined),
+        bulkArchiveFromSenders: vi.fn().mockResolvedValue(undefined),
+      });
     });
 
     describeEvalMatrix(
@@ -217,10 +271,7 @@ describe.runIf(shouldRunEval)(
                 messages: [{ role: "user", content: scenario.prompt }],
               });
 
-              const pass = evaluateScenario(
-                result.toolCalls,
-                scenario.expectedTool,
-              );
+              const pass = evaluateScenario(result.toolCalls, scenario);
 
               evalReporter.record({
                 testName: scenario.reportName,
@@ -264,9 +315,16 @@ async function runAssistantChat({
 
 function evaluateScenario(
   toolCalls: RecordedToolCall[],
-  expectedTool: string,
+  scenario: EvalScenario,
 ): boolean {
-  return toolCalls.some((tc) => tc.toolName === expectedTool);
+  const calledExpectedTool = toolCalls.some(
+    (tc) => tc.toolName === scenario.expectedTool,
+  );
+  const calledDisallowedTool = scenario.disallowedTools?.some((toolName) =>
+    toolCalls.some((tc) => tc.toolName === toolName),
+  );
+
+  return calledExpectedTool && !calledDisallowedTool;
 }
 
 function summarizeToolCall(toolCall: RecordedToolCall) {

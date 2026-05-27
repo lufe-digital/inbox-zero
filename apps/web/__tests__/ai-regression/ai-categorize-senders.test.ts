@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import { aiCategorizeSenders } from "@/utils/ai/categorize-sender/ai-categorize-senders";
 import { defaultCategory } from "@/utils/categories";
 import { aiCategorizeSender } from "@/utils/ai/categorize-sender/ai-categorize-single-sender";
@@ -9,8 +9,6 @@ import { getEmailAccount } from "@/__tests__/helpers";
 const isAiTest = process.env.RUN_AI_TESTS === "true";
 
 const TIMEOUT = 15_000;
-
-vi.mock("server-only", () => ({}));
 
 const emailAccount = getEmailAccount();
 
@@ -220,11 +218,10 @@ describe.runIf(isAiTest)("AI Sender Categorization", () => {
   });
 });
 
-const getEnabledCategories = () => {
-  return Object.entries(defaultCategory)
+const getEnabledCategories = () =>
+  Object.entries(defaultCategory)
     .filter(([_, value]) => value.enabled)
     .map(([_, value]) => ({
       name: value.name,
       description: value.description,
     }));
-};

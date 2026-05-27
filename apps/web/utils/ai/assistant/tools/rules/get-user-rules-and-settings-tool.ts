@@ -13,6 +13,7 @@ import { emptyInputSchema, trackRuleToolCall } from "./shared";
 type GetUserRulesAndSettingsOutput =
   | {
       personalInstructions: string;
+      ruleNotificationDestinations: Array<{ provider: string }>;
       rules:
         | Array<{
             name: string;
@@ -63,7 +64,7 @@ export const getUserRulesAndSettingsTool = ({
 }) =>
   tool<z.infer<typeof emptyInputSchema>, GetUserRulesAndSettingsOutput>({
     description:
-      "Retrieve the latest rules and about information for the user.",
+      "Retrieve the latest rules and personal instructions for the user.",
     inputSchema: emptyInputSchema,
     execute: async () => {
       trackRuleToolCall({
@@ -79,6 +80,7 @@ export const getUserRulesAndSettingsTool = ({
 
         return {
           personalInstructions: snapshot.about,
+          ruleNotificationDestinations: snapshot.ruleNotificationDestinations,
           rules: getVisibleRulesFromSnapshot(snapshot),
         };
       } catch (error) {

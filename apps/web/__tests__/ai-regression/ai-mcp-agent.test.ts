@@ -7,8 +7,6 @@ import { getEmailAccount, getEmail } from "@/__tests__/helpers";
 
 // Run with: pnpm test-ai ai-regression/ai-mcp-agent
 
-vi.mock("server-only", () => ({}));
-
 // Mock the MCP tools creation to return actual tools for testing
 vi.mock("@/utils/ai/mcp/mcp-tools", () => ({
   createMcpToolsForAgent: vi.fn(),
@@ -56,8 +54,8 @@ describe.runIf(isAiTest)(
             },
             required: ["query"],
           },
-          execute: vi.fn().mockImplementation(async () => {
-            return JSON.stringify({
+          execute: vi.fn().mockImplementation(async () =>
+            JSON.stringify({
               contacts: [
                 {
                   id: "12345",
@@ -76,8 +74,8 @@ describe.runIf(isAiTest)(
                 },
               ],
               totalResults: 1,
-            });
-          }),
+            }),
+          ),
         },
         "hubspot-search-deals": {
           description: "Search for deals in HubSpot CRM",
@@ -94,8 +92,8 @@ describe.runIf(isAiTest)(
               },
             },
           },
-          execute: vi.fn().mockImplementation(async () => {
-            return JSON.stringify({
+          execute: vi.fn().mockImplementation(async () =>
+            JSON.stringify({
               deals: [
                 {
                   id: "deal-456",
@@ -110,8 +108,8 @@ describe.runIf(isAiTest)(
                 },
               ],
               totalResults: 1,
-            });
-          }),
+            }),
+          ),
         },
       };
     }
@@ -159,8 +157,11 @@ describe.runIf(isAiTest)(
               .optional()
               .describe("URL of a Data source to search"),
           }),
-          execute: async ({ query }: { query: string }) => {
-            return `# API Documentation Search Results
+          execute: async ({
+            query,
+          }: {
+            query: string;
+          }) => `# API Documentation Search Results
 
 Found relevant information for "${query}":
 
@@ -185,8 +186,7 @@ When you exceed rate limits, you'll receive a 429 status code. The response incl
 3. **Monitor usage** - Track your API usage in the developer dashboard
 
 ### Developer Contact
-For API key issues or rate limit increases, contact: api-support@company.com`;
-          },
+For API key issues or rate limit increases, contact: api-support@company.com`,
         }),
         "notion-fetch": tool({
           description:

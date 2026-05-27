@@ -1,14 +1,20 @@
 "use client";
 
 import { useState } from "react";
+import type { ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { toastError } from "@/components/Toast";
 import Image from "next/image";
 import { MutedText } from "@/components/Typography";
 import { getAccountLinkingUrl } from "@/utils/account-linking";
 import { isGoogleProvider } from "@/utils/email/provider-types";
+import { redirectToSafeUrl } from "@/utils/redirect";
 
-export function AddAccount() {
+export function AddAccount({
+  helperText = "You will be billed for each account.",
+}: {
+  helperText?: ReactNode;
+}) {
   const [isLoadingGoogle, setIsLoadingGoogle] = useState(false);
   const [isLoadingMicrosoft, setIsLoadingMicrosoft] = useState(false);
 
@@ -20,7 +26,7 @@ export function AddAccount() {
 
     try {
       const url = await getAccountLinkingUrl(provider);
-      window.location.href = url;
+      redirectToSafeUrl(url, { allowExternal: true });
     } catch (error) {
       console.error(`Error initiating ${provider} link:`, error);
       toastError({
@@ -68,7 +74,7 @@ export function AddAccount() {
         </Button>
       </div>
 
-      <MutedText>You will be billed for each account.</MutedText>
+      <MutedText>{helperText}</MutedText>
     </div>
   );
 }

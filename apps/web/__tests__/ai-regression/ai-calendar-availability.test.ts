@@ -10,9 +10,7 @@ const logger = createTestLogger();
 
 // Run with: pnpm test-ai ai-regression/ai-calendar-availability
 
-vi.mock("server-only", () => ({}));
-
-const TIMEOUT = 15_000;
+const TIMEOUT = 45_000;
 
 // Skip tests unless explicitly running AI tests
 const isAiTest = process.env.RUN_AI_TESTS === "true";
@@ -438,6 +436,7 @@ describe.runIf(isAiTest)("aiGetCalendarAvailability", () => {
       if (result) {
         expect(result.suggestedTimes).toBeDefined();
         expect(result.suggestedTimes.length).toBeGreaterThan(0);
+        expect(result.timezone).toBe("America/New_York");
         console.debug("EST timezone suggestions:", result.suggestedTimes);
       }
 
@@ -483,6 +482,7 @@ describe.runIf(isAiTest)("aiGetCalendarAvailability", () => {
       if (result) {
         expect(result.suggestedTimes).toBeDefined();
         expect(result.suggestedTimes.length).toBeGreaterThan(0);
+        expect(result.timezone).toBe("America/Los_Angeles");
         console.debug("PST timezone suggestions:", result.suggestedTimes);
       }
 
@@ -534,6 +534,7 @@ describe.runIf(isAiTest)("aiGetCalendarAvailability", () => {
       expect(result).toBeDefined();
       if (result) {
         expect(result.suggestedTimes).toBeDefined();
+        expect(result.timezone).toBe("UTC");
         console.debug("UTC fallback suggestions:", result.suggestedTimes);
       }
 
@@ -599,6 +600,7 @@ describe.runIf(isAiTest)("aiGetCalendarAvailability", () => {
       expect(result).toBeDefined();
       if (result) {
         expect(result.suggestedTimes).toBeDefined();
+        expect(result.timezone).toBe("America/New_York");
         console.debug("Primary timezone suggestions:", result.suggestedTimes);
       }
 

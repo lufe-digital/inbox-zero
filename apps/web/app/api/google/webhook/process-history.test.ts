@@ -10,10 +10,6 @@ import { getEmailProviderRateLimitState } from "@/utils/email/rate-limit";
 import { createTestLogger } from "@/__tests__/helpers";
 
 const logger = createTestLogger();
-// Mock logger.with to return the same logger instance so spies work
-vi.spyOn(logger, "with").mockReturnValue(logger);
-
-vi.mock("server-only", () => ({}));
 
 vi.mock("@/utils/gmail/client", () => ({
   getGmailClientWithRefresh: vi.fn().mockResolvedValue({}),
@@ -182,9 +178,9 @@ describe("processHistoryForUser - 404 Handling", () => {
     expect(getHistory).toHaveBeenCalled();
   });
 
-  it("should log a warning and advance cursor when large-gap history is truncated", async () => {
+  it("does not truncate moderate history ID gaps", async () => {
     const email = "user@test.com";
-    const historyId = 2000; // Gap of 1000 (2000 - 1000)
+    const historyId = 1819;
     const emailAccount = {
       id: "account-123",
       email,
@@ -211,21 +207,113 @@ describe("processHistoryForUser - 404 Handling", () => {
 
     vi.mocked(getHistory).mockResolvedValue({ history: [] });
 
-    const warnSpy = vi.spyOn(logger, "warn");
+    await processHistoryForUser({ emailAddress: email, historyId }, {}, logger);
+
+    expect(getHistory).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ startHistoryId: "1000" }),
+      expect.any(Object),
+    );
+  });
+
+  it("advances cursor when large-gap history is truncated", async () => {
+    const email = "user@test.com";
+    const historyId = 5000;
+    const emailAccount = {
+      id: "account-123",
+      email,
+      lastSyncedHistoryId: "1000",
+    };
+
+    vi.mocked(getWebhookEmailAccount).mockResolvedValue(emailAccount as any);
+    vi.mocked(validateWebhookAccount).mockResolvedValue({
+      success: true,
+      data: {
+        emailAccount: {
+          ...emailAccount,
+          account: {
+            access_token: "token",
+            refresh_token: "refresh",
+            expires_at: new Date(Date.now() + 3_600_000),
+          },
+          rules: [],
+        },
+        hasAutomationRules: false,
+        hasAiAccess: false,
+      },
+    } as any);
+
+    vi.mocked(getHistory).mockResolvedValue({ history: [] });
 
     await processHistoryForUser({ emailAddress: email, historyId }, {}, logger);
 
-    expect(warnSpy).toHaveBeenCalledWith(
-      "Skipping history items due to large gap",
-      expect.objectContaining({
-        lastSyncedHistoryId: 1000,
-        webhookHistoryId: 2000,
-        skippedHistoryItems: 500, // (2000 - 500) - 1000 = 500
-      }),
+    expect(getHistory).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ startHistoryId: "2000" }),
+      expect.any(Object),
     );
+    expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
+  });
 
-    // Even if Gmail returns an empty array, advance the cursor to avoid
-    // repeatedly reprocessing the same large gap window.
+  it("fetches all Gmail history pages before processing catch-up", async () => {
+    const email = "user@test.com";
+    const historyId = 2000;
+    const emailAccount = {
+      id: "account-123",
+      email,
+      lastSyncedHistoryId: "1000",
+    };
+
+    vi.mocked(getWebhookEmailAccount).mockResolvedValue(emailAccount as any);
+    vi.mocked(validateWebhookAccount).mockResolvedValue({
+      success: true,
+      data: {
+        emailAccount: {
+          ...emailAccount,
+          account: {
+            access_token: "token",
+            refresh_token: "refresh",
+            expires_at: new Date(Date.now() + 3_600_000),
+          },
+          rules: [],
+        },
+        hasAutomationRules: false,
+        hasAiAccess: false,
+      },
+    } as any);
+
+    vi.mocked(getHistory)
+      .mockResolvedValueOnce({
+        history: [{ id: "1100", messagesAdded: [] }],
+        nextPageToken: "page-2",
+      })
+      .mockResolvedValueOnce({
+        history: [{ id: "1200", messagesAdded: [] }],
+      });
+
+    await processHistoryForUser({ emailAddress: email, historyId }, {}, logger);
+
+    expect(getHistory).toHaveBeenCalledTimes(2);
+    expect(getHistory).toHaveBeenNthCalledWith(
+      1,
+      expect.anything(),
+      expect.objectContaining({
+        startHistoryId: "1000",
+        maxResults: 500,
+        pageToken: undefined,
+      }),
+      expect.any(Object),
+    );
+    expect(getHistory).toHaveBeenNthCalledWith(
+      2,
+      expect.anything(),
+      expect.objectContaining({
+        startHistoryId: "1000",
+        maxResults: 500,
+        pageToken: "page-2",
+      }),
+      expect.any(Object),
+    );
     expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
   });
 });

@@ -24,8 +24,6 @@ import type { getEmailAccount } from "@/__tests__/helpers";
 // pnpm test-ai eval/assistant-chat-attachments
 // Multi-model: EVAL_MODELS=all pnpm test-ai eval/assistant-chat-attachments
 
-vi.mock("server-only", () => ({}));
-
 const shouldRunEval = shouldRunEvalTests();
 const TIMEOUT = 120_000;
 const evalReporter = createEvalReporter();
@@ -373,14 +371,6 @@ function hasToolBeforeTool(
     (tc) => tc.toolName === secondToolName,
   );
   return firstIndex >= 0 && secondIndex >= 0 && firstIndex < secondIndex;
-}
-
-function hasActivateAttachments(toolCalls: RecordedToolCall[]) {
-  return toolCalls.some((tc) => {
-    if (tc.toolName !== "activateTools") return false;
-    if (!isActivateToolsInput(tc.input)) return false;
-    return tc.input.capabilities.includes("attachments");
-  });
 }
 
 async function evaluateScenario(

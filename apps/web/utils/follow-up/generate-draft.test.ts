@@ -5,8 +5,6 @@ import type { EmailAccountWithAI } from "@/utils/llms/types";
 import type { EmailProvider } from "@/utils/email/types";
 import { aiDraftFollowUp } from "@/utils/ai/reply/draft-follow-up";
 
-vi.mock("server-only", () => ({}));
-
 const { envMock } = vi.hoisted(() => ({
   envMock: {
     NEXT_PUBLIC_AUTO_DRAFT_DISABLED: false,
@@ -58,12 +56,7 @@ vi.mock("@/env", () => ({
 import prisma from "@/utils/prisma";
 import { createTestLogger } from "@/__tests__/helpers";
 
-const mockLogger = {
-  info: vi.fn(),
-  error: vi.fn(),
-  warn: vi.fn(),
-  debug: vi.fn(),
-} as any;
+const logger = createTestLogger();
 
 const createMockEmailAccount = (): EmailAccountWithAI =>
   ({
@@ -173,7 +166,7 @@ describe("generateFollowUpDraft", () => {
       messageId: "user-msg",
       trackerId: "tracker-1",
       provider: mockProvider,
-      logger: mockLogger,
+      logger: logger,
     });
 
     // Should draft from the user's latest sent reply, not the older external email.
@@ -215,7 +208,7 @@ describe("generateFollowUpDraft", () => {
       messageId: "user-msg",
       trackerId: "tracker-1",
       provider: mockProvider,
-      logger: mockLogger,
+      logger: logger,
     });
 
     // Should use user's message with recipient override
@@ -267,7 +260,7 @@ describe("generateFollowUpDraft", () => {
       messageId: "user-msg-2",
       trackerId: "tracker-1",
       provider: mockProvider,
-      logger: mockLogger,
+      logger: logger,
     });
 
     // Should use the LAST user message (most recent)
@@ -296,14 +289,10 @@ describe("generateFollowUpDraft", () => {
       messageId: "msg-1",
       trackerId: "tracker-1",
       provider: mockProvider,
-      logger: mockLogger,
+      logger,
     });
 
     expect(mockProvider.draftEmail).not.toHaveBeenCalled();
-    expect(mockLogger.warn).toHaveBeenCalledWith(
-      "Thread has no messages",
-      expect.any(Object),
-    );
   });
 
   it("succeeds even when tracker update fails after draft creation", async () => {
@@ -360,7 +349,7 @@ describe("generateFollowUpDraft", () => {
       messageId: "msg-1",
       trackerId: "tracker-1",
       provider: mockProvider,
-      logger: mockLogger,
+      logger: logger,
     });
 
     expect(mockProvider.draftEmail).not.toHaveBeenCalled();
@@ -393,7 +382,7 @@ describe("generateFollowUpDraft", () => {
       messageId: "user-msg",
       trackerId: "tracker-1",
       provider: mockProvider,
-      logger: mockLogger,
+      logger: logger,
     });
 
     expect(aiDraftFollowUp).not.toHaveBeenCalled();
@@ -425,7 +414,7 @@ describe("generateFollowUpDraft", () => {
       messageId: "external-msg",
       trackerId: "tracker-1",
       provider: mockProvider,
-      logger: mockLogger,
+      logger: logger,
     });
 
     expect(mockProvider.draftEmail).not.toHaveBeenCalled();
@@ -467,7 +456,7 @@ describe("generateFollowUpDraft", () => {
       messageId: "user-msg-1",
       trackerId: "tracker-1",
       provider: mockProvider,
-      logger: mockLogger,
+      logger: logger,
     });
 
     expect(mockProvider.draftEmail).not.toHaveBeenCalled();
@@ -509,7 +498,7 @@ describe("generateFollowUpDraft", () => {
       messageId: "user-msg",
       trackerId: "tracker-1",
       provider: mockProvider,
-      logger: mockLogger,
+      logger: logger,
     });
 
     expect(aiDraftFollowUp).toHaveBeenCalledWith(

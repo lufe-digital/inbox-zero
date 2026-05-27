@@ -50,7 +50,10 @@ import { MutedText } from "@/components/Typography";
 import { BRAND_NAME } from "@/utils/branding";
 import { ActionAttachmentsField } from "@/app/(app)/[emailAccountId]/assistant/ActionAttachmentsField";
 import type { AttachmentSourceInput } from "@/utils/attachments/source-schema";
-import { getMessagingProviderName } from "@/utils/messaging/platforms";
+import {
+  getConnectAppLabel,
+  getMessagingProviderName,
+} from "@/utils/messaging/platforms";
 import { getConnectedRuleNotificationChannels } from "@/utils/messaging/routes";
 import type { GetMessagingChannelsResponse } from "@/app/api/user/messaging-channels/route";
 import { prefixPath } from "@/utils/path";
@@ -230,13 +233,15 @@ function ActionCard({
 
   const delayValue = watch(`actions.${index}.delayInMinutes`);
   const delayEnabled = !!delayValue;
+  const connectedMessagingChannels =
+    getConnectedRuleNotificationChannels(messagingChannels);
   const selectedMessagingChannelIds = getDraftReplyMessagingChannelIds({
     primaryAction,
     draftMessagingActions,
   });
   const selectedMessagingChannels = selectedMessagingChannelIds
     .map((channelId) =>
-      messagingChannels.find(
+      connectedMessagingChannels.find(
         (messagingChannel) => messagingChannel.id === channelId,
       ),
     )
@@ -246,7 +251,7 @@ function ActionCard({
   const selectedMessagingChannel = selectedMessagingChannels[0];
   const draftReplyGroupIndexes = [index, ...draftMessagingIndexes];
   const draftReplyDelivery: DraftReplyDelivery =
-    selectedMessagingChannelIds.length === 0
+    selectedMessagingChannels.length === 0
       ? "EMAIL"
       : primaryAction?.type === ActionType.DRAFT_MESSAGING_CHANNEL
         ? "MESSAGING"
@@ -655,8 +660,6 @@ function ActionCard({
     />
   ) : null;
 
-  const connectedMessagingChannels =
-    getConnectedRuleNotificationChannels(messagingChannels);
   const canConnectMessagingApp = availableMessagingProviders.length > 0;
 
   const deliveryField = isMessagingNotification ? (
@@ -665,7 +668,6 @@ function ActionCard({
       index={index}
       label="Send to"
       messagingChannels={connectedMessagingChannels}
-      selectedChannel={selectedMessagingChannel}
     />
   ) : null;
 
@@ -740,6 +742,7 @@ function ActionCard({
         delivery={draftReplyDelivery}
         selectedChannels={selectedMessagingChannels}
         connectedChannels={connectedMessagingChannels}
+        connectAppLabel={getConnectAppLabel(availableMessagingProviders)}
         errorMessage={deliveryErrorMessage}
         onChange={handleDraftReplyDeliveryChange}
       />
@@ -901,7 +904,7 @@ function ActionCard({
                 <div className="flex flex-wrap gap-2">
                   <Button asChild size="sm" variant="outline">
                     <Link href={prefixPath(emailAccountId, "/channels")}>
-                      Connect app
+                      {getConnectAppLabel(availableMessagingProviders)}
                     </Link>
                   </Button>
                 </div>
@@ -931,6 +934,7 @@ function DraftReplyReviewChannelsSection({
   delivery,
   selectedChannels,
   connectedChannels,
+  connectAppLabel,
   errorMessage,
   onChange,
 }: {
@@ -938,21 +942,13 @@ function DraftReplyReviewChannelsSection({
   delivery: DraftReplyDelivery;
   selectedChannels: MessagingChannelOption[];
   connectedChannels: MessagingChannelOption[];
+  connectAppLabel: string;
   errorMessage?: string;
   onChange: (value: {
     includeEmail: boolean;
     selectedMessagingChannelIds: string[];
   }) => void;
 }) {
-  const availableChannels = [...connectedChannels];
-  for (const selectedChannel of selectedChannels) {
-    if (
-      !availableChannels.some((channel) => channel.id === selectedChannel.id)
-    ) {
-      availableChannels.push(selectedChannel);
-    }
-  }
-
   const includeEmail = delivery !== "MESSAGING";
   const selectedMessagingChannelIds = selectedChannels.map(
     (channel) => channel.id,
@@ -993,7 +989,7 @@ function DraftReplyReviewChannelsSection({
           </div>
         </div>
 
-        {availableChannels.map((channel) => {
+        {connectedChannels.map((channel) => {
           const channelLabel = formatDraftReplyReviewChannelLabel(channel);
           const isSelectedChannel = selectedMessagingChannelIds.includes(
             channel.id,
@@ -1042,7 +1038,7 @@ function DraftReplyReviewChannelsSection({
       {!hasConnectedMessagingDestination ? (
         <Button asChild size="sm" variant="outline" className="w-fit">
           <Link href={prefixPath(emailAccountId, "/channels")}>
-            Connect app
+            {connectAppLabel}
           </Link>
         </Button>
       ) : null}
@@ -1058,26 +1054,24 @@ function MessagingChannelField({
   label,
   includeEmailOption = false,
   messagingChannels,
-  selectedChannel,
 }: {
   control: Control<CreateRuleBody>;
   index: number;
   label: string;
   includeEmailOption?: boolean;
   messagingChannels: MessagingChannelOption[];
-  selectedChannel?: MessagingChannelOption;
 }) {
   return (
     <FormField
       control={control}
       name={`actions.${index}.messagingChannelId`}
       render={({ field, fieldState }) => {
-        const value = field.value ?? (includeEmailOption ? "email" : undefined);
-        const showDisconnectedOption =
-          !!selectedChannel &&
-          !messagingChannels.some(
-            (channel) => channel.id === selectedChannel.id,
-          );
+        const isSelectedChannelConnected =
+          !field.value ||
+          messagingChannels.some((channel) => channel.id === field.value);
+        const value =
+          (isSelectedChannelConnected ? field.value : null) ??
+          (includeEmailOption ? "email" : undefined);
 
         return (
           <div className="space-y-2">
@@ -1108,12 +1102,6 @@ function MessagingChannelField({
                     {formatMessagingDestinationLabel(channel)}
                   </SelectItem>
                 ))}
-                {showDisconnectedOption && selectedChannel ? (
-                  <SelectItem value={selectedChannel.id}>
-                    {formatMessagingDestinationLabel(selectedChannel)}{" "}
-                    (Disconnected)
-                  </SelectItem>
-                ) : null}
               </SelectContent>
             </Select>
             {fieldState.error?.message ? (
@@ -1126,7 +1114,9 @@ function MessagingChannelField({
   );
 }
 
-function formatMessagingDestinationLabel(channel: MessagingChannelOption) {
+export function formatMessagingDestinationLabel(
+  channel: MessagingChannelOption,
+) {
   const provider = getMessagingProviderName(channel.provider);
   const destination = channel.destinations.ruleNotifications;
 
@@ -1270,7 +1260,7 @@ function getMessagingChannelError({
     if (errorMessage) return errorMessage;
   }
 
-  return undefined;
+  return;
 }
 
 function formatDraftReplyDeliverySummary({

@@ -1,3 +1,5 @@
+"use strict";
+
 module.exports = {
   reject: [
     // >=27.4.0 has ESM/CJS incompatibility that breaks Vercel runtime
@@ -33,6 +35,15 @@ module.exports = {
 
     // v5 imports zod/v4/core; keep this pinned while the app stays on Zod 3
     "@hookform/resolvers",
+
+    // 0.71.6+ pulls in jsonpath, which calls fs.readFileSync(require.resolve(...))
+    // at module eval and breaks Turbopack production builds with EBADF.
+    // See https://github.com/dubinc/dub-ts/issues/301
+    "dub",
+
+    // Keep aligned with @chat-adapter/slack to avoid duplicate WebClient copies
+    // that bypass Slack integration test API mocks.
+    "@slack/web-api",
 
     "@types/node",
   ],

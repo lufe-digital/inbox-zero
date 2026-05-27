@@ -2,8 +2,13 @@ import type { Client } from "@microsoft/microsoft-graph-client";
 import { getCalendarClientWithRefresh } from "@/utils/outlook/calendar-client";
 import type {
   CalendarEvent,
+  CalendarEventCancelInput,
   CalendarEventProvider,
+  CalendarEventUpdateInput,
+  CalendarEventWriteInput,
+  CalendarEventWriteResult,
 } from "@/utils/calendar/event-types";
+import { BookingLinkLocationType } from "@/generated/prisma/enums";
 import type { Logger } from "@/utils/logger";
 
 export interface MicrosoftCalendarConnectionParams {
@@ -117,6 +122,95 @@ export class MicrosoftCalendarEventProvider implements CalendarEventProvider {
     return events.map((event) => this.parseEvent(event));
   }
 
+  async createEvent(
+    input: CalendarEventWriteInput,
+  ): Promise<CalendarEventWriteResult> {
+    const client = await this.getClient();
+    const useMicrosoftTeams =
+      input.locationType === BookingLinkLocationType.MICROSOFT_TEAMS;
+    const response: MicrosoftEvent = await client
+      .api(`/me/calendars/${input.calendarId}/events`)
+      .post({
+        subject: input.title,
+        body: {
+          contentType: "text",
+          content: input.description || "",
+        },
+        start: {
+          dateTime: formatMicrosoftUtcDateTime(input.startTime),
+          timeZone: "UTC",
+        },
+        end: {
+          dateTime: formatMicrosoftUtcDateTime(input.endTime),
+          timeZone: "UTC",
+        },
+        attendees: input.attendees.map((attendee) => ({
+          emailAddress: {
+            address: attendee.email,
+            name: attendee.name || attendee.email,
+          },
+          type: "required",
+        })),
+        isOnlineMeeting: useMicrosoftTeams,
+        onlineMeetingProvider: useMicrosoftTeams
+          ? "teamsForBusiness"
+          : undefined,
+        location:
+          !useMicrosoftTeams && input.locationValue
+            ? { displayName: input.locationValue }
+            : undefined,
+      });
+
+    let videoConferenceLink = getJoinUrl(response);
+
+    // Graph initializes the Teams meeting after the event is created, so the
+    // POST response sometimes returns before `onlineMeeting` is populated.
+    // Refetch the event to retrieve the join URL when we asked for Teams.
+    if (useMicrosoftTeams && !videoConferenceLink && response.id) {
+      try {
+        const refetched: MicrosoftEvent = await client
+          .api(`/me/events/${response.id}`)
+          .get();
+        videoConferenceLink = getJoinUrl(refetched);
+      } catch (error) {
+        this.logger.warn(
+          "Failed to refetch Microsoft event for Teams join URL",
+          { eventId: response.id, error },
+        );
+      }
+    }
+
+    return {
+      id: response.id || "",
+      providerCalendarId: input.calendarId,
+      eventUrl: response.webLink,
+      videoConferenceLink,
+    };
+  }
+
+  async cancelEvent(input: CalendarEventCancelInput): Promise<void> {
+    const client = await this.getClient();
+
+    await client
+      .api(`/me/events/${input.eventId}/cancel`)
+      .post({ comment: "" });
+  }
+
+  async updateEvent(input: CalendarEventUpdateInput): Promise<void> {
+    const client = await this.getClient();
+
+    await client.api(`/me/events/${input.eventId}`).patch({
+      start: {
+        dateTime: formatMicrosoftUtcDateTime(input.startTime),
+        timeZone: "UTC",
+      },
+      end: {
+        dateTime: formatMicrosoftUtcDateTime(input.endTime),
+        timeZone: "UTC",
+      },
+    });
+  }
+
   private parseEvent(event: MicrosoftEvent) {
     return {
       id: event.id || "",
@@ -124,8 +218,7 @@ export class MicrosoftCalendarEventProvider implements CalendarEventProvider {
       description: event.bodyPreview || undefined,
       location: event.location?.displayName || undefined,
       eventUrl: event.webLink || undefined,
-      videoConferenceLink:
-        event.onlineMeeting?.joinUrl || event.onlineMeetingUrl || undefined,
+      videoConferenceLink: getJoinUrl(event),
       startTime: new Date(event.start?.dateTime || Date.now()),
       endTime: new Date(event.end?.dateTime || Date.now()),
       attendees:
@@ -135,4 +228,13 @@ export class MicrosoftCalendarEventProvider implements CalendarEventProvider {
         })) || [],
     };
   }
+}
+
+function formatMicrosoftUtcDateTime(date: Date) {
+  // Graph DateTimeTimeZone expects a local datetime for the supplied timezone.
+  return date.toISOString().replace(/Z$/, "0000");
+}
+
+function getJoinUrl(event: MicrosoftEvent): string | undefined {
+  return event.onlineMeeting?.joinUrl || event.onlineMeetingUrl;
 }

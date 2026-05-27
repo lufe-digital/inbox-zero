@@ -4,8 +4,13 @@ import prisma from "@/utils/prisma";
 import { filterNullProperties } from "@/utils";
 import { updateRuleConditionSchema } from "@/utils/actions/rule.validation";
 import { partialUpdateRule } from "@/utils/rule/rule";
+import { hideToolErrorFromUser } from "../../tool-error-visibility";
 import type { RuleReadState } from "../../chat-rule-state";
-import { trackRuleToolCall, validateRuleWasReadRecently } from "./shared";
+import {
+  buildHiddenRuleNotFoundError,
+  trackRuleToolCall,
+  validateRuleWasReadRecently,
+} from "./shared";
 
 export const updateRuleConditionsTool = ({
   email,
@@ -31,10 +36,10 @@ export const updateRuleConditionsTool = ({
         });
 
         if (readValidationError) {
-          return {
+          return hideToolErrorFromUser({
             success: false,
             error: readValidationError,
-          };
+          });
         }
 
         const rule = await prisma.rule.findUnique({
@@ -57,11 +62,7 @@ export const updateRuleConditionsTool = ({
         });
 
         if (!rule) {
-          return {
-            success: false,
-            error:
-              "Rule not found. Try listing the rules again. The user may have made changes since you last checked.",
-          };
+          return buildHiddenRuleNotFoundError();
         }
 
         const staleReadError = validateRuleWasReadRecently({
@@ -71,10 +72,10 @@ export const updateRuleConditionsTool = ({
           currentRuleUpdatedAt: rule.updatedAt,
         });
         if (staleReadError) {
-          return {
+          return hideToolErrorFromUser({
             success: false,
             error: staleReadError,
-          };
+          });
         }
 
         const originalConditions = {

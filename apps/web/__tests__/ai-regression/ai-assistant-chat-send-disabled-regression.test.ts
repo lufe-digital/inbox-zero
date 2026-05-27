@@ -6,8 +6,6 @@ import { createScopedLogger } from "@/utils/logger";
 
 // Run with: pnpm test-ai ai-regression/ai-assistant-chat-send-disabled-regression
 
-vi.mock("server-only", () => ({}));
-
 const TIMEOUT = 15_000;
 const isAiTest = process.env.RUN_AI_TESTS === "true";
 
@@ -217,24 +215,26 @@ describe.runIf(isAiTest)(
           }),
         );
 
-        const updateWithoutRead = await args.tools.updateRuleActions.execute({
+        const updateWithoutRead = await args.tools.updateRule.execute({
           ruleName: "DraftDemo",
-          actions: [
-            {
-              type: ActionType.DRAFT_EMAIL,
-              fields: {
-                to: "demoinboxzero@outlook.com",
-                subject: "test draft",
-                content: "hey, just testing out this email draft!",
-                label: null,
-                cc: null,
-                bcc: null,
-                webhookUrl: null,
-                folderName: null,
+          updates: {
+            actions: [
+              {
+                type: ActionType.DRAFT_EMAIL,
+                fields: {
+                  to: "demoinboxzero@outlook.com",
+                  subject: "test draft",
+                  content: "hey, just testing out this email draft!",
+                  label: null,
+                  cc: null,
+                  bcc: null,
+                  webhookUrl: null,
+                  folderName: null,
+                },
+                delayInMinutes: null,
               },
-              delayInMinutes: null,
-            },
-          ],
+            ],
+          },
         });
 
         expect(updateWithoutRead.success).toBe(false);

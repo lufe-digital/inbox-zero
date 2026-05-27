@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { people } from "@googleapis/people";
 import { auth } from "@googleapis/gmail";
+import { saveTokens } from "@/utils/auth/save-tokens";
+import { createTestLogger } from "@/__tests__/helpers";
 import {
   getContactsClient,
   getGmailClientWithRefresh,
@@ -32,6 +34,7 @@ vi.mock("@/utils/google/oauth", () => ({
 
 const setCredentials = vi.fn();
 const refreshAccessToken = vi.fn();
+const logger = createTestLogger();
 
 vi.mock("@googleapis/gmail", () => ({
   auth: {
@@ -112,13 +115,7 @@ describe("gmail oauth client configuration", () => {
       refreshToken: "refresh-token",
       expiresAt: null,
       emailAccountId: "email-account-id",
-      logger: {
-        error: vi.fn(),
-        info: vi.fn(),
-        trace: vi.fn(),
-        warn: vi.fn(),
-        with: vi.fn(),
-      } as any,
+      logger,
     });
 
     expect(getGoogleGmailApiRootUrl).toHaveBeenCalledWith();
@@ -127,5 +124,35 @@ describe("gmail oauth client configuration", () => {
       auth: expect.any(Object),
       rootUrl: "http://localhost:4444",
     });
+  });
+
+  it("saves refreshed Gmail tokens with optimistic concurrency", async () => {
+    const staleExpiresAt = Date.now() - 1000;
+    refreshAccessToken.mockResolvedValue({
+      credentials: {
+        access_token: "new-access-token",
+        expiry_date: Date.now() + 3_600_000,
+      },
+    });
+
+    await getGmailClientWithRefresh({
+      accessToken: "stale-access-token",
+      refreshToken: "refresh-token",
+      expiresAt: staleExpiresAt,
+      emailAccountId: "email-account-id",
+      logger,
+    });
+
+    expect(saveTokens).toHaveBeenCalledWith(
+      expect.objectContaining({
+        emailAccountId: "email-account-id",
+        accountRefreshToken: "refresh-token",
+        provider: "google",
+        expectedExpiresAt: staleExpiresAt,
+        tokens: expect.objectContaining({
+          access_token: "new-access-token",
+        }),
+      }),
+    );
   });
 });

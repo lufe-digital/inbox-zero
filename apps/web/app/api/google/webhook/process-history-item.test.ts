@@ -10,16 +10,16 @@ import { markMessageAsProcessing } from "@/utils/redis/message-processing";
 import { GmailLabel } from "@/utils/gmail/label";
 import { getEmailAccount, createTestLogger } from "@/__tests__/helpers";
 import { createEmailProvider } from "@/utils/email/provider";
+import { handleOutboundMessage } from "@/utils/reply-tracker/handle-outbound";
 
 const logger = createTestLogger();
 
-vi.mock("server-only", () => ({}));
-vi.mock("next/server", () => ({
-  after: vi.fn((callback) => callback()),
-}));
 vi.mock("@/utils/prisma");
 vi.mock("@/utils/redis/message-processing", () => ({
+  acquireOutboundMessageLock: vi.fn().mockResolvedValue("lock-token-1"),
+  clearOutboundMessageLock: vi.fn().mockResolvedValue(true),
   markMessageAsProcessing: vi.fn().mockResolvedValue(true),
+  markOutboundMessageProcessed: vi.fn().mockResolvedValue(true),
 }));
 
 vi.mock("@/utils/gmail/thread", () => ({
@@ -75,6 +75,10 @@ vi.mock("@/utils/email/provider", () => ({
     blockUnsubscribedEmail: vi.fn().mockResolvedValue(undefined),
     isSentMessage: vi.fn().mockReturnValue(false),
   }),
+}));
+
+vi.mock("@/utils/reply-tracker/handle-outbound", () => ({
+  handleOutboundMessage: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("@/utils/gmail/label", async () => {
@@ -165,7 +169,7 @@ describe("processHistoryItem", () => {
     await processHistoryItem(createHistoryItem(), options, logger);
   });
 
-  it("should skip if message is outbound", async () => {
+  it("handles outbound message-added events", async () => {
     const mockProvider = {
       getMessage: vi.fn().mockResolvedValue({
         id: "123",
@@ -195,6 +199,67 @@ describe("processHistoryItem", () => {
       emailAccount: getDefaultEmailAccount(),
     };
     await processHistoryItem(createHistoryItem(), options, logger);
+
+    expect(handleOutboundMessage).toHaveBeenCalledWith({
+      emailAccount: options.emailAccount,
+      message: expect.objectContaining({ id: "123" }),
+      provider: mockProvider,
+      logger: expect.anything(),
+    });
+  });
+
+  it("handles SENT label-added events as outbound messages", async () => {
+    const sentMessage = {
+      id: "sent-123",
+      threadId: "thread-123",
+      labelIds: [GmailLabel.SENT],
+      snippet: "Test email snippet",
+      historyId: "12345",
+      internalDate: "1704067200000",
+      sizeEstimate: 1024,
+      headers: {
+        from: "user@test.com",
+        to: "recipient@example.com",
+        subject: "Test Email",
+        date: "2024-01-01T00:00:00Z",
+      },
+      textPlain: "Hello World",
+      textHtml: "<b>Hello World</b>",
+    };
+    const mockProvider = {
+      getMessage: vi.fn().mockResolvedValue(sentMessage),
+      blockUnsubscribedEmail: vi.fn().mockResolvedValue(undefined),
+      isSentMessage: vi.fn().mockReturnValue(true),
+    };
+
+    vi.mocked(createEmailProvider).mockResolvedValueOnce(mockProvider as any);
+
+    const options = {
+      ...defaultOptions,
+      emailAccount: getDefaultEmailAccount(),
+    };
+
+    await processHistoryItem(
+      createHistoryItem(
+        "sent-123",
+        "thread-123",
+        HistoryEventType.LABEL_ADDED,
+        [GmailLabel.SENT],
+      ),
+      options,
+      logger,
+    );
+
+    expect(markMessageAsProcessing).toHaveBeenCalledWith({
+      userEmail: options.emailAccount.email,
+      messageId: "sent-123",
+    });
+    expect(handleOutboundMessage).toHaveBeenCalledWith({
+      emailAccount: options.emailAccount,
+      message: sentMessage,
+      provider: mockProvider,
+      logger: expect.anything(),
+    });
   });
 
   it("should skip if email is unsubscribed", async () => {

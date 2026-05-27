@@ -2,10 +2,9 @@ import type { ModelMessage } from "ai";
 import { afterAll, beforeEach, describe, expect, test, vi } from "vitest";
 import {
   captureAssistantChatToolCalls,
+  getLastRuleActionsUpdate,
   hasActionType,
   hasLabelAction,
-  isUpdateRuleActionsInput,
-  getLastMatchingToolCall,
   summarizeRecordedToolCalls,
   type RecordedToolCall,
 } from "@/__tests__/eval/assistant-chat-eval-utils";
@@ -33,8 +32,6 @@ import { createScopedLogger } from "@/utils/logger";
 
 // pnpm test-ai eval/assistant-chat-rule-editing-overlap-exceptions
 // Multi-model: EVAL_MODELS=all pnpm test-ai eval/assistant-chat-rule-editing-overlap-exceptions
-
-vi.mock("server-only", () => ({}));
 
 const shouldRunEval = shouldRunEvalTests();
 const TIMEOUT = 120_000;
@@ -342,11 +339,7 @@ describe.runIf(shouldRunEval)("Eval: assistant chat overlap exceptions", () => {
             context: buildFixRuleContext(),
           });
 
-          const updateActionsCall = getLastMatchingToolCall(
-            toolCalls,
-            "updateRuleActions",
-            isUpdateRuleActionsInput,
-          )?.input;
+          const updateActionsCall = getLastRuleActionsUpdate(toolCalls);
 
           const pass =
             !!updateActionsCall &&

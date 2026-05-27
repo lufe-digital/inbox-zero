@@ -2,6 +2,8 @@ import {
   APICallError,
   type ModelMessage,
   type Tool,
+  type ToolExecutionOptions,
+  type ToolSet,
   ToolLoopAgent,
   type JSONValue,
   type FlexibleSchema,
@@ -28,11 +30,13 @@ import type { EmailAccountWithAI, UserAIFields } from "@/utils/llms/types";
 import {
   addUserErrorMessageWithNotification,
   ErrorType,
+  type PersistedErrorType,
 } from "@/utils/error-messages";
 import {
   attachLlmRepairMetadata,
   captureException,
   isAnthropicInsufficientBalanceError,
+  isContentFilterRefusal,
   isIncorrectOpenAIAPIKeyError,
   isInsufficientCreditsError,
   isInvalidAIModelError,
@@ -49,8 +53,15 @@ import {
   type ResolvedModel,
   type SelectModel,
 } from "@/utils/llms/model";
-import { shouldForceNanoModel } from "@/utils/llms/model-usage-guard";
+import {
+  assertTrialAiUsageAllowed,
+  shouldForceNanoModel,
+} from "@/utils/llms/model-usage-guard";
 import { Provider } from "@/utils/llms/config";
+import {
+  appendOllamaOnlySystemGuidance,
+  OLLAMA_STRUCTURED_OUTPUT_GUIDANCE,
+} from "@/utils/llms/ollama-guidance";
 import { createScopedLogger } from "@/utils/logger";
 import { getPosthogLlmClient, isPosthogLlmEvalApproved } from "@/utils/posthog";
 import {
@@ -59,12 +70,17 @@ import {
   type PromptHardening,
 } from "@/utils/ai/security";
 import {
+  enforceSensitiveDataPolicy,
+  enforceSensitiveToolOutputPolicy,
+  redactSensitiveContentForLogging,
+} from "@/utils/llms/sensitive-content";
+import { resolveSensitiveDataPolicy } from "@/utils/dlp/policy.server";
+import {
   extractLLMErrorInfo,
   isTransientNetworkError,
   withNetworkRetry,
   withLLMRetry,
 } from "./retry";
-import { filterUnsupportedToolsForModel } from "./unsupported-tools";
 
 const logger = createScopedLogger("llms");
 
@@ -76,7 +92,7 @@ const NO_USER_AI_FIELDS: UserAIFields = {
 };
 
 type LLMProviderOptions = Record<string, Record<string, JSONValue>>;
-type RepairCandidateKind = "original" | "trimmed" | "unwrapped";
+type RepairCandidateKind = "original" | "trimmed" | "unwrapped" | "extracted";
 type RepairResultKind = "object-or-array" | "string-wrapped-object-or-array";
 type RepairAttemptState = {
   inputLength: number;
@@ -101,6 +117,20 @@ type UsageMetadata = {
   stepCount?: number;
   toolCallCount?: number;
 };
+type LlmEmailAccount = {
+  sensitiveDataPolicy?: EmailAccountWithAI["sensitiveDataPolicy"];
+  email: EmailAccountWithAI["email"];
+  id: EmailAccountWithAI["id"];
+  userId: EmailAccountWithAI["userId"];
+};
+
+export type ToolCallAgentResolvedModel = {
+  excludedTools: string[];
+  modelName?: string;
+  provider: string;
+  providerOptions: LLMProviderOptions;
+  replacedTools: string[];
+};
 
 const commonOptions: {
   experimental_telemetry: { isEnabled: boolean };
@@ -115,7 +145,7 @@ export function createGenerateText({
   promptHardening,
   onModelUsed,
 }: {
-  emailAccount: Pick<EmailAccountWithAI, "email" | "id" | "userId">;
+  emailAccount: LlmEmailAccount;
   label: string;
   modelOptions: ReturnType<typeof getModel>;
   promptHardening: PromptHardening;
@@ -140,12 +170,35 @@ export function createGenerateText({
         system: typeof options.system === "string" ? options.system : undefined,
         promptHardening,
       });
+      const protectedOptions = enforceSensitiveDataPolicy({
+        options: { ...options, system: systemText },
+        policy: emailAccount.sensitiveDataPolicy,
+        logger,
+        label,
+        userId: emailAccount.userId,
+        emailAccountId: emailAccount.id,
+      });
+      const protectedTools = wrapToolsWithSensitiveDataPolicy({
+        tools: protectedOptions.tools,
+        policy: emailAccount.sensitiveDataPolicy,
+        label,
+        userId: emailAccount.userId,
+        emailAccountId: emailAccount.id,
+      });
 
       logger.trace("Generating text", {
         label,
         promptHardening,
-        system: systemText?.slice(0, MAX_LOG_LENGTH),
-        prompt: options.prompt?.slice(0, MAX_LOG_LENGTH),
+        system: redactSensitiveContentForLogging(
+          typeof protectedOptions.system === "string"
+            ? protectedOptions.system
+            : undefined,
+        )?.slice(0, MAX_LOG_LENGTH),
+        prompt: redactSensitiveContentForLogging(
+          typeof protectedOptions.prompt === "string"
+            ? protectedOptions.prompt
+            : undefined,
+        )?.slice(0, MAX_LOG_LENGTH),
       });
 
       const providerOptions = buildProviderOptions({
@@ -164,8 +217,8 @@ export function createGenerateText({
 
       const result = await generateText(
         {
-          ...options,
-          system: systemText,
+          ...protectedOptions,
+          ...(protectedTools ? { tools: protectedTools } : {}),
           ...commonOptions,
           providerOptions,
           model: withPosthogTracing({
@@ -190,6 +243,7 @@ export function createGenerateText({
         await saveUsageWithMetadata({
           result,
           usage: result.usage,
+          userId: emailAccount.userId,
           email: emailAccount.email,
           emailAccountId: emailAccount.id,
           provider: candidate.provider,
@@ -220,6 +274,8 @@ export function createGenerateText({
           { label },
         );
       } catch (error) {
+        if (error instanceof SafeError) throw error;
+
         if (nextCandidate && shouldFallbackToNextModel(error)) {
           logger.warn("LLM call failed, trying fallback model", {
             label,
@@ -256,7 +312,7 @@ export function createGenerateObject({
   promptHardening,
   onModelUsed,
 }: {
-  emailAccount: Pick<EmailAccountWithAI, "email" | "id" | "userId">;
+  emailAccount: LlmEmailAccount;
   label: string;
   modelOptions: ReturnType<typeof getModel>;
   promptHardening: PromptHardening;
@@ -293,18 +349,44 @@ export function createGenerateObject({
         system: typeof options.system === "string" ? options.system : undefined,
         promptHardening,
       });
+      const protectedOptions = appendOllamaOnlySystemGuidance(
+        enforceSensitiveDataPolicy({
+          options: { ...options, system: systemText },
+          policy: emailAccount.sensitiveDataPolicy,
+          logger,
+          label,
+          userId: emailAccount.userId,
+          emailAccountId: emailAccount.id,
+        }),
+        candidate,
+        OLLAMA_STRUCTURED_OUTPUT_GUIDANCE,
+      );
 
       logger.trace("Generating object", {
         label,
         promptHardening,
-        system: systemText?.slice(0, MAX_LOG_LENGTH),
-        prompt: options.prompt?.slice(0, MAX_LOG_LENGTH),
+        system: redactSensitiveContentForLogging(
+          typeof protectedOptions.system === "string"
+            ? protectedOptions.system
+            : undefined,
+        )?.slice(0, MAX_LOG_LENGTH),
+        prompt: redactSensitiveContentForLogging(
+          typeof protectedOptions.prompt === "string"
+            ? protectedOptions.prompt
+            : undefined,
+        )?.slice(0, MAX_LOG_LENGTH),
       });
 
+      // Only warn for prompt-shaped calls. Messages-shaped callers (no
+      // `prompt` string) are out of scope; scanning every message for
+      // the literal "JSON" would be brittle and noisy.
+      const systemIncludesJson =
+        typeof protectedOptions.system === "string" &&
+        protectedOptions.system.includes("JSON");
       if (
-        !systemText?.includes("JSON") &&
-        typeof options.prompt === "string" &&
-        !options.prompt?.includes("JSON")
+        !systemIncludesJson &&
+        typeof protectedOptions.prompt === "string" &&
+        !protectedOptions.prompt.includes("JSON")
       ) {
         logger.warn("Missing JSON in prompt", { label });
       }
@@ -330,8 +412,7 @@ export function createGenerateObject({
           latestRepairAttempt = repairResult.attempt;
           return repairResult.text;
         },
-        ...options,
-        system: systemText,
+        ...protectedOptions,
         ...commonOptions,
         providerOptions,
         model: withPosthogTracing({
@@ -358,6 +439,7 @@ export function createGenerateObject({
         await saveUsageWithMetadata({
           result,
           usage: result.usage,
+          userId: emailAccount.userId,
           email: emailAccount.email,
           emailAccountId: emailAccount.id,
           provider: candidate.provider,
@@ -386,12 +468,15 @@ export function createGenerateObject({
             withNetworkRetry(() => generate(candidate), {
               label,
               shouldRetry: (error) =>
-                NoObjectGeneratedError.isInstance(error) ||
+                (NoObjectGeneratedError.isInstance(error) &&
+                  !isContentFilterRefusal(error)) ||
                 TypeValidationError.isInstance(error),
             }),
           { label },
         );
       } catch (error) {
+        if (error instanceof SafeError) throw error;
+
         attachLlmRepairMetadata(
           error,
           buildRepairMetadata({
@@ -443,6 +528,7 @@ export async function chatCompletionStream({
   userEmail,
   usageLabel: label,
   providerOptions: requestProviderOptions,
+  sensitiveDataPolicy,
   onFinish,
   onStepFinish,
 }: {
@@ -457,6 +543,7 @@ export async function chatCompletionStream({
   userEmail: string;
   usageLabel: string;
   providerOptions?: LLMProviderOptions;
+  sensitiveDataPolicy?: string | null;
   onFinish?: StreamTextOnFinishCallback<Record<string, Tool>>;
   onStepFinish?: StreamTextOnStepFinishCallback<Record<string, Tool>>;
 }) {
@@ -471,6 +558,14 @@ export async function chatCompletionStream({
     messages,
     promptHardening,
   });
+  const protectedMessages = enforceSensitiveDataPolicy({
+    options: { messages: hardenedMessages },
+    policy: sensitiveDataPolicy,
+    logger,
+    label,
+    userId,
+    emailAccountId,
+  }).messages;
 
   for (let index = 0; index < modelCandidates.length; index++) {
     const candidate = modelCandidates[index];
@@ -499,8 +594,14 @@ export async function chatCompletionStream({
     try {
       return streamText({
         model,
-        messages: hardenedMessages,
-        tools,
+        messages: protectedMessages as ModelMessage[],
+        tools: wrapToolsWithSensitiveDataPolicy({
+          tools,
+          policy: sensitiveDataPolicy,
+          label,
+          userId,
+          emailAccountId,
+        }),
         stopWhen: maxSteps ? stepCountIs(maxSteps) : undefined,
         ...commonOptions,
         providerOptions: providerOptions,
@@ -510,6 +611,7 @@ export async function chatCompletionStream({
           const usagePromise = saveUsageWithMetadata({
             result,
             usage: result.usage,
+            userId,
             email: userEmail,
             emailAccountId,
             provider: candidate.provider,
@@ -592,6 +694,9 @@ export async function toolCallAgentStream({
   providerOptions: requestProviderOptions,
   onFinish,
   onStepFinish,
+  onModelResolved,
+  sensitiveDataPolicy,
+  temperature,
 }: {
   userAi: UserAIFields;
   modelType?: ModelType;
@@ -608,6 +713,9 @@ export async function toolCallAgentStream({
   providerOptions?: LLMProviderOptions;
   onFinish?: StreamTextOnFinishCallback<Record<string, Tool>>;
   onStepFinish?: StreamTextOnStepFinishCallback<Record<string, Tool>>;
+  onModelResolved?: (resolvedModel: ToolCallAgentResolvedModel) => void;
+  sensitiveDataPolicy?: string | null;
+  temperature?: number;
 }) {
   const { modelOptions, modelCandidates } = await resolveModelCandidates({
     modelOptions: getModel(userAi, modelType),
@@ -620,6 +728,14 @@ export async function toolCallAgentStream({
     messages,
     promptHardening,
   });
+  const protectedMessages = enforceSensitiveDataPolicy({
+    options: { messages: hardenedMessages },
+    policy: sensitiveDataPolicy,
+    logger,
+    label,
+    userId,
+    emailAccountId,
+  }).messages;
 
   for (let index = 0; index < modelCandidates.length; index++) {
     const candidate = modelCandidates[index];
@@ -644,15 +760,15 @@ export async function toolCallAgentStream({
       provider: candidate.provider,
       modelName: candidate.modelName,
     });
-    const {
-      tools: candidateTools,
-      excludedTools,
-      replacedTools,
-    } = filterUnsupportedToolsForModel({
-      provider: candidate.provider,
-      modelName: candidate.modelName,
+    const candidateTools = wrapToolsWithSensitiveDataPolicy({
       tools,
+      policy: sensitiveDataPolicy,
+      label,
+      userId,
+      emailAccountId,
     });
+    const excludedTools: string[] = [];
+    const replacedTools: string[] = [];
 
     if (replacedTools.length > 0) {
       logger.warn("Replacing incompatible tools for model", {
@@ -670,6 +786,14 @@ export async function toolCallAgentStream({
       });
     }
 
+    onModelResolved?.({
+      provider: candidate.provider,
+      modelName: candidate.modelName,
+      providerOptions,
+      replacedTools,
+      excludedTools,
+    });
+
     const agent = new ToolLoopAgent({
       model,
       tools: candidateTools,
@@ -678,12 +802,14 @@ export async function toolCallAgentStream({
         | undefined,
       prepareStep,
       stopWhen: maxSteps ? stepCountIs(maxSteps) : undefined,
+      temperature,
       ...commonOptions,
       providerOptions,
       onFinish: async (result) => {
         const usagePromise = saveUsageWithMetadata({
           result,
           usage: result.totalUsage,
+          userId,
           email: userEmail,
           emailAccountId,
           provider: candidate.provider,
@@ -717,7 +843,7 @@ export async function toolCallAgentStream({
 
     try {
       return await agent.stream({
-        messages: hardenedMessages,
+        messages: protectedMessages as ModelMessage[],
         experimental_transform: smoothStream({ chunking: "word" }),
         onStepFinish: onStepFinish
           ? async (stepResult) => {
@@ -758,6 +884,93 @@ export async function toolCallAgentStream({
   }
 
   throw new Error("No models available for tool-call stream");
+}
+
+function wrapToolsWithSensitiveDataPolicy<TTools extends ToolSet | undefined>({
+  tools,
+  policy,
+  label,
+  userId,
+  emailAccountId,
+}: {
+  tools: TTools;
+  policy?: string | null;
+  label: string;
+  userId?: string;
+  emailAccountId: string;
+}): TTools {
+  if (!tools || resolveSensitiveDataPolicy(policy) === "ALLOW") return tools;
+
+  const protectedTools: ToolSet = { ...tools };
+
+  for (const [toolName, toolDefinition] of Object.entries(protectedTools)) {
+    const execute = toolDefinition.execute;
+    if (!execute) continue;
+
+    protectedTools[toolName] = {
+      ...toolDefinition,
+      execute(input: unknown, options: ToolExecutionOptions) {
+        const output = execute.call(toolDefinition, input, options);
+
+        if (isAsyncIterable(output)) {
+          return enforceSensitiveToolOutputStream({
+            output,
+            policy,
+            label,
+            toolName,
+            userId,
+            emailAccountId,
+          });
+        }
+
+        return Promise.resolve(output).then((resolvedOutput) =>
+          enforceSensitiveToolOutputPolicy({
+            output: resolvedOutput,
+            policy,
+            logger,
+            label: `${label}:${toolName}`,
+            userId,
+            emailAccountId,
+          }),
+        );
+      },
+    } as ToolSet[string];
+  }
+
+  return protectedTools as TTools;
+}
+
+async function* enforceSensitiveToolOutputStream({
+  output,
+  policy,
+  label,
+  toolName,
+  userId,
+  emailAccountId,
+}: {
+  output: AsyncIterable<unknown>;
+  policy?: string | null;
+  label: string;
+  toolName: string;
+  userId?: string;
+  emailAccountId: string;
+}) {
+  for await (const item of output) {
+    yield enforceSensitiveToolOutputPolicy({
+      output: item,
+      policy,
+      logger,
+      label: `${label}:${toolName}`,
+      userId,
+      emailAccountId,
+    });
+  }
+}
+
+function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
+  return (
+    typeof value === "object" && value !== null && Symbol.asyncIterator in value
+  );
 }
 
 async function handleError(
@@ -806,7 +1019,7 @@ async function handleError(
 
   if (APICallError.isInstance(error)) {
     const notifyUser = async (
-      errorType: (typeof ErrorType)[keyof typeof ErrorType],
+      errorType: PersistedErrorType,
       errorMessage: string,
     ) => {
       if (hasUserApiKey) markAsHandledUserKeyError(error);
@@ -869,6 +1082,10 @@ async function getCostControlledModelOptions({
   emailAccountId?: string;
   label: string;
 }): Promise<SelectModel> {
+  if (label === "assistant-chat") {
+    return modelOptions;
+  }
+
   const guard = await shouldForceNanoModel({
     userEmail,
     hasUserApiKey: modelOptions.hasUserApiKey,
@@ -877,7 +1094,9 @@ async function getCostControlledModelOptions({
     emailAccountId,
   });
 
-  if (!guard.shouldForce) return modelOptions;
+  if (!guard.shouldForce) {
+    return modelOptions;
+  }
 
   try {
     const nanoModelOptions = getModel(NO_USER_AI_FIELDS, "nano");
@@ -948,7 +1167,18 @@ async function resolveModelCandidates({
   userId?: string;
   emailAccountId?: string;
   label: string;
-}): Promise<{ modelOptions: SelectModel; modelCandidates: ResolvedModel[] }> {
+}): Promise<{
+  modelOptions: SelectModel;
+  modelCandidates: ResolvedModel[];
+}> {
+  await assertTrialAiUsageAllowed({
+    userEmail,
+    hasUserApiKey: modelOptions.hasUserApiKey,
+    label,
+    userId,
+    emailAccountId,
+  });
+
   const effectiveModelOptions = await getCostControlledModelOptions({
     modelOptions,
     userEmail,
@@ -978,6 +1208,8 @@ function shouldFallbackToNextModel(error: unknown): boolean {
   if (RetryError.isInstance(error) && isAiQuotaExceededError(error)) {
     return true;
   }
+
+  if (isContentFilterRefusal(error)) return true;
 
   const llmErrorInfo = extractLLMErrorInfo(error);
   if (llmErrorInfo.retryable) return true;
@@ -1187,12 +1419,88 @@ function repairObjectText(text: string, label: string) {
 function getRepairCandidates(text: string) {
   const trimmed = text.trim();
   const unwrapped = unwrapQuotedJson(trimmed);
+  const extracted = extractBalancedJsonRegions(trimmed);
 
   return dedupeRepairCandidates([
     { kind: "unwrapped", text: unwrapped },
+    ...extracted.map((region) => ({
+      kind: "extracted" as const,
+      text: region,
+    })),
     { kind: "trimmed", text: trimmed },
     { kind: "original", text },
   ]);
+}
+
+function extractBalancedJsonRegions(text: string): string[] {
+  const regions: string[] = [];
+  let i = 0;
+
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === "{" || ch === "[") {
+      const region = walkBalancedJsonFrom(text, i);
+      if (region) {
+        regions.push(region);
+        i += region.length;
+        continue;
+      }
+    }
+    i++;
+  }
+
+  return regions.sort((a, b) => {
+    if (a.length !== b.length) return b.length - a.length;
+    if (a[0] === b[0]) return 0;
+    return a[0] === "{" ? -1 : 1;
+  });
+}
+
+function walkBalancedJsonFrom(
+  text: string,
+  openIdx: number,
+): string | undefined {
+  const openChar = text[openIdx];
+  const closeChar = openChar === "{" ? "}" : "]";
+  let depth = 0;
+  let inString = false;
+  let stringChar: string | undefined;
+  let escaped = false;
+
+  for (let i = openIdx; i < text.length; i++) {
+    const ch = text[i];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (inString) {
+      if (ch === "\\") {
+        escaped = true;
+      } else if (ch === stringChar) {
+        inString = false;
+        stringChar = undefined;
+      }
+      continue;
+    }
+
+    if (ch === '"' || ch === "'" || ch === "`") {
+      inString = true;
+      stringChar = ch;
+      continue;
+    }
+
+    if (ch === "{" || ch === "[") {
+      depth++;
+    } else if (ch === "}" || ch === "]") {
+      depth--;
+      if (depth === 0) {
+        if (ch !== closeChar) return;
+        return text.slice(openIdx, i + 1);
+      }
+    }
+  }
 }
 
 function unwrapQuotedJson(text: string) {
@@ -1297,6 +1605,7 @@ function getUsageMetadata(result: unknown): UsageMetadata {
 async function saveUsageWithMetadata({
   result,
   usage,
+  userId,
   email,
   emailAccountId,
   provider,
@@ -1306,6 +1615,7 @@ async function saveUsageWithMetadata({
 }: {
   result: unknown;
   usage: Parameters<typeof saveAiUsage>[0]["usage"];
+  userId?: string;
   email: string;
   emailAccountId: string;
   provider: string;
@@ -1316,6 +1626,7 @@ async function saveUsageWithMetadata({
   const usageMetadata = getUsageMetadata(result);
 
   await saveAiUsage({
+    userId,
     email,
     emailAccountId,
     usage,

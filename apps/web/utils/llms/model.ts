@@ -16,6 +16,7 @@ import { Provider } from "@/utils/llms/config";
 import type { UserAIFields } from "@/utils/llms/types";
 import { createScopedLogger } from "@/utils/logger";
 import { SafeError } from "../error";
+import { assertCliLlmEnabled, createCliLanguageModel } from "./cli-provider";
 
 const DEFAULT_GOOGLE_THINKING_BUDGET = 128;
 
@@ -27,6 +28,7 @@ export type ResolvedModel = {
   provider: string;
   modelName: string;
   model: LanguageModelV3;
+  // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
   providerOptions?: Record<string, any>;
 };
 
@@ -100,6 +102,7 @@ function selectModel(
     aiModel: string | null;
     aiApiKey: string | null;
   },
+  // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
   providerOptions?: Record<string, any>,
   online = false,
 ): ResolvedModel {
@@ -259,6 +262,28 @@ function selectModel(
         model: openaiCompatible(modelName),
       };
     }
+    case Provider.CODEX_CLI: {
+      const modelName = aiModel || "gpt-5.3-codex";
+      return {
+        provider: Provider.CODEX_CLI,
+        modelName,
+        model: createCliLanguageModel({
+          provider: Provider.CODEX_CLI,
+          modelName,
+        }),
+      };
+    }
+    case Provider.CLAUDE_CODE: {
+      const modelName = aiModel || "sonnet";
+      return {
+        provider: Provider.CLAUDE_CODE,
+        modelName,
+        model: createCliLanguageModel({
+          provider: Provider.CLAUDE_CODE,
+          modelName,
+        }),
+      };
+    }
 
     case Provider.BEDROCK: {
       const modelName = aiModel || "global.anthropic.claude-sonnet-4-6";
@@ -301,6 +326,7 @@ function selectModel(
 function createOpenRouterProviderOptions(
   providers: string,
   modelName?: string | null,
+  // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
 ): Record<string, any> {
   const order = providers
     .split(",")
@@ -341,6 +367,7 @@ function selectEconomyModel(
     }
 
     // Configure OpenRouter provider options if using OpenRouter for economy
+    // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
     let providerOptions: Record<string, any> | undefined;
     if (
       env.ECONOMY_LLM_PROVIDER === Provider.OPENROUTER &&
@@ -380,6 +407,7 @@ function selectChatModel(userAi: UserAIFields, online = false): ResolvedModel {
     }
 
     // Configure OpenRouter provider options if using OpenRouter for chat
+    // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
     let providerOptions: Record<string, any> | undefined;
     if (
       env.CHAT_LLM_PROVIDER === Provider.OPENROUTER &&
@@ -465,13 +493,17 @@ function selectDefaultModel(
   let aiModel: string | null = null;
   const aiApiKey = userAi.aiApiKey;
 
+  // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
   const providerOptions: Record<string, any> = {};
 
   // If user has not api key set, then use default model
   // If they do they can use the model of their choice
   if (aiApiKey) {
     aiProvider = userAi.aiProvider || env.DEFAULT_LLM_PROVIDER;
-    aiModel = userAi.aiModel || null;
+    aiModel =
+      userAi.aiModel ||
+      (userAi.aiProvider ? null : env.DEFAULT_LLM_MODEL) ||
+      null;
   } else {
     aiProvider = env.DEFAULT_LLM_PROVIDER;
     aiModel = env.DEFAULT_LLM_MODEL || null;
@@ -536,9 +568,20 @@ function getProviderApiKey(provider: string) {
     // Returns a placeholder so the fallback chain doesn't skip this provider
     // when no API key is configured (many OpenAI-compatible servers don't require one)
     [Provider.OPENAI_COMPATIBLE]: env.LLM_API_KEY || "not-required",
+    [Provider.CODEX_CLI]: getCliProviderAvailability(Provider.CODEX_CLI),
+    [Provider.CLAUDE_CODE]: getCliProviderAvailability(Provider.CLAUDE_CODE),
   };
 
   return providerApiKeys[provider];
+}
+
+function getCliProviderAvailability(provider: string) {
+  try {
+    assertCliLlmEnabled(provider);
+    return "cli-provider";
+  } catch {
+    return;
+  }
 }
 
 function resolveApiKey(
@@ -689,6 +732,7 @@ function getConfiguredFallbacksByType(
 function getOpenRouterProviderOptionsByType(
   modelType: ModelType,
   modelName?: string | null,
+  // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
 ): Record<string, any> | undefined {
   const providersByType: Record<ModelType, string | undefined> = {
     default: env.DEFAULT_OPENROUTER_PROVIDERS,

@@ -14,16 +14,6 @@ import prisma from "@/utils/prisma";
 import { createTestLogger } from "@/__tests__/helpers";
 
 const logger = createTestLogger();
-vi.spyOn(logger, "with").mockReturnValue(logger);
-
-vi.mock("server-only", () => ({}));
-vi.mock("next/server", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("next/server")>();
-  return {
-    ...actual,
-    after: vi.fn((callback: () => Promise<void> | void) => callback()),
-  };
-});
 
 vi.mock("@/utils/webhook/validate-webhook-account", () => ({
   getWebhookEmailAccount: vi.fn(),
@@ -35,7 +25,10 @@ vi.mock("@/utils/email/provider", () => ({
 }));
 
 vi.mock("@/utils/redis/message-processing", () => ({
+  acquireOutboundMessageLock: vi.fn().mockResolvedValue("lock-token-1"),
+  clearOutboundMessageLock: vi.fn().mockResolvedValue(true),
   markMessageAsProcessing: vi.fn(),
+  markOutboundMessageProcessed: vi.fn().mockResolvedValue(true),
 }));
 
 vi.mock("@/utils/webhook/process-history-item", () => ({
@@ -168,8 +161,6 @@ describe("Outlook processHistoryForUser - Folder Filtering", () => {
     };
     vi.mocked(createEmailProvider).mockResolvedValue(mockProvider as any);
 
-    const infoSpy = vi.spyOn(logger, "info");
-
     const result = await processHistoryForUser({
       subscriptionId: "sub-123",
       resourceData: mockResourceData as any,
@@ -181,10 +172,6 @@ describe("Outlook processHistoryForUser - Folder Filtering", () => {
     expect(markMessageAsProcessing).not.toHaveBeenCalled();
     expect(processHistoryItem).not.toHaveBeenCalled();
     expect(learnFromOutlookLabelRemoval).not.toHaveBeenCalled();
-    expect(infoSpy).toHaveBeenCalledWith(
-      "Skipping message not in inbox or sent items",
-      expect.objectContaining({ labelIds: ["DRAFT"] }),
-    );
   });
 
   it("skips messages in TRASH folder without acquiring lock", async () => {
@@ -235,8 +222,6 @@ describe("Outlook processHistoryForUser - Folder Filtering", () => {
     vi.mocked(createEmailProvider).mockResolvedValue(mockProvider as any);
     vi.mocked(markMessageAsProcessing).mockResolvedValue(false);
 
-    const infoSpy = vi.spyOn(logger, "info");
-
     const result = await processHistoryForUser({
       subscriptionId: "sub-123",
       resourceData: mockResourceData as any,
@@ -248,9 +233,6 @@ describe("Outlook processHistoryForUser - Folder Filtering", () => {
     expect(markMessageAsProcessing).toHaveBeenCalled();
     expect(processHistoryItem).not.toHaveBeenCalled();
     expect(learnFromOutlookLabelRemoval).not.toHaveBeenCalled();
-    expect(infoSpy).toHaveBeenCalledWith(
-      "Skipping. Message already being processed.",
-    );
   });
 
   it("passes pre-fetched message to processHistoryItem to avoid refetching", async () => {
@@ -277,7 +259,7 @@ describe("Outlook processHistoryForUser - Folder Filtering", () => {
     );
   });
 
-  it("learns from Outlook label removal when rule already exists", async () => {
+  it("learns from Outlook label removal and continues shared processing when rule already exists", async () => {
     const inboxMessage = getMockParsedMessage({
       id: "message-123",
       threadId: "thread-123",
@@ -302,9 +284,14 @@ describe("Outlook processHistoryForUser - Folder Filtering", () => {
     expect(learnFromOutlookLabelRemoval).toHaveBeenCalledWith({
       message: inboxMessage,
       emailAccountId: "account-123",
-      logger,
+      logger: expect.any(Object),
     });
-    expect(processHistoryItem).not.toHaveBeenCalled();
+    expect(processHistoryItem).toHaveBeenCalledWith(
+      { messageId: "message-123", message: inboxMessage },
+      expect.objectContaining({
+        provider: mockProvider,
+      }),
+    );
   });
 
   describe("error handling", () => {

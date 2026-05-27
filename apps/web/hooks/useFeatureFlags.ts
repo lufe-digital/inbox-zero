@@ -2,7 +2,6 @@ import {
   useFeatureFlagEnabled,
   useFeatureFlagVariantKey,
 } from "posthog-js/react";
-import type { OnboardingFlowVariant } from "@/app/(app)/[emailAccountId]/onboarding/onboardingFlow";
 import { env } from "@/env";
 
 export function useCleanerEnabled() {
@@ -27,6 +26,15 @@ export function useIntegrationsEnabled() {
 export function useSmartFilingEnabled() {
   const posthogEnabled = useFeatureFlagEnabled("smart-filing");
   return env.NEXT_PUBLIC_SMART_FILING_ENABLED || posthogEnabled;
+}
+
+export function useBookingLinksEnabled() {
+  const posthogEnabled = useFeatureFlagEnabled("booking-links");
+  return env.NEXT_PUBLIC_BOOKING_LINKS_ENABLED || posthogEnabled;
+}
+
+export function useTeamsEnabled() {
+  return useFeatureFlagEnabled("microsoft-teams");
 }
 
 const HERO_FLAG_NAME = "hero-copy-7";
@@ -76,12 +84,5 @@ export function useWelcomePricingVariant() {
     (useFeatureFlagVariantKey(
       "welcome-pricing-tiers",
     ) as WelcomePricingVariant) || "control"
-  );
-}
-
-export function useOnboardingFlowVariant() {
-  return (
-    (useFeatureFlagVariantKey("onboarding-flow") as OnboardingFlowVariant) ||
-    "control"
   );
 }

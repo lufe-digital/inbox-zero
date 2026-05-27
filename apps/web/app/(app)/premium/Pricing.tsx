@@ -23,7 +23,7 @@ import {
   type Tier,
   tiers,
 } from "@/app/(app)/premium/config";
-import { AlertBasic, AlertWithButton } from "@/components/Alert";
+import { AlertBasic } from "@/components/Alert";
 import { TooltipExplanation } from "@/components/TooltipExplanation";
 import { toastError } from "@/components/Toast";
 import {
@@ -35,6 +35,7 @@ import { LoadingMiniSpinner } from "@/components/Loading";
 import { cn } from "@/utils";
 import { ManageSubscription } from "@/app/(app)/premium/ManageSubscription";
 import { captureException } from "@/utils/error";
+import { redirectToSafeUrl } from "@/utils/redirect";
 
 export type PricingProps = {
   header?: React.ReactNode;
@@ -125,35 +126,12 @@ export default function Pricing(props: PricingProps) {
             <ManageSubscription premium={premium ?? null} />
 
             {userPremiumTier && (
-              <>
-                <Button className="ml-2" asChild>
-                  <Link href="/setup">
-                    <SparklesIcon className="mr-2 h-4 w-4" />
-                    Go to app
-                  </Link>
-                </Button>
-                <div className="mx-auto mt-4 max-w-md">
-                  {userPremiumTier === "STARTER_MONTHLY" ||
-                  userPremiumTier === "STARTER_ANNUALLY" ||
-                  userPremiumTier === "PLUS_MONTHLY" ||
-                  userPremiumTier === "PLUS_ANNUALLY" ? (
-                    <AlertWithButton
-                      className="bg-background"
-                      variant="blue"
-                      title="Need multiple accounts?"
-                      description="Individual plans are designed for single users. Contact our support team for custom pricing on multiple accounts."
-                      icon={null}
-                      button={
-                        <div className="ml-4 whitespace-nowrap">
-                          <Button asChild>
-                            <Link href="/support">Contact Support</Link>
-                          </Button>
-                        </div>
-                      }
-                    />
-                  ) : null}
-                </div>
-              </>
+              <Button className="ml-2" asChild>
+                <Link href="/setup">
+                  <SparklesIcon className="mr-2 h-4 w-4" />
+                  Go to app
+                </Link>
+              </Button>
             )}
 
             {hasActiveAppleManagedSubscription && (
@@ -195,25 +173,23 @@ export default function Pricing(props: PricingProps) {
               : "max-w-7xl lg:mx-0 lg:max-w-none lg:grid-cols-3",
           )}
         >
-          {displayedTiers.map((tier) => {
-            return (
-              <PriceTier
-                key={tier.name}
-                tier={tier}
-                userPremiumTier={userPremiumTier}
-                frequency={frequency}
-                stripeSubscriptionId={premium?.stripeSubscriptionId}
-                stripeSubscriptionStatus={premium?.stripeSubscriptionStatus}
-                hasActiveAppleManagedSubscription={
-                  hasActiveAppleManagedSubscription
-                }
-                isLoggedIn={isLoggedIn}
-                router={router}
-                userId={data?.id}
-                pricingSource={pricingSource}
-              />
-            );
-          })}
+          {displayedTiers.map((tier) => (
+            <PriceTier
+              key={tier.name}
+              tier={tier}
+              userPremiumTier={userPremiumTier}
+              frequency={frequency}
+              stripeSubscriptionId={premium?.stripeSubscriptionId}
+              stripeSubscriptionStatus={premium?.stripeSubscriptionStatus}
+              hasActiveAppleManagedSubscription={
+                hasActiveAppleManagedSubscription
+              }
+              isLoggedIn={isLoggedIn}
+              router={router}
+              userId={data?.id}
+              pricingSource={pricingSource}
+            />
+          ))}
         </div>
       </div>
     </LoadingContent>
@@ -346,7 +322,7 @@ function PriceTier({
 
           // Handle enterprise tier differently - redirect to sales page
           if (tier.ctaLink) {
-            window.location.href = tier.ctaLink;
+            redirectToSafeUrl(tier.ctaLink, { allowExternal: true });
             return;
           }
 
@@ -406,7 +382,7 @@ function PriceTier({
               return;
             }
 
-            window.location.href = result.data.url;
+            redirectToSafeUrl(result.data.url, { allowExternal: true });
           }
 
           try {

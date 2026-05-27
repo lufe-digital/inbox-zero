@@ -223,6 +223,7 @@ export const getOutlookClientWithRefresh = async ({
       accountRefreshToken: refreshToken,
       emailAccountId,
       provider: "microsoft",
+      expectedExpiresAt: expiresAt,
     });
 
     return createOutlookClient(tokens.access_token, logger);
@@ -240,9 +241,8 @@ export const getOutlookClientWithRefresh = async ({
   }
 };
 
-export const getAccessTokenFromClient = (client: OutlookClient): string => {
-  return client.getAccessToken();
-};
+export const getAccessTokenFromClient = (client: OutlookClient): string =>
+  client.getAccessToken();
 
 // Helper function to get the OAuth2 URL for linking accounts
 export function getLinkingOAuth2Url() {

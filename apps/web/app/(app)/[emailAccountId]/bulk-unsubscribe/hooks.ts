@@ -5,6 +5,7 @@ import { toast } from "sonner";
 import { useAction } from "next-safe-action/hooks";
 import type { PostHog } from "posthog-js/react";
 import { onAutoArchive, onDeleteFilter } from "@/utils/actions/client";
+import { toastSuccess } from "@/components/Toast";
 import {
   setNewsletterStatusAction,
   unsubscribeSenderAction,
@@ -33,10 +34,11 @@ import {
   getHttpUnsubscribeLink,
   getUserFacingUnsubscribeLink,
 } from "@/utils/parse/unsubscribe";
+import { useProductAnalytics } from "@/hooks/useProductAnalytics";
 
 // Shared type for SWR mutate function
 type MutateFn = (
-  // biome-ignore lint/suspicious/noExplicitAny: SWR mutate signature
+  // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
   data?: any,
   opts?: { revalidate?: boolean },
 ) => Promise<unknown>;
@@ -112,17 +114,17 @@ async function executeBulkOperation<T extends Row>({
   const updateItemOptimistically = (item: T) => {
     const optimisticStatus = getNewStatus ? getNewStatus(item) : newStatus;
     mutate(
-      // biome-ignore lint/suspicious/noExplicitAny: SWR data structure
+      // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
       (currentData: any) => {
         if (!currentData?.newsletters) return currentData;
         return {
           ...currentData,
           newsletters: currentData.newsletters
-            // biome-ignore lint/suspicious/noExplicitAny: newsletter type
+            // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
             .map((n: any) =>
               n.name === item.name ? { ...n, status: optimisticStatus } : n,
             )
-            // biome-ignore lint/suspicious/noExplicitAny: newsletter type
+            // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
             .filter((n: any) => itemMatchesFilter(n.status, filter)),
         };
       },
@@ -218,8 +220,8 @@ async function blockSender({
   labelId?: string;
   labelName?: string;
   queueArchiveSenders: QueueArchiveSendersFn;
-}) {
-  await onAutoArchive({
+}): Promise<boolean> {
+  const ok = await onAutoArchive({
     emailAccountId,
     from: sender,
     gmailLabelId: labelId,
@@ -237,10 +239,11 @@ async function blockSender({
       labelId,
       emailAccountId,
     });
-    return;
+  } else {
+    await queueArchiveSenders({ senders: [sender] });
   }
 
-  await queueArchiveSenders({ senders: [sender] });
+  return ok;
 }
 
 export function useUnsubscribe<T extends Row>({
@@ -258,6 +261,7 @@ export function useUnsubscribe<T extends Row>({
   posthog: PostHog;
   refetchPremium: () => Promise<UserResponse | null | undefined>;
 }) {
+  const analytics = useProductAnalytics("bulk_unsubscribe");
   const [unsubscribeLoading, setUnsubscribeLoading] = useState(false);
   const { queueArchiveSenders } = useArchiveSenderQueueActions(emailAccountId);
   const automaticUnsubscribeLink = getAutomaticUnsubscribeLink(
@@ -274,6 +278,11 @@ export function useUnsubscribe<T extends Row>({
 
     try {
       posthog.capture("Clicked Unsubscribe");
+      analytics.captureAction("unsubscribe_sender_started", {
+        status: item.status,
+        has_automatic_unsubscribe_link: Boolean(automaticUnsubscribeLink),
+        has_user_facing_unsubscribe_link: Boolean(userFacingUnsubscribeLink),
+      });
 
       if (item.status === NewsletterStatus.UNSUBSCRIBED) {
         await setNewsletterStatusAction(emailAccountId, {
@@ -283,11 +292,19 @@ export function useUnsubscribe<T extends Row>({
         await mutate();
       } else {
         if (!userFacingUnsubscribeLink) {
-          await blockSender({
+          const ok = await blockSender({
             sender: item.name,
             emailAccountId,
             queueArchiveSenders,
           });
+          if (ok) {
+            analytics.captureAction("unsubscribe_sender_completed", {
+              outcome: "blocked_sender",
+            });
+            toastSuccess({
+              description: "Sender blocked. Future emails will be archived.",
+            });
+          }
           await mutate();
           await refetchPremium();
           return;
@@ -304,7 +321,14 @@ export function useUnsubscribe<T extends Row>({
           queueArchiveSenders,
         });
         if (!unsubscribed) {
+          analytics.captureAction("unsubscribe_sender_failed", {
+            reason: "automatic_unsubscribe_failed",
+          });
           toast.error(`Could not automatically unsubscribe from ${item.name}`);
+        } else {
+          analytics.captureAction("unsubscribe_sender_completed", {
+            outcome: "unsubscribed_and_archived",
+          });
         }
       }
     } catch (error) {
@@ -318,6 +342,7 @@ export function useUnsubscribe<T extends Row>({
     item.status,
     item.unsubscribeLink,
     automaticUnsubscribeLink,
+    analytics,
     mutate,
     refetchPremium,
     posthog,
@@ -353,12 +378,19 @@ export function useBulkUnsubscribe<T extends Row>({
   onDeselectItem?: (id: string) => void;
   filter: NewsletterFilterType;
 }) {
+  const analytics = useProductAnalytics("bulk_unsubscribe");
   const { queueArchiveSenders } = useArchiveSenderQueueActions(emailAccountId);
 
   const onBulkUnsubscribe = useCallback(
     async (items: T[]) => {
       if (!hasUnsubscribeAccess) return;
       posthog.capture("Clicked Bulk Unsubscribe");
+      analytics.captureAction("bulk_unsubscribe_started", {
+        item_count: items.length,
+        filter,
+      });
+
+      const messages = getBulkUnsubscribeMessages(items);
 
       await executeBulkOperation({
         items,
@@ -370,9 +402,7 @@ export function useBulkUnsubscribe<T extends Row>({
           getAutomaticUnsubscribeLink(item.unsubscribeLink)
             ? NewsletterStatus.UNSUBSCRIBED
             : NewsletterStatus.AUTO_ARCHIVED,
-        loadingMessage: "Unsubscribing from",
-        successMessage: "unsubscribed",
-        errorMessage: "Failed to unsubscribe from",
+        ...messages,
         processItem: async (item) => {
           if (!getAutomaticUnsubscribeLink(item.unsubscribeLink)) {
             await blockSender({
@@ -400,6 +430,10 @@ export function useBulkUnsubscribe<T extends Row>({
           await refetchPremium();
         },
       });
+      analytics.captureAction("bulk_unsubscribe_completed", {
+        item_count: items.length,
+        filter,
+      });
     },
     [
       hasUnsubscribeAccess,
@@ -409,6 +443,7 @@ export function useBulkUnsubscribe<T extends Row>({
       emailAccountId,
       onDeselectItem,
       filter,
+      analytics,
       queueArchiveSenders,
     ],
   );
@@ -433,13 +468,16 @@ async function autoArchive({
   emailAccountId: string;
   queueArchiveSenders: QueueArchiveSendersFn;
 }) {
-  await blockSender({
+  const ok = await blockSender({
     sender: name,
     emailAccountId,
     labelId,
     labelName,
     queueArchiveSenders,
   });
+  if (ok) {
+    toastSuccess({ description: "Auto archive enabled!" });
+  }
   await mutate();
   await refetchPremium();
 }
@@ -575,18 +613,11 @@ export function useBulkAutoArchive<T extends Row>({
         successMessage: "set to auto archive",
         errorMessage: "Failed to set auto archive for",
         processItem: async (item) => {
-          await onAutoArchive({
+          await blockSender({
+            sender: item.name,
             emailAccountId,
-            from: item.name,
-            gmailLabelId: undefined,
-            labelName: undefined,
+            queueArchiveSenders,
           });
-          await setNewsletterStatusAction(emailAccountId, {
-            newsletterEmail: item.name,
-            status: NewsletterStatus.AUTO_ARCHIVED,
-          });
-          await decrementUnsubscribeCreditAction();
-          await queueArchiveSenders({ senders: [item.name] });
         },
         onComplete: refetchPremium,
       });
@@ -614,11 +645,11 @@ export function useApproveButton<T extends Row>({
 }: {
   item: T;
   mutate: (
-    // biome-ignore lint/suspicious/noExplicitAny: SWR mutate signature
+    // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
     data?: any,
     opts?: {
       revalidate?: boolean;
-      // biome-ignore lint/suspicious/noExplicitAny: SWR optimisticData can be any shape
+      // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
       optimisticData?: any;
       rollbackOnError?: boolean;
     },
@@ -648,18 +679,17 @@ export function useApproveButton<T extends Row>({
     setOptimisticStatus(newStatus);
 
     // Optimistically update status and filter out items that no longer match the current view
-    // biome-ignore lint/suspicious/noExplicitAny: SWR data structure
+    // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
     const optimisticUpdate = (currentData: any) => {
       if (!currentData?.newsletters) return currentData;
       return {
         ...currentData,
         newsletters: currentData.newsletters
-          .map(
-            // biome-ignore lint/suspicious/noExplicitAny: newsletter type
-            (n: any) =>
-              n.name === item.name ? { ...n, status: newStatus } : n,
+          // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
+          .map((n: any) =>
+            n.name === item.name ? { ...n, status: newStatus } : n,
           )
-          // biome-ignore lint/suspicious/noExplicitAny: newsletter type
+          // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
           .filter((n: any) => itemMatchesFilter(n.status, filter)),
       };
     };
@@ -926,7 +956,7 @@ export function useBulkUnsubscribeShortcuts<T extends Row>({
   onOpenNewsletter: (row: T) => void;
   refetchPremium: () => Promise<UserResponse | null | undefined>;
   hasUnsubscribeAccess: boolean;
-  // biome-ignore lint/suspicious/noExplicitAny: simplest
+  // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
   mutate: () => Promise<any>;
   emailAccountId: string;
   userEmail: string;
@@ -969,6 +999,8 @@ export function useBulkUnsubscribeShortcuts<T extends Row>({
           onAutoArchive({
             emailAccountId,
             from: item.name,
+          }).then((ok) => {
+            if (ok) toastSuccess({ description: "Auto archive enabled!" });
           });
           await setNewsletterStatusAction(emailAccountId, {
             newsletterEmail: item.name,
@@ -990,11 +1022,16 @@ export function useBulkUnsubscribeShortcuts<T extends Row>({
           );
 
           if (!userFacingUnsubscribeLink) {
-            await blockSender({
+            const ok = await blockSender({
               sender: item.name,
               emailAccountId,
               queueArchiveSenders,
             });
+            if (ok) {
+              toastSuccess({
+                description: "Sender blocked. Future emails will be archived.",
+              });
+            }
             await mutate();
             await refetchPremium();
             return;
@@ -1107,4 +1144,33 @@ function getManualUnsubscribeLink(unsubscribeLink?: string | null) {
   return getUserFacingUnsubscribeLink({
     unsubscribeLink,
   });
+}
+
+function getBulkUnsubscribeMessages<T extends Row>(items: T[]) {
+  const hasAutomatic = items.some((item) =>
+    getAutomaticUnsubscribeLink(item.unsubscribeLink),
+  );
+  const hasBlock = items.some(
+    (item) => !getAutomaticUnsubscribeLink(item.unsubscribeLink),
+  );
+
+  if (hasAutomatic && hasBlock) {
+    return {
+      loadingMessage: "Processing",
+      successMessage: "processed",
+      errorMessage: "Failed to process",
+    };
+  }
+  if (hasBlock) {
+    return {
+      loadingMessage: "Blocking",
+      successMessage: "blocked",
+      errorMessage: "Failed to block",
+    };
+  }
+  return {
+    loadingMessage: "Unsubscribing from",
+    successMessage: "unsubscribed",
+    errorMessage: "Failed to unsubscribe from",
+  };
 }

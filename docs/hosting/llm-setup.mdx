@@ -31,6 +31,8 @@ Use one of these values for `*_LLM_PROVIDER`:
 | [AWS Bedrock](https://ai-sdk.dev/providers/ai-sdk-providers/amazon-bedrock) | `bedrock` |
 | [Ollama](https://ollama.com/) | `ollama` |
 | OpenAI-compatible (LM Studio, vLLM, LiteLLM, etc.) | `openai-compatible` |
+| Codex CLI (experimental, self-host only) | `codex-cli` |
+| Claude Code (experimental, self-host only) | `claude-code` |
 
 ## Tiers
 
@@ -38,15 +40,18 @@ For most self-hosted setups, configure these two tiers:
 
 - `DEFAULT_LLM_*` (required): primary model used for normal AI tasks.
 - `ECONOMY_LLM_*` (optional): lower-cost model for high-volume tasks. If unset, it falls back to `DEFAULT`.
+- `CHAT_LLM_*` (optional): model used for assistant chat. If unset, it falls back to `DEFAULT`.
+- `DRAFT_LLM_*` (optional): model used for drafting replies. If unset, it falls back to `DEFAULT`.
+- `NANO_LLM_*` (optional): very low-cost model for lightweight classification and extraction. If unset, it falls back to economy/default behavior.
 
 Minimal example:
 
 ```env
 DEFAULT_LLM_PROVIDER=openai
-DEFAULT_LLM_MODEL=gpt-4o
+DEFAULT_LLM_MODEL=gpt-5.4-mini
 
 ECONOMY_LLM_PROVIDER=openai
-ECONOMY_LLM_MODEL=gpt-4o-mini
+ECONOMY_LLM_MODEL=gpt-5.4-nano
 
 LLM_API_KEY=sk-...
 ```
@@ -57,6 +62,70 @@ Provider-specific keys (for example `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`) also 
 
 The app also has **Settings → AI** for per-user keys/models, but self-hosted deployments usually keep configuration at the environment-variable level.
 
+## Sensitive Data Protection
+
+Self-hosted deployments can choose how LLM requests handle sensitive data matches before they are sent to an AI provider. The current scanner targets likely credentials/tokens and payment-card-like numbers; it is not a full DLP or PHI classifier.
+
+```env
+SENSITIVE_DATA_POLICY_DEFAULT=ALLOW # ALLOW, REDACT, or BLOCK
+NEXT_PUBLIC_SENSITIVE_DATA_POLICY_LOCKED=false
+```
+
+`ALLOW` preserves the default behavior. `REDACT` replaces matched values before the LLM request. `BLOCK` stops the request when a match is found. Leave `NEXT_PUBLIC_SENSITIVE_DATA_POLICY_LOCKED=false` to let users choose per account in Settings, or set it to `true` to enforce the deployment default for all accounts and hide the setting from the UI.
+
 ## Provider-specific details
 
 - `openai-compatible` also requires `OPENAI_COMPATIBLE_BASE_URL`.
+- `ollama` can use `OLLAMA_BASE_URL` and `OLLAMA_MODEL`.
+
+## Fallbacks
+
+You can configure ordered provider fallbacks for default, economy, and chat tiers:
+
+```env
+DEFAULT_LLM_FALLBACKS=openrouter:anthropic/claude-sonnet-4.6,openai:gpt-5.4-mini
+ECONOMY_LLM_FALLBACKS=openrouter:google/gemini-2.5-flash
+CHAT_LLM_FALLBACKS=openrouter:anthropic/claude-haiku-4.5
+```
+
+Each fallback entry must include both provider and model as `provider:model`.
+
+### CLI LLM providers
+
+`codex-cli` and `claude-code` are experimental self-host options. They use
+third-party community AI SDK provider packages that spawn local CLI tools, so
+they are disabled unless `CLI_LLM_ENABLED=true`.
+
+Use them only on trusted self-hosted deployments. Review the provider package
+source, pin exact package versions, and make sure you comply with the relevant
+OpenAI or Anthropic terms for your authentication method.
+
+Codex example:
+
+```bash
+cd apps/web
+pnpm add ai-sdk-provider-codex-cli@1.1.0
+pnpm add -g @openai/codex
+codex login
+```
+
+```env
+CLI_LLM_ENABLED=true
+DEFAULT_LLM_PROVIDER=codex-cli
+DEFAULT_LLM_MODEL=gpt-5.3-codex
+CODEX_CLI_ALLOW_NPX=false
+```
+
+Claude Code example:
+
+```bash
+cd apps/web
+pnpm add ai-sdk-provider-claude-code@3.1.0
+claude auth login
+```
+
+```env
+CLI_LLM_ENABLED=true
+DEFAULT_LLM_PROVIDER=claude-code
+DEFAULT_LLM_MODEL=sonnet
+```

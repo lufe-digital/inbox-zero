@@ -12,10 +12,12 @@ import {
   SendIcon,
   SparklesIcon,
   UserIcon,
+  UsersIcon,
   WebhookIcon,
 } from "lucide-react";
 import { ApiKeysSection } from "@/app/(app)/[emailAccountId]/settings/ApiKeysSection";
 import { AppearanceSection } from "@/app/(app)/settings/AppearanceSection";
+import { TeamSection } from "@/app/(app)/settings/TeamSection";
 import { BillingSection } from "@/app/(app)/[emailAccountId]/settings/BillingSection";
 import { CleanupDraftsSection } from "@/app/(app)/[emailAccountId]/settings/CleanupDraftsSection";
 import { useSlackNotifications } from "@/app/(app)/[emailAccountId]/settings/ConnectedAppsSection";
@@ -126,14 +128,22 @@ export default function SettingsPage() {
           </SettingsGroup>
         )}
 
-        <SettingsGroup
-          icon={<SparklesIcon className="size-5" />}
-          title="AI Model"
-        >
-          <ItemCard className="p-4">
-            <ModelSection />
+        <SettingsGroup icon={<UsersIcon className="size-5" />} title="Team">
+          <ItemCard>
+            <TeamSection />
           </ItemCard>
         </SettingsGroup>
+
+        {!env.NEXT_PUBLIC_AI_MODEL_SETTINGS_DISABLED && (
+          <SettingsGroup
+            icon={<SparklesIcon className="size-5" />}
+            title="AI Model"
+          >
+            <ItemCard className="p-4">
+              <ModelSection />
+            </ItemCard>
+          </SettingsGroup>
+        )}
 
         {(env.NEXT_PUBLIC_WEBHOOK_ACTION_ENABLED !== false ||
           env.NEXT_PUBLIC_EXTERNAL_API_ENABLED) && (

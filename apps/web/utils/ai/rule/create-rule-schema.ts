@@ -2,7 +2,10 @@ import { z } from "zod";
 import { ActionType, LogicalOperator } from "@/generated/prisma/enums";
 import { isMicrosoftProvider } from "@/utils/email/provider-types";
 import { isDefined } from "@/utils/types";
-import { env } from "@/env";
+import {
+  getAvailableActionsForRuleEditor,
+  getExtraAvailableActionsForRuleEditor,
+} from "@/utils/ai/rule/action-availability";
 import { delayInMinutesLlmSchema } from "@/utils/actions/rule.validation";
 import {
   AI_INSTRUCTIONS_PROMPT_DESCRIPTION,
@@ -35,7 +38,12 @@ const conditionSchema = z
           })
           .describe(STATIC_FROM_CONDITION_DESCRIPTION),
         to: z.string().nullish().describe("The to email address to match"),
-        subject: z.string().nullish().describe("The subject to match"),
+        subject: z
+          .string()
+          .nullish()
+          .describe(
+            "Exact subject-line text to match. Use this when the user explicitly asks to match the email subject. If the user describes email content, topic, meaning, or general keyword matching without naming the subject line, use aiInstructions instead.",
+          ),
       })
       .nullish()
       .describe(
@@ -45,30 +53,39 @@ const conditionSchema = z
   .describe("The conditions to match");
 
 export function getAvailableActions(provider: string) {
-  const availableActions: ActionType[] = [
-    ActionType.LABEL,
-    ...(isMicrosoftProvider(provider) ? [ActionType.MOVE_FOLDER] : []),
-    ActionType.ARCHIVE,
-    ActionType.MARK_READ,
-    ...(env.NEXT_PUBLIC_AUTO_DRAFT_DISABLED ? [] : [ActionType.DRAFT_EMAIL]),
-    // Only include send-related actions when email sending is enabled
-    ...(env.NEXT_PUBLIC_EMAIL_SEND_ENABLED
-      ? [ActionType.REPLY, ActionType.FORWARD, ActionType.SEND_EMAIL]
-      : []),
-    ActionType.MARK_SPAM,
-  ].filter(isDefined);
+  const availableActions = getAvailableActionsForRuleEditor({
+    provider,
+  }).filter(isDefined);
   return availableActions as [ActionType, ...ActionType[]];
 }
 
-export const getExtraActions = () => [
-  ActionType.DIGEST,
-  ...(env.NEXT_PUBLIC_WEBHOOK_ACTION_ENABLED !== false
-    ? [ActionType.CALL_WEBHOOK]
-    : []),
-];
+export const getExtraActions = (existingActionTypes: ActionType[] = []) =>
+  getExtraAvailableActionsForRuleEditor(existingActionTypes);
 
-export const createRuleActionSchema = (provider: string) => {
-  const supportsMoveFolder = isMicrosoftProvider(provider);
+export type RuleActionFields = {
+  label?: string | null;
+  to?: string | null;
+  cc?: string | null;
+  bcc?: string | null;
+  subject?: string | null;
+  content?: string | null;
+  webhookUrl?: string | null;
+  folderName?: string | null;
+};
+
+export type RuleAction = {
+  type: ActionType;
+  fields?: RuleActionFields | null;
+  delayInMinutes?: number | null;
+};
+
+export const createRuleActionSchema = (
+  provider: string,
+): z.ZodType<RuleAction> => {
+  const allowedActionTypes = new Set([
+    ...getAvailableActionsForRuleEditor({ provider }),
+    ...getExtraAvailableActionsForRuleEditor(),
+  ]);
   const optionalFieldsSchema = createOptionalActionFieldsSchema(provider);
 
   const actionSchemas: [z.ZodTypeAny, z.ZodTypeAny, ...z.ZodTypeAny[]] = [
@@ -78,30 +95,32 @@ export const createRuleActionSchema = (provider: string) => {
       createRequiredLabelFieldsSchema(provider),
     ),
     createActionObjectSchema(ActionType.MARK_READ, optionalFieldsSchema),
+    createActionObjectSchema(ActionType.STAR, optionalFieldsSchema),
     createActionObjectSchema(ActionType.MARK_SPAM, optionalFieldsSchema),
     createActionObjectSchema(ActionType.DIGEST, optionalFieldsSchema),
-    ...(env.NEXT_PUBLIC_AUTO_DRAFT_DISABLED
-      ? []
-      : [
-          createActionObjectSchema(
-            ActionType.DRAFT_EMAIL,
-            optionalFieldsSchema,
-          ),
-        ]),
-    ...(env.NEXT_PUBLIC_EMAIL_SEND_ENABLED
+    ...(allowedActionTypes.has(ActionType.DRAFT_EMAIL)
+      ? [createActionObjectSchema(ActionType.DRAFT_EMAIL, optionalFieldsSchema)]
+      : []),
+    ...(allowedActionTypes.has(ActionType.REPLY)
+      ? [createActionObjectSchema(ActionType.REPLY, optionalFieldsSchema)]
+      : []),
+    ...(allowedActionTypes.has(ActionType.FORWARD)
       ? [
-          createActionObjectSchema(ActionType.REPLY, optionalFieldsSchema),
           createActionObjectSchema(
             ActionType.FORWARD,
             createRequiredRecipientFieldsSchema(provider),
           ),
+        ]
+      : []),
+    ...(allowedActionTypes.has(ActionType.SEND_EMAIL)
+      ? [
           createActionObjectSchema(
             ActionType.SEND_EMAIL,
             createRequiredRecipientFieldsSchema(provider),
           ),
         ]
       : []),
-    ...(env.NEXT_PUBLIC_WEBHOOK_ACTION_ENABLED !== false
+    ...(allowedActionTypes.has(ActionType.CALL_WEBHOOK)
       ? [
           createActionObjectSchema(
             ActionType.CALL_WEBHOOK,
@@ -109,7 +128,7 @@ export const createRuleActionSchema = (provider: string) => {
           ),
         ]
       : []),
-    ...(supportsMoveFolder
+    ...(allowedActionTypes.has(ActionType.MOVE_FOLDER)
       ? [
           createActionObjectSchema(
             ActionType.MOVE_FOLDER,
@@ -119,7 +138,7 @@ export const createRuleActionSchema = (provider: string) => {
       : []),
   ];
 
-  return z.union(actionSchemas);
+  return z.union(actionSchemas) as z.ZodType<RuleAction>;
 };
 
 export const createRuleSchema = (provider: string) =>
@@ -142,10 +161,41 @@ export type CreateOrUpdateRuleSchema = CreateRuleSchema & {
 
 function createActionObjectSchema(type: ActionType, fields: z.ZodTypeAny) {
   return z.object({
-    type: z.literal(type),
+    type: z.literal(type).describe(getActionTypeDescription(type)),
     fields,
     delayInMinutes: delayInMinutesLlmSchema,
   });
+}
+
+function getActionTypeDescription(type: ActionType) {
+  switch (type) {
+    case ActionType.DRAFT_EMAIL:
+      return "Draft a reply to the matching inbound email without sending it. Use this for draft reply requests.";
+    case ActionType.REPLY:
+      return "Send a reply to the matching inbound email. Do not use this for draft reply requests.";
+    case ActionType.SEND_EMAIL:
+      return "Send a new outbound email. Do not use this for draft reply requests.";
+    case ActionType.FORWARD:
+      return "Forward the matching email.";
+    case ActionType.LABEL:
+      return "Apply a label to the matching email.";
+    case ActionType.ARCHIVE:
+      return "Archive the matching email.";
+    case ActionType.MARK_READ:
+      return "Mark the matching email as read.";
+    case ActionType.STAR:
+      return "Star the matching email.";
+    case ActionType.MARK_SPAM:
+      return "Mark the matching email as spam.";
+    case ActionType.DIGEST:
+      return "Include the matching email in a digest.";
+    case ActionType.CALL_WEBHOOK:
+      return "Call a webhook for the matching email.";
+    case ActionType.MOVE_FOLDER:
+      return "Move the matching email to a folder.";
+    default:
+      return "Action type to apply to the matching email.";
+  }
 }
 
 function createOptionalActionFieldsSchema(provider: string) {

@@ -7,7 +7,11 @@ import prisma from "@/utils/prisma";
 import type { Logger } from "@/utils/logger";
 import { getEmailAccountWithAiAndTokens } from "@/utils/user/get";
 import { runActionFunction } from "@/utils/ai/actions";
-import type { ActionItem, EmailForAction } from "@/utils/ai/types";
+import type {
+  ActionExecutionEmailAccount,
+  ActionItem,
+  EmailForAction,
+} from "@/utils/ai/types";
 import type { EmailProvider } from "@/utils/email/types";
 
 const MODULE = "scheduled-actions-executor";
@@ -59,6 +63,7 @@ export async function executeScheduledAction(
       bcc: scheduledAction.bcc,
       url: scheduledAction.url,
       staticAttachments: scheduledAction.staticAttachments,
+      selectedAttachments: scheduledAction.selectedAttachments,
     };
 
     const executedAction = await executeDelayedAction({
@@ -155,7 +160,7 @@ async function executeDelayedAction({
   client: EmailProvider;
   actionItem: ActionItem;
   emailMessage: EmailForAction;
-  emailAccount: { email: string; userId: string; id: string };
+  emailAccount: ActionExecutionEmailAccount;
   scheduledAction: ScheduledAction;
   log: Logger;
 }) {
@@ -170,13 +175,16 @@ async function executeDelayedAction({
       bcc: actionItem.bcc,
       url: actionItem.url,
       staticAttachments: actionItem.staticAttachments ?? undefined,
+      selectedAttachments: actionItem.selectedAttachments ?? undefined,
       executedRuleId: scheduledAction.executedRuleId,
     },
   });
 
   const executedRule = await prisma.executedRule.findUnique({
     where: { id: scheduledAction.executedRuleId },
-    include: { actionItems: true },
+    include: {
+      actionItems: true,
+    },
   });
 
   if (!executedRule) {
@@ -204,9 +212,7 @@ async function executeDelayedAction({
     client,
     email,
     action: executedAction,
-    userEmail: emailAccount.email,
-    userId: emailAccount.userId,
-    emailAccountId: emailAccount.id,
+    emailAccount,
     executedRule,
     logger: log,
   });

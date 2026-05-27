@@ -33,6 +33,14 @@ import { useSession } from "@/utils/auth-client";
 import type { UseChatHelpers } from "@ai-sdk/react";
 import type { ChatMessage } from "@/components/assistant-chat/types";
 import type { MessageContext } from "@/app/api/chat/validation";
+import { useProductAnalytics } from "@/hooks/useProductAnalytics";
+import { ChatHistoryItem } from "@/components/assistant-chat/ChatHistoryItem";
+import {
+  type ChatHistoryEntry,
+  getChatHistoryLabel,
+} from "@/components/assistant-chat/chat-history-types";
+import { RenameChatDialog } from "@/components/assistant-chat/RenameChatDialog";
+import { DeleteChatDialog } from "@/components/assistant-chat/DeleteChatDialog";
 
 const MAX_FILE_SIZE = 4 * 1024 * 1024; // 4MB
 const MAX_FILES = 5;
@@ -44,10 +52,12 @@ const ACCEPTED_IMAGE_TYPES = [
 ];
 
 export function Chat({ open }: { open: boolean }) {
+  const analytics = useProductAnalytics("assistant_chat");
   const {
     chat,
     chatId,
     input,
+    persistedMessageIds,
     setInput,
     handleSubmit,
     setNewChat,
@@ -65,10 +75,10 @@ export function Chat({ open }: { open: boolean }) {
   const [uploadQueue, setUploadQueue] = useState<string[]>([]);
 
   useEffect(() => {
-    if (open && !chatId) {
+    if (open && !chatId && status === "ready" && messages.length === 0) {
       setNewChat();
     }
-  }, [open, chatId, setNewChat]);
+  }, [open, chatId, messages.length, setNewChat, status]);
 
   // Sync input with localStorage
   useEffect(() => {
@@ -84,8 +94,8 @@ export function Chat({ open }: { open: boolean }) {
   }, []);
 
   const readFileAsDataUrl = useCallback(
-    (file: File): Promise<Attachment | undefined> => {
-      return new Promise((resolve) => {
+    (file: File): Promise<Attachment | undefined> =>
+      new Promise((resolve) => {
         if (!ACCEPTED_IMAGE_TYPES.includes(file.type)) {
           resolve(undefined);
           return;
@@ -106,8 +116,7 @@ export function Chat({ open }: { open: boolean }) {
         };
         reader.onerror = () => resolve(undefined);
         reader.readAsDataURL(file);
-      });
-    },
+      }),
     [],
   );
 
@@ -121,10 +130,15 @@ export function Chat({ open }: { open: boolean }) {
       const results = await Promise.all(filesToProcess.map(readFileAsDataUrl));
       const valid = results.filter((a): a is Attachment => a !== undefined);
 
+      analytics.captureAction("chat_attachments_added", {
+        requested_file_count: files.length,
+        accepted_file_count: valid.length,
+        existing_attachment_count: attachments.length,
+      });
       setAttachments((prev) => [...prev, ...valid]);
       setUploadQueue([]);
     },
-    [attachments.length, readFileAsDataUrl, setAttachments],
+    [analytics, attachments.length, readFileAsDataUrl, setAttachments],
   );
 
   const handleFileChange = useCallback(
@@ -170,6 +184,12 @@ export function Chat({ open }: { open: boolean }) {
       onSubmit={(e) => {
         e.preventDefault();
         if (hasContent && status === "ready") {
+          analytics.captureAction("chat_message_submitted", {
+            has_text: input.trim().length > 0,
+            attachment_count: attachments.length,
+            has_context: Boolean(context),
+            message_count: messages.length,
+          });
           handleSubmit();
           setLocalStorageInput("");
         }
@@ -223,7 +243,12 @@ export function Chat({ open }: { open: boolean }) {
             variant="ghost"
             size="icon"
             className="size-9 rounded-full text-muted-foreground hover:text-foreground"
-            onClick={() => fileInputRef.current?.click()}
+            onClick={() => {
+              analytics.captureAction("chat_attach_button_clicked", {
+                attachment_count: attachments.length,
+              });
+              fileInputRef.current?.click();
+            }}
             disabled={attachments.length >= MAX_FILES}
           >
             <PaperclipIcon className="size-4" />
@@ -242,6 +267,9 @@ export function Chat({ open }: { open: boolean }) {
           className="h-9 w-9 rounded-full bg-blue-500 text-white hover:bg-blue-600"
           onClick={(e) => {
             if (status === "streaming" || status === "submitted") {
+              analytics.captureAction("chat_generation_stopped", {
+                status,
+              });
               e.preventDefault();
               stop();
               setMessages((messages) => messages);
@@ -275,6 +303,7 @@ export function Chat({ open }: { open: boolean }) {
         <ChatMessagesView
           status={status}
           messages={messages}
+          persistedMessageIds={persistedMessageIds}
           setMessages={setMessages}
           setInput={setInput}
           regenerate={regenerate}
@@ -287,6 +316,9 @@ export function Chat({ open }: { open: boolean }) {
           firstName={firstName}
           inputArea={inputArea}
           onSuggestionClick={(text) => {
+            analytics.captureAction("chat_suggestion_clicked", {
+              suggestion_index: CHAT_EXAMPLES.indexOf(text),
+            });
             chat.sendMessage({
               role: "user",
               parts: [{ type: "text", text }],
@@ -302,6 +334,7 @@ export function Chat({ open }: { open: boolean }) {
 function ChatMessagesView({
   status,
   messages,
+  persistedMessageIds,
   setMessages,
   setInput,
   regenerate,
@@ -311,6 +344,7 @@ function ChatMessagesView({
 }: {
   status: UseChatHelpers<ChatMessage>["status"];
   messages: ChatMessage[];
+  persistedMessageIds: Set<string>;
   setMessages: UseChatHelpers<ChatMessage>["setMessages"];
   setInput: (input: string) => void;
   regenerate: UseChatHelpers<ChatMessage>["regenerate"];
@@ -324,6 +358,7 @@ function ChatMessagesView({
       <Messages
         status={status}
         messages={messages}
+        persistedMessageIds={persistedMessageIds}
         setMessages={setMessages}
         setInput={setInput}
         regenerate={regenerate}
@@ -358,7 +393,7 @@ function ChatMessagesView({
 const CHAT_EXAMPLES = [
   "Help me handle my inbox today",
   "Clean up my inbox",
-  "Auto-archive newsletters for me",
+  "Suggest rules I should add",
 ];
 
 function NewChatView({
@@ -426,61 +461,101 @@ function NewChatButton() {
 }
 
 function ChatHistoryDropdown() {
-  const { setChatId } = useChat();
   const [shouldLoadChats, setShouldLoadChats] = useState(false);
+  const [open, setOpen] = useState(false);
+  const [renameTarget, setRenameTarget] = useState<ChatHistoryEntry | null>(
+    null,
+  );
+  const [deleteTarget, setDeleteTarget] = useState<ChatHistoryEntry | null>(
+    null,
+  );
+  const { chatId, setChatId } = useChat();
   const { data, error, isLoading, mutate } = useChats(shouldLoadChats);
 
   return (
-    <DropdownMenu>
-      <Tooltip content="View previous conversations">
-        <DropdownMenuTrigger asChild>
-          <Button
-            variant="ghost"
-            size="icon"
-            onMouseEnter={() => setShouldLoadChats(true)}
-            onClick={() => mutate()}
-          >
-            <HistoryIcon className="size-5" />
-            <span className="sr-only">Chat History</span>
-          </Button>
-        </DropdownMenuTrigger>
-      </Tooltip>
-      <DropdownMenuContent align="end">
-        <LoadingContent
-          loading={isLoading}
-          error={error}
-          loadingComponent={
-            <DropdownMenuItem
-              disabled
-              className="flex items-center justify-center"
+    <>
+      <DropdownMenu open={open} onOpenChange={setOpen}>
+        <Tooltip content="View previous conversations">
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              onMouseEnter={() => setShouldLoadChats(true)}
+              onClick={() => mutate()}
             >
-              <Loader2 className="mr-2 size-4 animate-spin" />
-              Loading chats...
-            </DropdownMenuItem>
-          }
-          errorComponent={
-            <DropdownMenuItem disabled>Error loading chats</DropdownMenuItem>
-          }
-        >
-          {data && data.chats.length > 0 ? (
-            data.chats.map((chatItem) => (
+              <HistoryIcon className="size-5" />
+              <span className="sr-only">Chat History</span>
+            </Button>
+          </DropdownMenuTrigger>
+        </Tooltip>
+        <DropdownMenuContent align="end" className="w-72">
+          <LoadingContent
+            loading={isLoading}
+            error={error}
+            loadingComponent={
               <DropdownMenuItem
-                key={chatItem.id}
-                onSelect={() => {
-                  setChatId(chatItem.id);
-                }}
+                disabled
+                className="flex items-center justify-center"
               >
-                {`Chat from ${new Date(chatItem.createdAt).toLocaleString()}`}
+                <Loader2 className="mr-2 size-4 animate-spin" />
+                Loading chats...
               </DropdownMenuItem>
-            ))
-          ) : (
-            <DropdownMenuItem disabled>
-              No previous chats found
-            </DropdownMenuItem>
-          )}
-        </LoadingContent>
-      </DropdownMenuContent>
-    </DropdownMenu>
+            }
+            errorComponent={
+              <DropdownMenuItem disabled>Error loading chats</DropdownMenuItem>
+            }
+          >
+            {data && data.chats.length > 0 ? (
+              data.chats.map((chatItem) => (
+                <ChatHistoryItem
+                  key={chatItem.id}
+                  chat={chatItem}
+                  onSelect={() => {
+                    setOpen(false);
+                    setChatId(chatItem.id);
+                  }}
+                  onRename={() => {
+                    setOpen(false);
+                    setRenameTarget(chatItem);
+                  }}
+                  onDelete={() => {
+                    setOpen(false);
+                    setDeleteTarget(chatItem);
+                  }}
+                />
+              ))
+            ) : (
+              <DropdownMenuItem disabled>
+                No previous chats found
+              </DropdownMenuItem>
+            )}
+          </LoadingContent>
+        </DropdownMenuContent>
+      </DropdownMenu>
+
+      <RenameChatDialog
+        open={renameTarget !== null}
+        onOpenChange={(value) => {
+          if (!value) setRenameTarget(null);
+        }}
+        chatId={renameTarget?.id ?? ""}
+        currentName={renameTarget?.name ?? ""}
+        defaultLabel={renameTarget ? getChatHistoryLabel(renameTarget) : ""}
+        onRenamed={mutate}
+      />
+      <DeleteChatDialog
+        open={deleteTarget !== null}
+        onOpenChange={(value) => {
+          if (!value) setDeleteTarget(null);
+        }}
+        chatId={deleteTarget?.id ?? ""}
+        label={deleteTarget ? getChatHistoryLabel(deleteTarget) : ""}
+        onDeleted={() => {
+          if (deleteTarget && chatId === deleteTarget.id) setChatId(null);
+          mutate();
+        }}
+      />
+    </>
   );
 }
 

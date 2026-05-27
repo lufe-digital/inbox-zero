@@ -1,10 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { filterMultipleSystemRules } from "./match-rules";
 import {
+  evaluateRuleConditions,
+  filterConversationStatusRules,
+  filterMultipleSystemRules,
   findMatchingRules,
   matchesStaticRule,
-  filterConversationStatusRules,
-  evaluateRuleConditions,
 } from "./match-rules";
 import {
   GroupItemType,
@@ -27,17 +27,12 @@ import {
   isColdEmailRuleEnabled,
 } from "@/utils/cold-email/cold-email-rule";
 import { isColdEmail } from "@/utils/cold-email/is-cold-email";
-
-// Run with:
-// pnpm test match-rules.test.ts
+import { checkSenderReplyHistory } from "@/utils/reply-tracker/check-sender-reply-history";
 
 const logger = createTestLogger();
 
-const provider = {
-  isReplyInThread: vi.fn().mockReturnValue(false),
-} as unknown as EmailProvider;
+const provider = getProvider();
 
-vi.mock("server-only", () => ({}));
 vi.mock("@/utils/prisma");
 vi.mock("@/utils/ai/choose-rule/ai-choose-rule", () => ({
   aiChooseRule: vi.fn(),
@@ -1478,7 +1473,7 @@ describe("findMatchingRule", () => {
   });
 });
 
-describe("filterToReplyPreset", () => {
+describe("filterConversationStatusRules", () => {
   it("should filter out no-reply emails from TO_REPLY rules", async () => {
     const toReplyRule = {
       ...getRule({
@@ -1544,16 +1539,10 @@ describe("filterToReplyPreset", () => {
   });
 
   it("should filter out TO_REPLY rule when sender has high received count and no replies", async () => {
-    const { checkSenderReplyHistory } = await import(
-      "@/utils/reply-tracker/check-sender-reply-history"
-    );
-
-    (checkSenderReplyHistory as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
-      {
-        hasReplied: false,
-        receivedCount: 15, // Above threshold of 10
-      },
-    );
+    vi.mocked(checkSenderReplyHistory).mockResolvedValueOnce({
+      hasReplied: false,
+      receivedCount: 15,
+    });
 
     const toReplyRule = {
       ...getRule({
@@ -1594,16 +1583,10 @@ describe("filterToReplyPreset", () => {
   });
 
   it("should keep TO_REPLY rule when sender has prior replies", async () => {
-    const { checkSenderReplyHistory } = await import(
-      "@/utils/reply-tracker/check-sender-reply-history"
-    );
-
-    (checkSenderReplyHistory as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
-      {
-        hasReplied: true,
-        receivedCount: 20, // High count but has replies
-      },
-    );
+    vi.mocked(checkSenderReplyHistory).mockResolvedValueOnce({
+      hasReplied: true,
+      receivedCount: 20,
+    });
 
     const toReplyRule = {
       ...getRule({
@@ -1638,16 +1621,10 @@ describe("filterToReplyPreset", () => {
   });
 
   it("should keep TO_REPLY rule when received count is below threshold", async () => {
-    const { checkSenderReplyHistory } = await import(
-      "@/utils/reply-tracker/check-sender-reply-history"
-    );
-
-    (checkSenderReplyHistory as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
-      {
-        hasReplied: false,
-        receivedCount: 5, // Below threshold of 10
-      },
-    );
+    vi.mocked(checkSenderReplyHistory).mockResolvedValueOnce({
+      hasReplied: false,
+      receivedCount: 5,
+    });
 
     const toReplyRule = {
       ...getRule({
@@ -1709,11 +1686,7 @@ describe("filterToReplyPreset", () => {
   });
 
   it("should handle errors from checkSenderReplyHistory gracefully", async () => {
-    const { checkSenderReplyHistory } = await import(
-      "@/utils/reply-tracker/check-sender-reply-history"
-    );
-
-    (checkSenderReplyHistory as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+    vi.mocked(checkSenderReplyHistory).mockRejectedValueOnce(
       new Error("API error"),
     );
 
@@ -1768,6 +1741,20 @@ describe("filterToReplyPreset", () => {
     expect(result).toContain(toReplyRule);
   });
 });
+
+function getProvider({ isThread = false }: { isThread?: boolean } = {}) {
+  return {
+    isReplyInThread: vi.fn().mockReturnValue(isThread),
+  } as unknown as EmailProvider;
+}
+
+function getRuleSelectionCandidate(name: string, systemType: string | null) {
+  return {
+    name,
+    instructions: "",
+    systemType,
+  };
+}
 
 function getRule(overrides: Partial<RuleWithActions> = {}): RuleWithActions {
   const {
@@ -1990,7 +1977,61 @@ describe("findMatchingRules - Integration Tests", () => {
     });
 
     expect(result.matches[0]?.rule.id).toBe("cold-email-rule");
+    expect(result.matches[0]?.matchReasons).toEqual([
+      { type: ConditionType.AI },
+    ]);
     expect(result.reasoning).toBe("ai");
+  });
+
+  it("returns learned pattern match reasons for cold email pattern hits", async () => {
+    const coldEmailRule = getRule({
+      id: "cold-email-rule",
+      systemType: SystemType.COLD_EMAIL,
+    });
+    const group = { id: "cold-email-group", name: "Cold Email" };
+    const groupItem = {
+      id: "cold-email-sender",
+      type: GroupItemType.FROM,
+      value: "coldemailer@example.com",
+      exclude: false,
+    };
+
+    vi.mocked(getColdEmailRule).mockResolvedValue(coldEmailRule);
+    vi.mocked(isColdEmailRuleEnabled).mockReturnValue(true);
+    vi.mocked(isColdEmail).mockResolvedValue({
+      isColdEmail: true,
+      reason: "ai-already-labeled",
+      patternMatch: {
+        group,
+        groupItem,
+      },
+    });
+    vi.mocked(prisma.rule.findUniqueOrThrow).mockResolvedValue(coldEmailRule);
+
+    const result = await findMatchingRules({
+      rules: [coldEmailRule],
+      message: getMessage({
+        headers: getHeaders({ from: "coldemailer@example.com" }),
+      }),
+      emailAccount: getEmailAccount(),
+      provider,
+      modelType: "default",
+      logger,
+    });
+
+    expect(result.matches).toEqual([
+      {
+        rule: coldEmailRule,
+        matchReasons: [
+          {
+            type: ConditionType.LEARNED_PATTERN,
+            group,
+            groupItem,
+          },
+        ],
+      },
+    ]);
+    expect(result.reasoning).toBe("ai-already-labeled");
   });
 
   it("should skip cold email detection when rule is not enabled", async () => {
@@ -2212,10 +2253,7 @@ describe("findMatchingRules - Integration Tests", () => {
       runOnThreads: false,
     });
 
-    // Mock provider to return true for isReplyInThread
-    const threadProvider = {
-      isReplyInThread: vi.fn().mockReturnValue(true),
-    } as unknown as EmailProvider;
+    const threadProvider = getProvider({ isThread: true });
 
     // Mock no previously executed rules in thread
     prisma.executedRule.findMany.mockResolvedValue([]);
@@ -2245,33 +2283,9 @@ describe("findMatchingRules - Integration Tests", () => {
 
   describe("filterMultipleSystemRules branches", () => {
     it("returns all system rules when none marked primary (plus conversation rules)", () => {
-      const sysA: {
-        name: string;
-        instructions: string;
-        systemType: string | null;
-      } = {
-        name: "Sys A",
-        instructions: "",
-        systemType: "TO_REPLY",
-      };
-      const sysB: {
-        name: string;
-        instructions: string;
-        systemType: string | null;
-      } = {
-        name: "Sys B",
-        instructions: "",
-        systemType: "AWAITING_REPLY",
-      };
-      const conv: {
-        name: string;
-        instructions: string;
-        systemType: string | null;
-      } = {
-        name: "Conv",
-        instructions: "",
-        systemType: null,
-      };
+      const sysA = getRuleSelectionCandidate("Sys A", "TO_REPLY");
+      const sysB = getRuleSelectionCandidate("Sys B", "AWAITING_REPLY");
+      const conv = getRuleSelectionCandidate("Conv", null);
 
       const result = filterMultipleSystemRules([
         { rule: sysA, isPrimary: false },
@@ -2283,33 +2297,9 @@ describe("findMatchingRules - Integration Tests", () => {
     });
 
     it("keeps only the primary system rule when multiple system rules present", () => {
-      const sysA: {
-        name: string;
-        instructions: string;
-        systemType: string | null;
-      } = {
-        name: "Sys A",
-        instructions: "",
-        systemType: "TO_REPLY",
-      };
-      const sysB: {
-        name: string;
-        instructions: string;
-        systemType: string | null;
-      } = {
-        name: "Sys B",
-        instructions: "",
-        systemType: "AWAITING_REPLY",
-      };
-      const conv: {
-        name: string;
-        instructions: string;
-        systemType: string | null;
-      } = {
-        name: "Conv",
-        instructions: "",
-        systemType: null,
-      };
+      const sysA = getRuleSelectionCandidate("Sys A", "TO_REPLY");
+      const sysB = getRuleSelectionCandidate("Sys B", "AWAITING_REPLY");
+      const conv = getRuleSelectionCandidate("Conv", null);
 
       const result = filterMultipleSystemRules([
         { rule: sysA, isPrimary: false },
@@ -2346,9 +2336,7 @@ describe("findMatchingRules - Integration Tests", () => {
       // No previously executed rules in this thread
       prisma.executedRule.findMany.mockResolvedValue([]);
 
-      const threadProvider = {
-        isReplyInThread: vi.fn().mockReturnValue(true),
-      } as unknown as EmailProvider;
+      const threadProvider = getProvider({ isThread: true });
 
       const rules = [marketingRule];
       const message = getMessage({
@@ -2394,9 +2382,7 @@ describe("findMatchingRules - Integration Tests", () => {
         { ruleId: "notif-rule" },
       ] as any);
 
-      const threadProvider = {
-        isReplyInThread: vi.fn().mockReturnValue(true),
-      } as unknown as EmailProvider;
+      const threadProvider = getProvider({ isThread: true });
 
       const rules = [notifRule];
       const message = getMessage({
@@ -2441,10 +2427,7 @@ describe("findMatchingRules - Integration Tests", () => {
         }),
       ]);
 
-      // First message: isReplyInThread=false, so runOnThreads check doesn't apply
-      const nonThreadProvider = {
-        isReplyInThread: vi.fn().mockReturnValue(false),
-      } as unknown as EmailProvider;
+      const nonThreadProvider = getProvider();
 
       const rules = [marketingRule];
       const message = getMessage({
@@ -2493,9 +2476,7 @@ describe("findMatchingRules - Integration Tests", () => {
         }),
       ]);
 
-      const providerNoThread = {
-        isReplyInThread: vi.fn().mockReturnValue(false),
-      } as unknown as EmailProvider;
+      const providerNoThread = getProvider();
 
       const result = await findMatchingRules({
         rules: [notificationRule],
@@ -2542,9 +2523,7 @@ describe("findMatchingRules - Integration Tests", () => {
         }),
       ]);
 
-      const threadProvider = {
-        isReplyInThread: vi.fn().mockReturnValue(true),
-      } as unknown as EmailProvider;
+      const threadProvider = getProvider({ isThread: true });
 
       const rules = [rule];
       const message = getMessage({
@@ -2576,9 +2555,7 @@ describe("findMatchingRules - Integration Tests", () => {
 
       prisma.executedRule.findMany.mockResolvedValue([]);
 
-      const threadProvider = {
-        isReplyInThread: vi.fn().mockReturnValue(true),
-      } as unknown as EmailProvider;
+      const threadProvider = getProvider({ isThread: true });
 
       const rules = [marketingRule];
       const message = getMessage({
@@ -2613,10 +2590,7 @@ describe("findMatchingRules - Integration Tests", () => {
         groupId: "g1",
       });
 
-      // Ensure provider treats this as non-thread
-      const providerNoThread = {
-        isReplyInThread: vi.fn().mockReturnValue(false),
-      } as unknown as EmailProvider;
+      const providerNoThread = getProvider();
 
       // Mock groups to be empty so the code path skips learned pattern branch
       const groupModule = await import("@/utils/group/find-matching-group");
@@ -2650,10 +2624,7 @@ describe("findMatchingRules - Integration Tests", () => {
         runOnThreads: false,
       });
 
-      // Mock provider to indicate this is a thread
-      const threadProvider = {
-        isReplyInThread: vi.fn().mockReturnValue(true),
-      } as unknown as EmailProvider;
+      const threadProvider = getProvider({ isThread: true });
 
       // Mock DB to return previously executed rule id
       prisma.executedRule.findMany.mockResolvedValue([
@@ -2692,9 +2663,7 @@ describe("findMatchingRules - Integration Tests", () => {
         runOnThreads: false,
       });
 
-      const threadProvider = {
-        isReplyInThread: vi.fn().mockReturnValue(true),
-      } as unknown as EmailProvider;
+      const threadProvider = getProvider({ isThread: true });
 
       prisma.executedRule.findMany.mockResolvedValue([
         { ruleId: "rule-a" },
@@ -2730,9 +2699,7 @@ describe("findMatchingRules - Integration Tests", () => {
         runOnThreads: false,
       });
 
-      const providerNotThread = {
-        isReplyInThread: vi.fn().mockReturnValue(false),
-      } as unknown as EmailProvider;
+      const providerNotThread = getProvider();
 
       const rules = [notifRule];
       const message = getMessage({
@@ -2762,9 +2729,7 @@ describe("findMatchingRules - Integration Tests", () => {
         runOnThreads: true,
       });
 
-      const threadProvider = {
-        isReplyInThread: vi.fn().mockReturnValue(true),
-      } as unknown as EmailProvider;
+      const threadProvider = getProvider({ isThread: true });
 
       const rules = [threadRule];
       const message = getMessage({
@@ -2844,7 +2809,7 @@ describe("findMatchingRules - Integration Tests", () => {
 
     // Ensure potentialAiMatches includes aiOnlyRule
     vi.mocked(aiChooseRule).mockResolvedValue({
-      rules: [aiOnlyRule as any],
+      rules: [{ rule: aiOnlyRule as any, isPrimary: true }],
       reason: "AI reasoning here",
     });
 

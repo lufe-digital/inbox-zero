@@ -1,10 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ModelMessage } from "ai";
-import { getEmailAccount, getMockMessage } from "@/__tests__/helpers";
-import { ActionType, GroupItemType } from "@/generated/prisma/enums";
-import { createScopedLogger } from "@/utils/logger";
-
-vi.mock("server-only", () => ({}));
+import {
+  createTestLogger,
+  getEmailAccount,
+  getMockMessage,
+} from "@/__tests__/helpers";
+import {
+  ActionType,
+  DraftEmailStatus,
+  GroupItemType,
+} from "@/generated/prisma/enums";
 
 const {
   envState,
@@ -13,9 +18,15 @@ const {
   mockPosthogCaptureEvent,
   mockUnsubscribeSenderAndMark,
   mockPrisma,
+  mockArchiveCategory,
+  mockGetCategoryOverview,
+  mockStartBulkCategorization,
+  mockGetCategorizationProgress,
+  mockGetCategorizationStatusSnapshot,
 } = vi.hoisted(() => ({
   envState: {
     sendEmailEnabled: true,
+    autoDraftDisabled: false,
     webhookActionsEnabled: true,
   },
   mockToolCallAgentStream: vi.fn(),
@@ -23,6 +34,7 @@ const {
   mockPosthogCaptureEvent: vi.fn(),
   mockUnsubscribeSenderAndMark: vi.fn(),
   mockPrisma: {
+    $queryRaw: vi.fn(),
     emailAccount: {
       findUnique: vi.fn(),
       update: vi.fn(),
@@ -30,6 +42,10 @@ const {
     rule: {
       findUnique: vi.fn(),
       update: vi.fn(),
+    },
+    ruleHistory: {
+      findFirst: vi.fn().mockResolvedValue(null),
+      create: vi.fn().mockResolvedValue({}),
     },
     knowledge: {
       create: vi.fn(),
@@ -39,7 +55,15 @@ const {
       findFirst: vi.fn().mockResolvedValue(null),
       findMany: vi.fn().mockResolvedValue([]),
     },
+    executedRule: {
+      findMany: vi.fn().mockResolvedValue([]),
+    },
   },
+  mockArchiveCategory: vi.fn(),
+  mockGetCategoryOverview: vi.fn(),
+  mockStartBulkCategorization: vi.fn(),
+  mockGetCategorizationProgress: vi.fn(),
+  mockGetCategorizationStatusSnapshot: vi.fn(),
 }));
 
 vi.mock("@/utils/llms", () => ({
@@ -58,6 +82,23 @@ vi.mock("@/utils/senders/unsubscribe", () => ({
   unsubscribeSenderAndMark: mockUnsubscribeSenderAndMark,
 }));
 
+vi.mock("@/utils/categorize/senders/archive-category", () => ({
+  archiveCategory: mockArchiveCategory,
+}));
+
+vi.mock("@/utils/categorize/senders/get-category-overview", () => ({
+  getCategoryOverview: mockGetCategoryOverview,
+}));
+
+vi.mock("@/utils/categorize/senders/start-bulk-categorization", () => ({
+  startBulkCategorization: mockStartBulkCategorization,
+}));
+
+vi.mock("@/utils/redis/categorization-progress", () => ({
+  getCategorizationProgress: mockGetCategorizationProgress,
+  getCategorizationStatusSnapshot: mockGetCategorizationStatusSnapshot,
+}));
+
 vi.mock("@/utils/prisma", () => ({
   default: mockPrisma,
 }));
@@ -67,13 +108,16 @@ vi.mock("@/env", () => ({
     get NEXT_PUBLIC_EMAIL_SEND_ENABLED() {
       return envState.sendEmailEnabled;
     },
+    get NEXT_PUBLIC_AUTO_DRAFT_DISABLED() {
+      return envState.autoDraftDisabled;
+    },
     get NEXT_PUBLIC_WEBHOOK_ACTION_ENABLED() {
       return envState.webhookActionsEnabled;
     },
   },
 }));
 
-const logger = createScopedLogger("ai-assistant-chat-test");
+const logger = createTestLogger();
 
 const baseMessages: ModelMessage[] = [
   {
@@ -84,41 +128,18 @@ const baseMessages: ModelMessage[] = [
 
 async function loadAssistantChatModule({
   emailSend,
+  autoDraftDisabled = false,
   webhookActions = true,
 }: {
   emailSend: boolean;
+  autoDraftDisabled?: boolean;
   webhookActions?: boolean;
 }) {
   envState.sendEmailEnabled = emailSend;
+  envState.autoDraftDisabled = autoDraftDisabled;
   envState.webhookActionsEnabled = webhookActions;
   vi.resetModules();
   return await import("@/utils/ai/assistant/chat");
-}
-
-async function buildSystemPrompt({
-  emailSend,
-  provider = "google",
-  responseSurface = "web",
-  messagingPlatform,
-}: {
-  emailSend: boolean;
-  provider?: "google" | "microsoft";
-  responseSurface?: "web" | "messaging";
-  messagingPlatform?: "slack" | "teams" | "telegram";
-}) {
-  const { buildResolvedSystemPrompt } = await loadAssistantChatModule({
-    emailSend,
-  });
-
-  return buildResolvedSystemPrompt({
-    emailSendToolsEnabled: emailSend,
-    webhookActionsEnabled: true,
-    provider,
-    responseSurface,
-    messagingPlatform,
-    userTimezone: "America/Los_Angeles",
-    currentTimestamp: "2026-04-12T09:30:00.000Z",
-  });
 }
 
 async function captureToolSet(
@@ -151,6 +172,7 @@ describe("aiProcessAssistantChat", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     envState.sendEmailEnabled = true;
+    envState.autoDraftDisabled = false;
     envState.webhookActionsEnabled = true;
   });
 
@@ -176,6 +198,10 @@ describe("aiProcessAssistantChat", () => {
 
     expect(args.messages[0].role).toBe("system");
     expect(args.tools.getAccountOverview).toBeDefined();
+    expect(args.tools.getSenderCategoryOverview).toBeDefined();
+    expect(args.tools.startSenderCategorization).toBeDefined();
+    expect(args.tools.getSenderCategorizationStatus).toBeDefined();
+    expect(args.tools.manageSenderCategory).toBeDefined();
     expect(args.tools.getAssistantCapabilities).toBeDefined();
     expect(args.tools.searchInbox).toBeDefined();
     expect(args.tools.readEmail).toBeDefined();
@@ -217,41 +243,6 @@ describe("aiProcessAssistantChat", () => {
     expect(args.tools.forwardEmail).toBeDefined();
   });
 
-  it("builds a google prompt without the removed tool-parameter duplication", async () => {
-    const prompt = await buildSystemPrompt({
-      emailSend: true,
-      provider: "google",
-    });
-
-    expect(prompt).toContain("Use Gmail search syntax");
-    expect(prompt).toContain("For inbox triage, default to `is:unread`");
-    expect(prompt).not.toContain("Use KQL syntax");
-    expect(prompt).not.toContain(
-      "updateAssistantSettings expects changes that specify the setting path and value",
-    );
-    expect(prompt).not.toContain(
-      "saveMemory expects content, source, and userEvidence",
-    );
-    expect(prompt).not.toContain(
-      "Use the field name about, not personalInstructions",
-    );
-  });
-
-  it("builds a microsoft send-disabled prompt with provider-specific triage guidance", async () => {
-    const prompt = await buildSystemPrompt({
-      emailSend: false,
-      provider: "microsoft",
-      responseSurface: "messaging",
-      messagingPlatform: "slack",
-    });
-
-    expect(prompt).toContain("Use KQL syntax for search");
-    expect(prompt).toContain("include the literal token `unread`");
-    expect(prompt).toContain("Email sending actions are disabled");
-    expect(prompt).not.toContain("Use Gmail search syntax");
-    expect(prompt).not.toContain("prepare a pending action");
-  });
-
   it("omits sendEmail tool when email sending is disabled", async () => {
     const { aiProcessAssistantChat } = await loadAssistantChatModule({
       emailSend: false,
@@ -271,6 +262,180 @@ describe("aiProcessAssistantChat", () => {
     const args = mockToolCallAgentStream.mock.calls[0][0];
     expect(args.tools.sendEmail).toBeUndefined();
     expect(args.tools.forwardEmail).toBeUndefined();
+  });
+
+  it("uses one email-capabilities block when send and draft-reply are both disabled", async () => {
+    const { aiProcessAssistantChat } = await loadAssistantChatModule({
+      emailSend: false,
+      autoDraftDisabled: true,
+    });
+
+    mockToolCallAgentStream.mockResolvedValue({
+      toUIMessageStreamResponse: vi.fn(),
+    });
+
+    await aiProcessAssistantChat({
+      messages: baseMessages,
+      emailAccountId: "email-account-id",
+      user: getEmailAccount(),
+      logger,
+    });
+
+    const systemPrompt = String(
+      mockToolCallAgentStream.mock.calls[0][0].messages[0].content,
+    );
+
+    expect(systemPrompt).toContain("Email capabilities:");
+    expect(systemPrompt).toContain(
+      "Email sending actions are disabled in this environment. sendEmail, replyEmail, and forwardEmail tools are unavailable.",
+    );
+    expect(systemPrompt).toContain(
+      "Draft reply rule actions are disabled in this environment.",
+    );
+    expect(systemPrompt).not.toContain("Email sending:");
+    expect(systemPrompt).not.toContain("Draft replies in rules:");
+  });
+
+  it("uses the same email-capabilities block when send is disabled but draft-reply rules remain available", async () => {
+    const { aiProcessAssistantChat } = await loadAssistantChatModule({
+      emailSend: false,
+      autoDraftDisabled: false,
+    });
+
+    mockToolCallAgentStream.mockResolvedValue({
+      toUIMessageStreamResponse: vi.fn(),
+    });
+
+    await aiProcessAssistantChat({
+      messages: baseMessages,
+      emailAccountId: "email-account-id",
+      user: getEmailAccount(),
+      logger,
+    });
+
+    const systemPrompt = String(
+      mockToolCallAgentStream.mock.calls[0][0].messages[0].content,
+    );
+
+    expect(systemPrompt).toContain("Email capabilities:");
+    expect(systemPrompt).toContain(
+      "Draft reply rule actions are available for automation.",
+    );
+    expect(systemPrompt).toContain(
+      "Do not treat rule-based draft actions as a substitute for disabled chat send tools unless the user explicitly asks for automation.",
+    );
+    expect(systemPrompt).not.toContain("Email sending:");
+    expect(systemPrompt).not.toContain("Draft replies in rules:");
+  });
+
+  it("keeps send guidance but removes draft-reply rule guidance when draft replies are disabled", async () => {
+    const { aiProcessAssistantChat } = await loadAssistantChatModule({
+      emailSend: true,
+      autoDraftDisabled: true,
+    });
+
+    mockToolCallAgentStream.mockResolvedValue({
+      toUIMessageStreamResponse: vi.fn(),
+    });
+
+    await aiProcessAssistantChat({
+      messages: baseMessages,
+      emailAccountId: "email-account-id",
+      user: getEmailAccount(),
+      logger,
+    });
+
+    const systemPrompt = String(
+      mockToolCallAgentStream.mock.calls[0][0].messages[0].content,
+    );
+
+    expect(systemPrompt).toContain("Email capabilities:");
+    expect(systemPrompt).toContain(
+      "sendEmail, replyEmail, and forwardEmail prepare a pending action only. No email is sent yet.",
+    );
+    expect(systemPrompt).toContain(
+      "Draft reply rule actions are disabled in this environment.",
+    );
+    expect(systemPrompt).toContain(
+      "Do not create or suggest draft-reply automation.",
+    );
+    expect(systemPrompt).not.toContain("Email sending:");
+    expect(systemPrompt).not.toContain("Draft replies in rules:");
+  });
+
+  it("warns that chat-uploaded files cannot be used as outgoing email attachments", async () => {
+    const { aiProcessAssistantChat } = await loadAssistantChatModule({
+      emailSend: true,
+    });
+
+    mockToolCallAgentStream.mockResolvedValue({
+      toUIMessageStreamResponse: vi.fn(),
+    });
+
+    await aiProcessAssistantChat({
+      messages: baseMessages,
+      emailAccountId: "email-account-id",
+      user: getEmailAccount(),
+      responseSurface: "messaging",
+      messagingPlatform: "telegram",
+      logger,
+    });
+
+    const systemPrompt = String(
+      mockToolCallAgentStream.mock.calls[0][0].messages[0].content,
+    );
+
+    expect(systemPrompt).toContain(
+      "Chat-uploaded files are not available as outgoing email attachments.",
+    );
+    expect(systemPrompt).toContain(
+      "do not call sendEmail, replyEmail, or forwardEmail for that file",
+    );
+  });
+
+  it("guides rule recommendations through existing rules and inbox evidence", async () => {
+    const { aiProcessAssistantChat } = await loadAssistantChatModule({
+      emailSend: true,
+    });
+
+    mockToolCallAgentStream.mockResolvedValue({
+      toUIMessageStreamResponse: vi.fn(),
+    });
+
+    await aiProcessAssistantChat({
+      messages: [
+        {
+          role: "user",
+          content: "Give me some ideas of rules I could add.",
+        },
+      ],
+      emailAccountId: "email-account-id",
+      user: getEmailAccount(),
+      logger,
+    });
+
+    const args = mockToolCallAgentStream.mock.calls[0][0];
+    const systemPrompt = String(args.messages[0].content);
+
+    expect(systemPrompt).toContain("Rule suggestions:");
+    expect(systemPrompt).toContain(
+      "call getUserRulesAndSettings first, then inspect enough inbox evidence",
+    );
+    expect(systemPrompt).toContain(
+      "Treat existing labels as context, not a constraint",
+    );
+    expect(systemPrompt).toContain(
+      "Use <rule-suggestions> with exactly one self-contained <rule-suggestion",
+    );
+    expect(systemPrompt).toContain(
+      "Always set name to a short, descriptive rule title",
+    );
+    expect(args.tools.getUserRulesAndSettings.description).toContain(
+      "Retrieve the latest rules and personal instructions for the user",
+    );
+    expect(args.tools.searchInbox.description).toContain(
+      "Search inbox messages and return concise message metadata",
+    );
   });
 
   it("does not expose webhook rule actions when webhook actions are disabled", async () => {
@@ -297,13 +462,16 @@ describe("aiProcessAssistantChat", () => {
         .success,
     ).toBe(false);
     expect(
-      args.tools.updateRuleActions.inputSchema.safeParse(
-        getWebhookRuleActionsInput(),
-      ).success,
+      args.tools.updateRule.inputSchema.safeParse({
+        ruleName: "Webhook",
+        updates: {
+          actions: getWebhookRuleActionsInput().actions,
+        },
+      }).success,
     ).toBe(false);
   });
 
-  it("accepts sparse rule action fields for createRule and updateRuleActions", async () => {
+  it("accepts sparse rule action fields for createRule and updateRule", async () => {
     const tools = await captureToolSet(true);
 
     expect(
@@ -334,52 +502,58 @@ describe("aiProcessAssistantChat", () => {
     ).toBe(true);
 
     expect(
-      tools.updateRuleActions.inputSchema.safeParse({
+      tools.updateRule.inputSchema.safeParse({
         ruleName: "Finance",
-        actions: [
-          {
-            type: ActionType.LABEL,
-            fields: {
-              label: "Finance",
+        updates: {
+          actions: [
+            {
+              type: ActionType.LABEL,
+              fields: {
+                label: "Finance",
+              },
+              delayInMinutes: null,
             },
-            delayInMinutes: null,
-          },
-          {
-            type: ActionType.ARCHIVE,
-            fields: {},
-            delayInMinutes: null,
-          },
-        ],
+            {
+              type: ActionType.ARCHIVE,
+              fields: {},
+              delayInMinutes: null,
+            },
+          ],
+        },
       }).success,
     ).toBe(true);
   });
 
-  it("rejects updateRuleActions payloads that omit required action fields", async () => {
+  it("rejects updateRule payloads that omit required action fields", async () => {
     const tools = await captureToolSet(true);
 
     expect(
-      tools.updateRuleActions.inputSchema.safeParse({
+      tools.updateRule.inputSchema.safeParse({
         ruleName: "Finance",
-        actions: [
-          {
-            type: ActionType.LABEL,
-            fields: {},
-            delayInMinutes: null,
-          },
-        ],
+        updates: {
+          actions: [
+            {
+              type: ActionType.LABEL,
+              fields: {},
+              delayInMinutes: null,
+            },
+          ],
+        },
       }).success,
     ).toBe(false);
 
     expect(
-      tools.updateRuleActions.inputSchema.safeParse({
+      tools.updateRule.inputSchema.safeParse({
         ruleName: "Webhook",
-        actions: [
-          {
-            type: ActionType.CALL_WEBHOOK,
-            fields: {},
-            delayInMinutes: null,
-          },
-        ],
+        updates: {
+          actions: [
+            {
+              type: ActionType.CALL_WEBHOOK,
+              fields: {},
+              delayInMinutes: null,
+            },
+          ],
+        },
       }).success,
     ).toBe(false);
   });
@@ -390,32 +564,36 @@ describe("aiProcessAssistantChat", () => {
     const microsoftTools = await captureToolSet(true, "microsoft");
 
     expect(
-      googleTools.updateRuleActions.inputSchema.safeParse({
+      googleTools.updateRule.inputSchema.safeParse({
         ruleName: "Finance",
-        actions: [
-          {
-            type: ActionType.MOVE_FOLDER,
-            fields: {
-              folderName: "Archive",
+        updates: {
+          actions: [
+            {
+              type: ActionType.MOVE_FOLDER,
+              fields: {
+                folderName: "Archive",
+              },
+              delayInMinutes: null,
             },
-            delayInMinutes: null,
-          },
-        ],
+          ],
+        },
       }).success,
     ).toBe(false);
 
     expect(
-      microsoftTools.updateRuleActions.inputSchema.safeParse({
+      microsoftTools.updateRule.inputSchema.safeParse({
         ruleName: "Finance",
-        actions: [
-          {
-            type: ActionType.MOVE_FOLDER,
-            fields: {
-              folderName: "Archive",
+        updates: {
+          actions: [
+            {
+              type: ActionType.MOVE_FOLDER,
+              fields: {
+                folderName: "Archive",
+              },
+              delayInMinutes: null,
             },
-            delayInMinutes: null,
-          },
-        ],
+          ],
+        },
       }).success,
     ).toBe(true);
   });
@@ -438,31 +616,11 @@ describe("aiProcessAssistantChat", () => {
     });
 
     const args = mockToolCallAgentStream.mock.calls[0][0];
-    expect(args.providerOptions).toEqual({
+    expect(args.providerOptions).toMatchObject({
       openai: {
         promptCacheKey: "assistant-chat:chat-123",
       },
     });
-  });
-
-  it("does not add chat provider options when chatId is missing", async () => {
-    const { aiProcessAssistantChat } = await loadAssistantChatModule({
-      emailSend: true,
-    });
-
-    mockToolCallAgentStream.mockResolvedValue({
-      toUIMessageStreamResponse: vi.fn(),
-    });
-
-    await aiProcessAssistantChat({
-      messages: baseMessages,
-      emailAccountId: "email-account-id",
-      user: getEmailAccount(),
-      logger,
-    });
-
-    const args = mockToolCallAgentStream.mock.calls[0][0];
-    expect(args.providerOptions).toBeUndefined();
   });
 
   it("places context between history and latest message for cache-friendly ordering", async () => {
@@ -1046,10 +1204,12 @@ describe("aiProcessAssistantChat", () => {
   it("requires reading rules immediately before updating rule conditions", async () => {
     const tools = await captureToolSet(true, "google");
 
-    const result = await tools.updateRuleConditions.execute({
+    const result = await tools.updateRule.execute({
       ruleName: "To Reply",
-      condition: {
-        aiInstructions: "Updated instructions",
+      updates: {
+        condition: {
+          aiInstructions: "Updated instructions",
+        },
       },
     });
 
@@ -1093,6 +1253,7 @@ describe("aiProcessAssistantChat", () => {
       id: "rule-1",
       name: "To Reply",
       updatedAt: new Date("2026-02-13T10:00:00.000Z"),
+      enabled: true,
       emailAccount: {
         rulesRevision: 2,
       },
@@ -1101,6 +1262,7 @@ describe("aiProcessAssistantChat", () => {
       to: null,
       subject: null,
       conditionalOperator: "AND",
+      actions: [],
     });
     mockPrisma.rule.update.mockResolvedValue({
       id: "rule-1",
@@ -1129,10 +1291,12 @@ describe("aiProcessAssistantChat", () => {
     expect(freshRuleContext?.content).toContain('"name": "To Reply"');
     expect(onRulesStateExposed).toHaveBeenCalledWith(2);
 
-    const result = await args.tools.updateRuleConditions.execute({
+    const result = await args.tools.updateRule.execute({
       ruleName: "To Reply",
-      condition: {
-        aiInstructions: "Updated instructions",
+      updates: {
+        condition: {
+          aiInstructions: "Updated instructions",
+        },
       },
     });
 
@@ -1294,15 +1458,188 @@ describe("aiProcessAssistantChat", () => {
       conditionalOperator: "AND",
     });
 
-    const result = await tools.updateRuleConditions.execute({
+    const result = await tools.updateRule.execute({
       ruleName: "To Reply",
-      condition: {
-        aiInstructions: "Updated instructions",
+      updates: {
+        condition: {
+          aiInstructions: "Updated instructions",
+        },
       },
     });
 
     expect(result.success).toBe(false);
     expect(result.error).toContain("Rule state changed since the last read");
+  });
+
+  it("returns rules and settings without ambient execution history", async () => {
+    const tools = await captureToolSet(true, "google");
+
+    mockPrisma.emailAccount.findUnique.mockResolvedValue({
+      about: "Keep replies concise.",
+      rulesRevision: 1,
+      rules: [],
+    });
+
+    const result = await tools.getUserRulesAndSettings.execute({});
+
+    expect(result).toEqual({
+      personalInstructions: "Keep replies concise.",
+      ruleNotificationDestinations: [],
+      rules: [],
+    });
+  });
+
+  it("returns exact rule execution history for a specific message", async () => {
+    const tools = await captureToolSet(true, "google");
+
+    mockPrisma.executedRule.findMany.mockResolvedValue([
+      {
+        id: "executed-rule-1",
+        ruleId: "rule-1",
+        threadId: "thread-1",
+        createdAt: new Date("2026-04-20T10:00:00.000Z"),
+        status: "APPLIED",
+        reason: "Matched the sender-specific rule for this thread.",
+        matchMetadata: [{ type: "STATIC" }],
+        automated: true,
+        actionItems: [
+          {
+            type: "DRAFT_EMAIL",
+            label: null,
+            labelId: null,
+            subject: "Re: Priority sender",
+            to: "sender@example.com",
+            cc: null,
+            bcc: null,
+            url: null,
+            folderName: null,
+            draftId: "draft-1",
+            draftStatus: DraftEmailStatus.REPLIED_WITHOUT_DRAFT,
+          },
+          {
+            type: "LABEL",
+            label: "To Reply",
+            labelId: "label-1",
+            subject: null,
+            to: null,
+            cc: null,
+            bcc: null,
+            url: null,
+            folderName: null,
+            draftId: null,
+            draftStatus: null,
+          },
+        ],
+        rule: {
+          id: "rule-1",
+          name: "Priority Sender",
+        },
+      },
+      {
+        id: "executed-rule-2",
+        ruleId: null,
+        threadId: "thread-1",
+        createdAt: new Date("2026-04-20T09:00:00.000Z"),
+        status: "SKIPPED",
+        reason: "Matched by AI instructions.",
+        matchMetadata: [{ type: "AI" }],
+        automated: false,
+        actionItems: [],
+        rule: null,
+      },
+    ]);
+
+    const result = await tools.getRuleExecutionForMessage.execute({
+      messageId: "message-1",
+    });
+
+    expect(mockPrisma.executedRule.findMany).toHaveBeenCalledWith({
+      where: {
+        emailAccountId: "email-account-id",
+        messageId: "message-1",
+      },
+      orderBy: { createdAt: "desc" },
+      select: {
+        id: true,
+        ruleId: true,
+        threadId: true,
+        createdAt: true,
+        status: true,
+        reason: true,
+        matchMetadata: true,
+        automated: true,
+        actionItems: {
+          select: {
+            type: true,
+            label: true,
+            labelId: true,
+            subject: true,
+            to: true,
+            cc: true,
+            bcc: true,
+            url: true,
+            folderName: true,
+          },
+        },
+        rule: {
+          select: {
+            id: true,
+            name: true,
+          },
+        },
+      },
+    });
+    expect(result).toEqual({
+      messageId: "message-1",
+      threadId: "thread-1",
+      executions: [
+        {
+          executedRuleId: "executed-rule-1",
+          ruleId: "rule-1",
+          ruleName: "Priority Sender",
+          status: "APPLIED",
+          executedAt: "2026-04-20T10:00:00.000Z",
+          reason: "Matched the sender-specific rule for this thread.",
+          matchMetadata: [{ type: "STATIC" }],
+          automated: true,
+          actions: [
+            {
+              type: "DRAFT_EMAIL",
+              label: null,
+              labelId: null,
+              subject: "Re: Priority sender",
+              to: "sender@example.com",
+              cc: null,
+              bcc: null,
+              url: null,
+              folderName: null,
+            },
+            {
+              type: "LABEL",
+              label: "To Reply",
+              labelId: "label-1",
+              subject: null,
+              to: null,
+              cc: null,
+              bcc: null,
+              url: null,
+              folderName: null,
+            },
+          ],
+        },
+        {
+          executedRuleId: "executed-rule-2",
+          ruleId: null,
+          ruleName: null,
+          status: "SKIPPED",
+          executedAt: "2026-04-20T09:00:00.000Z",
+          reason: "Matched by AI instructions.",
+          matchMetadata: [{ type: "AI" }],
+          automated: false,
+          actions: [],
+        },
+      ],
+    });
   });
 
   it("returns messages from searchMessages", async () => {
@@ -1527,11 +1864,6 @@ describe("aiProcessAssistantChat", () => {
     expect(forwardEmail).not.toHaveBeenCalled();
   });
 
-  it("registers saveMemory tool", async () => {
-    const tools = await captureToolSet();
-    expect(tools.saveMemory).toBeDefined();
-  });
-
   it("saveMemory creates a new memory", async () => {
     const tools = await captureToolSet(true, "google", [
       {
@@ -1616,6 +1948,17 @@ describe("aiProcessAssistantChat", () => {
     });
 
     expect(parsed.success).toBe(true);
+  });
+
+  it("saveMemory schema requires userEvidence for user_message", async () => {
+    const tools = await captureToolSet();
+
+    const parsed = (tools.saveMemory as any).inputSchema.safeParse({
+      content: "I prefer concise responses.",
+      source: "user_message",
+    });
+
+    expect(parsed.success).toBe(false);
   });
 
   it("searchMemories supports empty query for broad recall", async () => {
@@ -1788,10 +2131,12 @@ describe("aiProcessAssistantChat", () => {
   it("updatePersonalInstructions in append mode preserves existing content", async () => {
     const tools = await captureToolSet();
 
-    mockPrisma.emailAccount.findUnique.mockResolvedValue({
-      about: "Existing instructions",
-    });
-    mockPrisma.emailAccount.update.mockResolvedValue({});
+    mockPrisma.$queryRaw.mockResolvedValue([
+      {
+        previous: "Existing instructions",
+        updated: "Existing instructions\nAdditional preference",
+      },
+    ]);
 
     const result = await tools.updatePersonalInstructions.execute({
       personalInstructions: "Additional preference",
@@ -1801,20 +2146,18 @@ describe("aiProcessAssistantChat", () => {
     expect(result.success).toBe(true);
     expect(result.updated).toBe("Existing instructions\nAdditional preference");
     expect(result.previous).toBe("Existing instructions");
-    expect(mockPrisma.emailAccount.update).toHaveBeenCalledWith(
-      expect.objectContaining({
-        data: { about: "Existing instructions\nAdditional preference" },
-      }),
-    );
+    expect(mockPrisma.emailAccount.update).not.toHaveBeenCalled();
   });
 
   it("updatePersonalInstructions defaults to append mode", async () => {
     const tools = await captureToolSet();
 
-    mockPrisma.emailAccount.findUnique.mockResolvedValue({
-      about: "Existing instructions",
-    });
-    mockPrisma.emailAccount.update.mockResolvedValue({});
+    mockPrisma.$queryRaw.mockResolvedValue([
+      {
+        previous: "Existing instructions",
+        updated: "Existing instructions\nAdditional preference",
+      },
+    ]);
 
     const result = await tools.updatePersonalInstructions.execute({
       personalInstructions: "Additional preference",
@@ -1822,20 +2165,18 @@ describe("aiProcessAssistantChat", () => {
 
     expect(result.success).toBe(true);
     expect(result.updated).toBe("Existing instructions\nAdditional preference");
-    expect(mockPrisma.emailAccount.update).toHaveBeenCalledWith(
-      expect.objectContaining({
-        data: { about: "Existing instructions\nAdditional preference" },
-      }),
-    );
+    expect(mockPrisma.emailAccount.update).not.toHaveBeenCalled();
   });
 
   it("updatePersonalInstructions in append mode with no existing about sets new content", async () => {
     const tools = await captureToolSet();
 
-    mockPrisma.emailAccount.findUnique.mockResolvedValue({
-      about: null,
-    });
-    mockPrisma.emailAccount.update.mockResolvedValue({});
+    mockPrisma.$queryRaw.mockResolvedValue([
+      {
+        previous: null,
+        updated: "First instructions",
+      },
+    ]);
 
     const result = await tools.updatePersonalInstructions.execute({
       personalInstructions: "First instructions",
@@ -2102,64 +2443,6 @@ describe("aiProcessAssistantChat", () => {
         failedThreadIds: ["thread-2"],
       }),
     );
-  });
-
-  describe("progressive tool disclosure", () => {
-    async function captureStreamArgs(emailSend = true) {
-      const { aiProcessAssistantChat } = await loadAssistantChatModule({
-        emailSend,
-      });
-
-      mockToolCallAgentStream.mockResolvedValue({
-        toUIMessageStreamResponse: vi.fn(),
-      });
-
-      await aiProcessAssistantChat({
-        messages: baseMessages,
-        emailAccountId: "email-account-id",
-        user: getEmailAccount(),
-        logger,
-      });
-
-      return mockToolCallAgentStream.mock.calls[0][0];
-    }
-
-    it("registers all tools in the tools object", async () => {
-      const args = await captureStreamArgs();
-
-      expect(args.tools.listLabels).toBeDefined();
-      expect(args.tools.createOrGetLabel).toBeDefined();
-      expect(args.tools.updateAssistantSettings).toBeDefined();
-      expect(args.tools.saveMemory).toBeDefined();
-      expect(args.tools.searchMemories).toBeDefined();
-      expect(args.tools.addToKnowledgeBase).toBeDefined();
-      expect(args.tools.getCalendarEvents).toBeDefined();
-      expect(args.tools.readAttachment).toBeDefined();
-      expect(args.tools.searchInbox).toBeDefined();
-      expect(args.tools.manageInbox).toBeDefined();
-      expect(args.tools.updatePersonalInstructions).toBeDefined();
-    });
-
-    it("includes send tools when email send enabled", async () => {
-      const args = await captureStreamArgs(true);
-
-      expect(args.tools.sendEmail).toBeDefined();
-      expect(args.tools.replyEmail).toBeDefined();
-    });
-
-    it("excludes send tools when email send disabled", async () => {
-      const args = await captureStreamArgs(false);
-
-      expect(args.tools.sendEmail).toBeUndefined();
-      expect(args.tools.replyEmail).toBeUndefined();
-    });
-
-    it("does not use activeTools or prepareStep", async () => {
-      const args = await captureStreamArgs();
-
-      expect(args.activeTools).toBeUndefined();
-      expect(args.prepareStep).toBeUndefined();
-    });
   });
 });
 

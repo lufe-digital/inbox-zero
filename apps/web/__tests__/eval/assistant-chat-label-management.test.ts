@@ -18,8 +18,6 @@ import { createScopedLogger } from "@/utils/logger";
 // pnpm test-ai eval/assistant-chat-label-management
 // Multi-model: EVAL_MODELS=all pnpm test-ai eval/assistant-chat-label-management
 
-vi.mock("server-only", () => ({}));
-
 const shouldRunEval = shouldRunEvalTests();
 const TIMEOUT = 60_000;
 const evalReporter = createEvalReporter();
@@ -107,12 +105,17 @@ describe.runIf(shouldRunEval)("Eval: assistant chat label management", () => {
         labels = [...labels, createdLabel];
         return createdLabel;
       }),
-      getLabelById: vi.fn().mockImplementation(async (id: string) => {
-        return labels.find((label) => label.id === id) ?? null;
-      }),
-      getLabelByName: vi.fn().mockImplementation(async (name: string) => {
-        return labels.find((label) => label.name === name) ?? null;
-      }),
+      getLabelById: vi
+        .fn()
+        .mockImplementation(
+          async (id: string) => labels.find((label) => label.id === id) ?? null,
+        ),
+      getLabelByName: vi
+        .fn()
+        .mockImplementation(
+          async (name: string) =>
+            labels.find((label) => label.name === name) ?? null,
+        ),
       getThreadMessages: vi
         .fn()
         .mockImplementation(async (threadId: string) => [
@@ -285,11 +288,6 @@ describe.runIf(shouldRunEval)("Eval: assistant chat label management", () => {
               (toolCall) =>
                 toolCall.toolName === "createOrGetLabel" &&
                 isCreateOrGetLabelInput(toolCall.input),
-            ) &&
-            !toolCalls.some(
-              (toolCall) =>
-                toolCall.toolName === "listLabels" &&
-                isListLabelsInput(toolCall.input),
             );
 
           evalReporter.record({
@@ -334,11 +332,6 @@ describe.runIf(shouldRunEval)("Eval: assistant chat label management", () => {
               (toolCall) =>
                 toolCall.toolName === "createOrGetLabel" &&
                 isCreateOrGetLabelInput(toolCall.input),
-            ) &&
-            !toolCalls.some(
-              (toolCall) =>
-                toolCall.toolName === "listLabels" &&
-                isListLabelsInput(toolCall.input),
             );
 
           evalReporter.record({

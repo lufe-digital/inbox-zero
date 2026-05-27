@@ -6,8 +6,10 @@ import Link from "next/link";
 import { env } from "@/env";
 import { Button } from "@/components/ui/button";
 import { toastError } from "@/components/Toast";
+import { useEndStripeTrial } from "@/hooks/useEndStripeTrial";
 import { getBillingPortalUrlAction } from "@/utils/actions/premium";
 import { hasActiveAppleSubscription } from "@/utils/premium";
+import { redirectToSafeUrl } from "@/utils/redirect";
 
 const APPLE_SUBSCRIPTION_HELP_URL = "https://support.apple.com/en-us/118428";
 
@@ -20,6 +22,7 @@ export function ManageSubscription({
         appleRevokedAt?: string | Date | null | undefined;
         appleSubscriptionStatus?: string | null | undefined;
         stripeSubscriptionId: string | null | undefined;
+        stripeSubscriptionStatus?: string | null | undefined;
         lemonSqueezyCustomerId: number | null | undefined;
       }
     | null
@@ -27,6 +30,7 @@ export function ManageSubscription({
 }) {
   const { loading: loadingBillingPortal, openBillingPortal } =
     useOpenBillingPortal();
+  const { loading: loadingEndTrial, endTrial } = useEndStripeTrial();
   const hasAppleSubscription = hasActiveAppleSubscription(
     premium?.appleExpiresAt || null,
     premium?.appleRevokedAt || null,
@@ -39,6 +43,13 @@ export function ManageSubscription({
 
   return (
     <>
+      {premium?.stripeSubscriptionStatus === "trialing" && (
+        <Button loading={loadingEndTrial} onClick={endTrial} variant="outline">
+          <CreditCardIcon className="mr-2 h-4 w-4" />
+          Start paid plan now
+        </Button>
+      )}
+
       {premium?.stripeSubscriptionId && (
         <Button loading={loadingBillingPortal} onClick={openBillingPortal}>
           <CreditCardIcon className="mr-2 h-4 w-4" />
@@ -132,7 +143,7 @@ function useOpenBillingPortal() {
           "Error loading billing portal. Please contact support.",
       });
     } else {
-      window.location.href = url;
+      redirectToSafeUrl(url, { allowExternal: true });
     }
   };
 

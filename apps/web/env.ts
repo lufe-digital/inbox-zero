@@ -15,6 +15,8 @@ const llmProviderEnum = z.enum([
   "aigateway",
   "ollama",
   "openai-compatible",
+  "codex-cli",
+  "claude-code",
 ]);
 
 /** For Vercel preview deployments, auto-detect from VERCEL_URL. */
@@ -71,6 +73,21 @@ const parsedEnv = createEnv({
     MICROSOFT_CLIENT_ID: z.string().optional(),
     MICROSOFT_CLIENT_SECRET: z.string().optional(),
     MICROSOFT_TENANT_ID: z.string().optional().default("common"),
+    APPLE_CLIENT_ID: z.string().optional(),
+    APPLE_TEAM_ID: z.string().optional(),
+    APPLE_KEY_ID: z.string().optional(),
+    APPLE_PRIVATE_KEY: z.string().optional(),
+    APPLE_APP_BUNDLE_IDENTIFIER: z.string().optional(),
+    // Comma-separated SHA-256 fingerprints served from /.well-known/assetlinks.json
+    ANDROID_APP_CERT_SHA256_FINGERPRINTS: z
+      .string()
+      .optional()
+      .transform((value) =>
+        value
+          ?.split(",")
+          .map((entry) => entry.trim())
+          .filter(Boolean),
+      ),
     EMAIL_ENCRYPT_SECRET: z.string(),
     EMAIL_ENCRYPT_SALT: z.string(),
 
@@ -96,6 +113,11 @@ const parsedEnv = createEnv({
     DRAFT_LLM_PROVIDER: llmProviderEnum.optional(),
     DRAFT_LLM_MODEL: z.string().optional(),
     AI_NANO_WEEKLY_SPEND_LIMIT_USD: z.coerce.number().positive().optional(),
+    AI_TRIAL_WEEKLY_SPEND_LIMIT_USD: z.coerce.number().positive().optional(),
+    // Unset defaults to ALLOW. Used when an account has not chosen a policy.
+    SENSITIVE_DATA_POLICY_DEFAULT: z
+      .enum(["ALLOW", "REDACT", "BLOCK"])
+      .optional(),
 
     LLM_API_KEY: z.string().optional(),
     OPENAI_API_KEY: z.string().optional(),
@@ -124,6 +146,9 @@ const parsedEnv = createEnv({
     OLLAMA_MODEL: z.string().optional(),
     OPENAI_COMPATIBLE_BASE_URL: z.string().optional(),
     OPENAI_COMPATIBLE_MODEL: z.string().optional(),
+    CLI_LLM_ENABLED: booleanString.optional().default(false),
+    CODEX_CLI_ALLOW_NPX: booleanString.optional().default(false),
+    CODEX_CLI_PATH: z.string().optional(),
 
     OPENAI_ZERO_DATA_RETENTION: booleanString.optional().default(false),
 
@@ -155,6 +180,8 @@ const parsedEnv = createEnv({
     SENTRY_PROJECT: z.string().optional(),
     AXIOM_DATASET: z.string().optional(),
     AXIOM_TOKEN: z.string().optional(),
+    AXIOM_AUDIT_DATASET: z.string().optional(),
+    AXIOM_AUDIT_TOKEN: z.string().optional(),
 
     DISABLE_LOG_ZOD_ERRORS: booleanString.optional(),
     ENABLE_DEBUG_LOGS: booleanString.default(false),
@@ -163,6 +190,14 @@ const parsedEnv = createEnv({
       .int()
       .nonnegative()
       .default(50),
+    REASONING_RETENTION_DAYS: z.preprocess(
+      (value) => (value === "" ? undefined : value),
+      z.coerce.number().int().nonnegative().optional(),
+    ),
+    DRAFT_SENT_TEXT_RETENTION_DAYS: z.preprocess(
+      (value) => (value === "" ? undefined : value),
+      z.coerce.number().int().nonnegative().default(14),
+    ),
 
     // Lemon Squeezy
     LEMON_SQUEEZY_SIGNING_SECRET: z.string().optional(),
@@ -183,8 +218,6 @@ const parsedEnv = createEnv({
 
     TINYBIRD_TOKEN: z.string().optional(),
     TINYBIRD_BASE_URL: z.string().default("https://api.us-east.tinybird.co/"),
-    TINYBIRD_ENCRYPT_SECRET: z.string().optional(),
-    TINYBIRD_ENCRYPT_SALT: z.string().optional(),
 
     API_KEY_SALT: z.string().optional(),
 
@@ -252,8 +285,8 @@ const parsedEnv = createEnv({
     TELEGRAM_BOT_TOKEN: z.string().optional(),
     TELEGRAM_BOT_SECRET_TOKEN: z.string().optional(),
     APP_REVIEW_DEMO_ENABLED: booleanString.optional().default(false),
-    APP_REVIEW_DEMO_CODE: z.string().optional(),
-    APP_REVIEW_DEMO_EMAIL: z.string().email().optional(),
+    APP_REVIEW_DEMO_ACCOUNTS: z.string().optional(),
+    SSO_LOGIN_ENABLED: booleanString.optional().default(false),
   },
   client: {
     // stripe
@@ -295,6 +328,7 @@ const parsedEnv = createEnv({
     NEXT_PUBLIC_BRAND_LOGO_URL: z.string().optional(),
     NEXT_PUBLIC_BRAND_ICON_URL: z.string().optional().default("/icon.png"),
     NEXT_PUBLIC_SLACK_BOT_NAME: z.string().trim().min(1).default("Inbox Zero"),
+    NEXT_PUBLIC_SELF_HOSTED_LOGIN_FOOTER_TEXT: z.string().optional(),
     NEXT_PUBLIC_CONTACTS_ENABLED: booleanString.optional().default(false),
     NEXT_PUBLIC_EMAIL_SEND_ENABLED: booleanString.default(true),
     NEXT_PUBLIC_WEBHOOK_ACTION_ENABLED: booleanString.optional().default(true),
@@ -302,7 +336,7 @@ const parsedEnv = createEnv({
     NEXT_PUBLIC_SUPPORT_EMAIL: z
       .string()
       .optional()
-      .default("elie@getinboxzero.com"),
+      .default("support@getinboxzero.com"),
     NEXT_PUBLIC_GTM_ID: z.string().optional(),
     NEXT_PUBLIC_CRISP_WEBSITE_ID: z.string().optional(),
     NEXT_PUBLIC_WELCOME_UPGRADE_ENABLED: booleanString
@@ -329,8 +363,16 @@ const parsedEnv = createEnv({
     NEXT_PUBLIC_INTEGRATIONS_ENABLED: booleanString.optional(),
     NEXT_PUBLIC_SMART_FILING_ENABLED: booleanString.optional(),
     NEXT_PUBLIC_CLEANER_ENABLED: booleanString.optional(),
+    NEXT_PUBLIC_BOOKING_LINKS_ENABLED: booleanString.optional(),
     NEXT_PUBLIC_EXTERNAL_API_ENABLED: booleanString.optional().default(false),
     NEXT_PUBLIC_AUTO_DRAFT_DISABLED: booleanString.optional(),
+    NEXT_PUBLIC_AI_MODEL_SETTINGS_DISABLED: booleanString
+      .optional()
+      .default(false),
+    // When true, the deployment default is enforced and account-level edits are disabled.
+    NEXT_PUBLIC_SENSITIVE_DATA_POLICY_LOCKED: booleanString
+      .optional()
+      .default(false),
     NEXT_PUBLIC_IS_RESEND_CONFIGURED: booleanString.optional(),
     NEXT_PUBLIC_TABS_EXTENSION_ID: z
       .string()
@@ -391,6 +433,8 @@ const parsedEnv = createEnv({
     NEXT_PUBLIC_BRAND_LOGO_URL: process.env.NEXT_PUBLIC_BRAND_LOGO_URL,
     NEXT_PUBLIC_BRAND_ICON_URL: process.env.NEXT_PUBLIC_BRAND_ICON_URL,
     NEXT_PUBLIC_SLACK_BOT_NAME: process.env.NEXT_PUBLIC_SLACK_BOT_NAME,
+    NEXT_PUBLIC_SELF_HOSTED_LOGIN_FOOTER_TEXT:
+      process.env.NEXT_PUBLIC_SELF_HOSTED_LOGIN_FOOTER_TEXT,
     NEXT_PUBLIC_CONTACTS_ENABLED: process.env.NEXT_PUBLIC_CONTACTS_ENABLED,
     NEXT_PUBLIC_EMAIL_SEND_ENABLED: process.env.NEXT_PUBLIC_EMAIL_SEND_ENABLED,
     NEXT_PUBLIC_WEBHOOK_ACTION_ENABLED:
@@ -422,10 +466,16 @@ const parsedEnv = createEnv({
     NEXT_PUBLIC_SMART_FILING_ENABLED:
       process.env.NEXT_PUBLIC_SMART_FILING_ENABLED,
     NEXT_PUBLIC_CLEANER_ENABLED: process.env.NEXT_PUBLIC_CLEANER_ENABLED,
+    NEXT_PUBLIC_BOOKING_LINKS_ENABLED:
+      process.env.NEXT_PUBLIC_BOOKING_LINKS_ENABLED,
     NEXT_PUBLIC_EXTERNAL_API_ENABLED:
       process.env.NEXT_PUBLIC_EXTERNAL_API_ENABLED,
     NEXT_PUBLIC_AUTO_DRAFT_DISABLED:
       process.env.NEXT_PUBLIC_AUTO_DRAFT_DISABLED,
+    NEXT_PUBLIC_AI_MODEL_SETTINGS_DISABLED:
+      process.env.NEXT_PUBLIC_AI_MODEL_SETTINGS_DISABLED,
+    NEXT_PUBLIC_SENSITIVE_DATA_POLICY_LOCKED:
+      process.env.NEXT_PUBLIC_SENSITIVE_DATA_POLICY_LOCKED,
     NEXT_PUBLIC_IS_RESEND_CONFIGURED:
       process.env.NEXT_PUBLIC_IS_RESEND_CONFIGURED,
     NEXT_PUBLIC_TABS_EXTENSION_ID: process.env.NEXT_PUBLIC_TABS_EXTENSION_ID,

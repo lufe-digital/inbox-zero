@@ -87,6 +87,7 @@ export const getGmailClientWithRefresh = async ({
         accountRefreshToken: refreshToken,
         emailAccountId,
         provider: "google",
+        expectedExpiresAt: expiresAt,
       });
     }
 
@@ -99,6 +100,7 @@ export const getGmailClientWithRefresh = async ({
       logger.warn("Error refreshing Gmail access token", {
         emailAccountId,
         error: error.message,
+        // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
         errorDescription: (error as any).response?.data?.error_description,
       });
     }
@@ -124,6 +126,7 @@ export const getContactsClient = ({
 };
 
 export const getAccessTokenFromClient = (client: gmail_v1.Gmail): string => {
+  // biome-ignore lint/suspicious/noExplicitAny: existing loose external shape
   const accessToken = (client.context._options.auth as any).credentials
     .access_token;
   if (!accessToken) throw new Error("No access token");

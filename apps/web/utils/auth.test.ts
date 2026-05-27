@@ -3,11 +3,22 @@ import { cookies } from "next/headers";
 import { createReferral } from "@/utils/referral/referral-code";
 import { captureException } from "@/utils/error";
 import { saveTokens } from "@/utils/auth/save-tokens";
-import { handleLinkAccount, handleReferralOnSignUp } from "@/utils/auth";
+import {
+  betterAuthConfig,
+  handleLinkAccount,
+  handleReferralOnSignUp,
+} from "@/utils/auth";
 import prisma from "@/utils/__mocks__/prisma";
 import { clearSpecificErrorMessages } from "@/utils/error-messages";
 
-vi.mock("server-only", () => ({}));
+vi.mock("better-auth", () => ({
+  betterAuth: vi.fn((options: unknown) => ({
+    api: {
+      getSession: vi.fn(),
+    },
+    options,
+  })),
+}));
 vi.mock("@/utils/prisma");
 vi.mock("@/utils/error-messages", () => ({
   addUserErrorMessage: vi.fn().mockResolvedValue(undefined),
@@ -39,6 +50,14 @@ vi.mock("@/utils/referral/referral-code", () => ({
 vi.mock("@/utils/error", () => ({
   captureException: vi.fn(),
 }));
+
+describe("betterAuthConfig", () => {
+  it("does not trust Microsoft for implicit social account linking", () => {
+    expect(
+      (betterAuthConfig as any).options.account.accountLinking.trustedProviders,
+    ).toEqual(["google", "apple"]);
+  });
+});
 
 describe("handleReferralOnSignUp", () => {
   const mockCookies = vi.mocked(cookies);
@@ -151,6 +170,73 @@ describe("saveTokens", () => {
         errorTypes: ["Account disconnected"],
       }),
     );
+  });
+
+  it("uses optimistic concurrency when saving refreshed email account tokens", async () => {
+    const expectedExpiresAt = 1_700_000_000_000;
+    prisma.emailAccount.findUnique.mockResolvedValue({
+      userId: "user_1",
+    } as any);
+    prisma.account.updateMany.mockResolvedValue({ count: 1 } as any);
+
+    const result = await saveTokens({
+      emailAccountId: "ea_1",
+      tokens: {
+        access_token: "new-access",
+        refresh_token: "new-refresh",
+        expires_at: 123_456_789,
+      },
+      accountRefreshToken: "old-refresh",
+      provider: "google",
+      expectedExpiresAt,
+    });
+
+    expect(result).toEqual({ status: "saved" });
+    expect(prisma.account.updateMany).toHaveBeenCalledWith({
+      where: {
+        provider: "google",
+        emailAccount: { id: "ea_1" },
+        expires_at: {
+          gte: new Date(expectedExpiresAt),
+          lt: new Date(expectedExpiresAt + 1),
+        },
+      },
+      data: expect.objectContaining({
+        access_token: "new-access",
+        refresh_token: "new-refresh",
+        expires_at: new Date(123_456_789_000),
+        disconnectedAt: null,
+      }),
+    });
+    expect(prisma.emailAccount.update).not.toHaveBeenCalled();
+    expect(clearSpecificErrorMessages).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: "user_1",
+        errorTypes: ["Account disconnected"],
+      }),
+    );
+  });
+
+  it("reports a conflict instead of overwriting newer email account tokens", async () => {
+    prisma.emailAccount.findUnique.mockResolvedValue({
+      userId: "user_1",
+    } as any);
+    prisma.account.updateMany.mockResolvedValue({ count: 0 } as any);
+
+    const result = await saveTokens({
+      emailAccountId: "ea_1",
+      tokens: {
+        access_token: "new-access",
+        refresh_token: "new-refresh",
+        expires_at: 123_456_789,
+      },
+      accountRefreshToken: "old-refresh",
+      provider: "google",
+      expectedExpiresAt: 1_700_000_000_000,
+    });
+
+    expect(result).toEqual({ status: "conflict" });
+    expect(clearSpecificErrorMessages).not.toHaveBeenCalled();
   });
 
   it("clears disconnectedAt and error messages when saving tokens via providerAccountId", async () => {
